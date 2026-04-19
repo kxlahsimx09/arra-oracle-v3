@@ -10,7 +10,7 @@ import fs from 'fs';
 import { oracleDocuments } from '../db/schema.ts';
 import { detectProject } from '../server/project-detect.ts';
 import { getVaultPsiRoot } from '../vault/handler.ts';
-import { getVectorStoreByModel } from '../vector/factory.ts';
+import { ensureVectorStoreConnected } from '../vector/factory.ts';
 import { REPO_ROOT } from '../config.ts';
 import type { ToolContext, ToolResponse, OracleLearnInput } from './types.ts';
 
@@ -197,10 +197,15 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
   // mode works immediately without a follow-up `bun run index-model`. Graceful
   // fallback: if the embedder is unreachable (e.g. Ollama down) we log and
   // carry on — the FTS row above is still searchable.
+  //
+  // Must use `ensureVectorStoreConnected` (not `getVectorStoreByModel`) so the
+  // background LanceDB connect promise is awaited before `addDocuments` runs.
+  // Prior to this, a fresh MCP process's first `arra_learn` call would race the
+  // connect and throw "LanceDB not connected", silently writing to FTS/disk only.
   let embeddingStatus: 'ok' | 'skipped' | 'failed' = 'skipped';
   try {
     const model = process.env.ORACLE_EMBEDDING_MODEL || 'bge-m3';
-    const vectorStore = getVectorStoreByModel(model);
+    const vectorStore = await ensureVectorStoreConnected(model);
     await vectorStore.addDocuments([{
       id,
       document: frontmatter,
