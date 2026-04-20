@@ -80,6 +80,67 @@ export function normalizeProject(input?: string): string | null {
   return null;
 }
 
+export interface FrontmatterStripResult {
+  /** Pattern with any outer frontmatter block + trailing auto-footer removed. */
+  cleanPattern: string;
+  /** True if we actually found and stripped a frontmatter block. */
+  stripped: boolean;
+  /** `title:` value from the stripped frontmatter if non-empty and not `---`. */
+  extractedTitle: string | null;
+}
+
+/**
+ * Guard against the "arra_learn double-wrap" bug: agents occasionally pass a
+ * pattern that already contains a markdown frontmatter block (e.g. pasting a
+ * pre-formatted doc or a prior arra_learn output). Without this guard the
+ * handler wraps its own frontmatter around the pre-wrapped body, producing
+ * files with `title: ---`, a `_title-*` filename slug, and nested frontmatter
+ * (caught by scripts/verify.sh in the vault as "arra_learn double-wrap bug").
+ *
+ * When we detect the pattern, strip the outer block (and the trailing
+ * `*Added via Oracle Learn*` auto-footer if it rode along) and return the
+ * bare body plus the title we recovered so the caller can seed slug/title
+ * from something meaningful instead of `---`.
+ */
+export function stripFrontmatterWrap(pattern: string): FrontmatterStripResult {
+  const unchanged: FrontmatterStripResult = { cleanPattern: pattern, stripped: false, extractedTitle: null };
+  if (!pattern.startsWith('---\n') && !pattern.startsWith('---\r\n')) return unchanged;
+
+  // normalize CRLF so line-level matches don't need to handle trailing \r
+  const lines = pattern.replace(/\r\n?/g, '\n').split('\n');
+  const closeLimit = Math.min(lines.length, 30);
+  let closeIdx = -1;
+  for (let i = 1; i < closeLimit; i++) {
+    if (lines[i].trimEnd() === '---') { closeIdx = i; break; }
+  }
+  if (closeIdx === -1) return unchanged;
+
+  let extractedTitle: string | null = null;
+  for (let i = 1; i < closeIdx; i++) {
+    const m = lines[i].match(/^title:\s*(.*)$/);
+    if (m) {
+      const raw = m[1].trim();
+      if (raw && raw !== '---') extractedTitle = raw;
+      break;
+    }
+  }
+
+  let bodyStart = closeIdx + 1;
+  while (bodyStart < lines.length && lines[bodyStart].trim() === '') bodyStart++;
+
+  let bodyEnd = lines.length;
+  while (bodyEnd > bodyStart && lines[bodyEnd - 1].trim() === '') bodyEnd--;
+  if (bodyEnd > bodyStart && lines[bodyEnd - 1].trim() === '*Added via Oracle Learn*') {
+    bodyEnd--;
+    while (bodyEnd > bodyStart && lines[bodyEnd - 1].trim() === '') bodyEnd--;
+    if (bodyEnd > bodyStart && lines[bodyEnd - 1].trim() === '---') bodyEnd--;
+    while (bodyEnd > bodyStart && lines[bodyEnd - 1].trim() === '') bodyEnd--;
+  }
+
+  const cleanPattern = lines.slice(bodyStart, bodyEnd).join('\n');
+  return { cleanPattern, stripped: true, extractedTitle };
+}
+
 /**
  * Extract project from source field (fallback).
  * Handles "arra_learn from github.com/owner/repo" and "rrr: org/repo" formats.
@@ -104,11 +165,18 @@ export function extractProjectFromSource(source?: string): string | null {
 // ============================================================================
 
 export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Promise<ToolResponse> {
-  const { pattern, source, concepts, project: projectInput } = input;
+  const { pattern: rawPattern, source, concepts, project: projectInput } = input;
   const now = new Date();
   const dateStr = now.toISOString().split('T')[0];
 
-  const slug = pattern
+  // Defend against double-wrap: if pattern is pre-wrapped markdown, peel the
+  // outer frontmatter off and reuse its title so slug/title aren't derived
+  // from the literal string `---`.
+  const stripResult = stripFrontmatterWrap(rawPattern);
+  const pattern = stripResult.cleanPattern;
+  const slugSource = stripResult.extractedTitle ?? pattern;
+
+  const slug = slugSource
     .substring(0, 50)
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, '')
@@ -149,7 +217,7 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
     throw new Error(`File already exists: ${filename}`);
   }
 
-  const title = pattern.split('\n')[0].substring(0, 80);
+  const title = (stripResult.extractedTitle ?? pattern.split('\n')[0]).substring(0, 80);
   const conceptsList = coerceConcepts(concepts);
   const frontmatter = [
     '---',
@@ -223,6 +291,11 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
     console.warn(`[arra_learn] document still searchable via FTS5; run 'bun src/scripts/index-model.ts <model>' later to backfill vectors`);
   }
 
+  const warnings = stripResult.stripped
+    ? ['`pattern` began with a markdown frontmatter block and was unwrapped before indexing. ' +
+       'arra_learn generates its own frontmatter — pass prose in `pattern`, not a pre-formatted doc.']
+    : undefined;
+
   return {
     content: [{
       type: 'text',
@@ -231,7 +304,8 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
         file: sourceFileRel,
         id,
         embedding: embeddingStatus,
-        message: `Pattern added to Oracle knowledge base${vaultRoot ? ' (vault)' : ''}${embeddingStatus === 'failed' ? ' — vector embedding failed, see server log' : ''}`
+        message: `Pattern added to Oracle knowledge base${vaultRoot ? ' (vault)' : ''}${embeddingStatus === 'failed' ? ' — vector embedding failed, see server log' : ''}`,
+        ...(warnings ? { warnings } : {}),
       }, null, 2)
     }]
   };
