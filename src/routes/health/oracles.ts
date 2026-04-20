@@ -31,13 +31,21 @@ export const oraclesEndpoint = new Elysia().get('/oracles', ({ query }) => {
     ORDER BY last_seen DESC
   `).all(cutoff, cutoff, cutoff);
 
+  // active_docs = non-superseded count. HAVING active_docs > 0 hides projects
+  // whose entire footprint is superseded — typically project-field typo paths
+  // (e.g. `bank-bot<`, `cbank-bot`, `kokarat/kokarat`) where the canonical
+  // entries have been arra_supersede'd to recovered versions at the correct
+  // path. The /superseded route remains the place to inspect supersede chains.
   const projects = sqlite.prepare(`
-    SELECT project, count(*) as docs,
+    SELECT project,
+           count(*) as docs,
+           sum(CASE WHEN superseded_by IS NULL THEN 1 ELSE 0 END) as active_docs,
            count(DISTINCT type) as types,
            max(created_at) as last_indexed
     FROM oracle_documents
     WHERE project IS NOT NULL
     GROUP BY project
+    HAVING active_docs > 0
     ORDER BY last_indexed DESC
   `).all();
 
