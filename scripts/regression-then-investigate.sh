@@ -172,23 +172,33 @@ Operator contract: <code>\$MOBIZ</code> must stay on <code>main</code>, clean, f
 fi
 log "  \$MOBIZ at $(git rev-parse --short HEAD) ($(git log -1 --format='%s' | head -c 60))"
 
-# ── Step 2a: Rebuild images (backend + bank-bot) against HEAD ──────────────
+# ── Step 2a: Rebuild images (backend + mock-bank + bank-bot) against HEAD ──
 # User's setup is DOCKER_MODE (persistent containers for backend, bank-bot,
 # bank-bot-ktb, mock-bank). Images must be rebuilt when source changes,
 # otherwise tests run against stale code = misleading green/red.
 #
-# Rebuild all three relevant images every run. Docker layer cache keeps this
+# Rebuild all four relevant images every run. Docker layer cache keeps this
 # fast when nothing relevant changed (~5-10s), slow on cold/first-run
-# (~2-5min). mock-bank is skipped — it's mostly static JS.
+# (~2-5min).
+#
+# mock-bank MUST be in the list — it is not "mostly static JS". It carries
+# test-critical routing logic (e.g. resolveKTBBiznextAccount cross-bank
+# guard from mobiz commit 1ad0712). Regression 20260421-165340 failed
+# because mock-bank was skipped here and the container ran stale code,
+# routing SCB statements to the KTB bot.
 
 INFRA_LOG="$RUN_DIR/infra.log"
-log "Rebuilding backend + bank-bot + bank-bot-ktb images (docker layer cache will short-circuit if no changes)..."
+# up -d --build --no-deps so that containers whose image actually changed
+# get recreated in the same step. A plain `build` leaves old containers
+# running against new images, which was the root cause of regression
+# 20260421-165340 for mock-bank. --no-deps keeps mongodb/redis untouched.
+log "Rebuilding + recreating backend + mock-bank + bank-bot + bank-bot-ktb (docker layer cache will short-circuit if no changes)..."
 BUILD_START=$(date +%s)
-if ! docker compose -f integration-tests/docker-compose.yml build \
-    backend bank-bot bank-bot-ktb >> "$INFRA_LOG" 2>&1; then
-  log "ABORT: docker compose build failed — see $INFRA_LOG"
+if ! docker compose -f integration-tests/docker-compose.yml up -d --build --no-deps \
+    backend mock-bank bank-bot bank-bot-ktb >> "$INFRA_LOG" 2>&1; then
+  log "ABORT: docker compose up --build failed — see $INFRA_LOG"
   send_tg "🔴 <b>Regression aborted</b> (run <code>${RUN_ID}</code>)
-<code>docker compose build</code> failed. Source error or build-time failure — ไม่ได้รัน test เลย
+<code>docker compose up --build</code> failed. Source error or build-time failure — ไม่ได้รัน test เลย
 
 ดู <code>${INFRA_LOG}</code>"
   exit 1
