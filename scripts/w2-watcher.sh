@@ -95,56 +95,69 @@ cmd_status() {
   echo ""
   for role in "${!REPOS[@]}"; do
     repo=${REPOS[$role]}
+    repo_slug=$(echo "$repo" | sed 's|.*/github\.com/||')
     state_file=$STATE_DIR/$role.state
     echo "── $role ──"
+    echo "    repo:           $repo_slug"
+    echo ""
+
+    # ── W2 trigger gate ───────────────────────────────────────────────────
+    # The settle/min_gap math here decides WHEN the wake fires. Once it does,
+    # the wake's prompt runs W2 first, then chains W9 (see W9 section below).
+    echo "  W2 trigger gate (when to wake):"
     if [ -f "$state_file" ]; then
       source "$state_file"
       now=$(date +%s)
-      echo "    last_seen:      ${last_seen:0:12}"
+      echo "      last_seen:      ${last_seen:0:12}"
       if [ "${last_new:-0}" -gt 0 ]; then
         age=$((now - last_new))
         settle_left=$((SETTLE_WINDOW - age))
         if [ $settle_left -gt 0 ]; then
-          echo "    settling:       $((age/60)) min since last new commit ($((settle_left/60)) min left of settle window)"
+          echo "      settling:       $((age/60)) min since last new commit ($((settle_left/60)) min left of settle window)"
         else
-          echo "    settled:        new commits ready to trigger"
+          echo "      settled:        new commits ready to trigger"
         fi
       else
-        echo "    pending:        nothing new since last run"
+        echo "      pending:        nothing new since last run"
       fi
       if [ "${last_run:-0}" -gt 0 ]; then
         gap=$((now - last_run))
         gap_left=$((MIN_GAP - gap))
         if [ $gap_left -gt 0 ]; then
-          echo "    min_gap block:  $((gap/60)) min since last run ($((gap_left/60)) min left of min_gap)"
+          echo "      min_gap block:  $((gap/60)) min since last run ($((gap_left/60)) min left of min_gap)"
         else
-          echo "    min_gap clear:  last run was $((gap/60)) min ago"
+          echo "      min_gap clear:  last run was $((gap/60)) min ago"
         fi
       else
-        echo "    first run:      never triggered yet"
+        echo "      first run:      never triggered yet"
       fi
     else
-      echo "    (uninitialized — run the watcher once to seed)"
+      echo "      (uninitialized — run the watcher once to seed)"
     fi
+    echo ""
 
-    # W9 chain status — query GitHub for the current open W9 PR (if any).
-    # This is what claude inside the wake will check via Step 8.0 detect →
-    # 8.A (amend) if non-empty / 8.B (new) if empty. See workflow-9-track-flows.md.
-    repo_slug=$(echo "$repo" | sed 's|.*/github\.com/||')
+    # ── W9 chain (downstream of W2 inside the same wake) ──────────────────
+    # When the wake fires, claude runs W2 to completion, then reads the W9
+    # spec and runs it. This block tells you what the W9 portion will do
+    # by querying GitHub for the same signal Step 8.0 detect uses inline.
+    echo "  W9 chain (runs after W2 in same wake):"
     if command -v gh > /dev/null 2>&1; then
       w9_pr=$(gh pr list --repo "$repo_slug" --search "head:docs/flow-track- state:open" --author "@me" --json number,headRefName,title,createdAt --jq '.[0]' 2>/dev/null)
       if [ -n "$w9_pr" ] && [ "$w9_pr" != "null" ]; then
         pr_num=$(jq -r .number <<< "$w9_pr" 2>/dev/null)
         pr_branch=$(jq -r .headRefName <<< "$w9_pr" 2>/dev/null)
         pr_age_iso=$(jq -r .createdAt <<< "$w9_pr" 2>/dev/null)
-        echo "    W9 PR open:     #$pr_num ($pr_branch, opened $pr_age_iso)"
-        echo "                    → next wake takes 8.A amend path on the W9 portion"
+        echo "      open W9 PR:     #$pr_num ($pr_branch)"
+        echo "      opened:         $pr_age_iso"
+        echo "      next path:      8.A — amend the open PR (extend cumulative range)"
       else
-        echo "    W9 PR:          none open → next wake takes 8.B new-PR path on the W9 portion"
+        echo "      open W9 PR:     none"
+        echo "      next path:      8.B — open a new PR (clean cycle)"
       fi
     else
-      echo "    W9 PR:          (gh CLI unavailable — install/authenticate to surface W9 chain state)"
+      echo "      (gh CLI unavailable — install/authenticate to surface W9 chain state)"
     fi
+    echo ""
   done
 }
 
