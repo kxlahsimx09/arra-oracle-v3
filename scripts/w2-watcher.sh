@@ -328,8 +328,15 @@ cmd_run() {
               # other roles.
               if [ "$role" = "pg-tester" ]; then
                 log "[$role] chaining regression-then-investigate.sh (fire-and-forget)"
+                # </dev/null is load-bearing: without it, deep children (docker
+                # compose exec) inherit stdin from the parent's tty and can
+                # receive SIGTTIN when trying to read term-size / auth prompts
+                # → process stops with state T → whole chain hangs. Fixed
+                # 2026-04-21 after a live regression hung for 17+ min with 11
+                # SIGSTOP'd processes. nohup alone (without </dev/null) is
+                # insufficient when spawned from an interactive-tty context.
                 nohup bash "$SCRIPT_DIR/regression-then-investigate.sh" \
-                  >> "$STATE_DIR/regression.log" 2>&1 &
+                  </dev/null >> "$STATE_DIR/regression.log" 2>&1 &
                 disown
               fi
             else
