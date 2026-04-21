@@ -351,14 +351,14 @@ Per-test logs: ${RUN_DIR}/<test-name>.log"
 fi  # end fail-fast vs multi-fail branch
 
 log "Spawning tester investigation wake..."
-if maw wake tester --fresh "$INVESTIGATE_PROMPT" >> "$RUN_DIR/runner.log" 2>&1; then
-  log "Investigation wake spawned — tester will send Telegram summary"
+if maw wake pg-tester --fresh "$INVESTIGATE_PROMPT" >> "$RUN_DIR/runner.log" 2>&1; then
+  log "Investigation wake spawned — pg-tester will send Telegram summary"
 else
-  log "FAIL: maw wake tester failed — sending fallback Telegram"
+  log "FAIL: maw wake pg-tester failed — sending fallback Telegram"
   if [ "$FAIL_COUNT" -eq 1 ]; then
     send_tg "🔴 <b>Regression ${RUN_ID}</b> — fail-fast stop at <code>${FIRST_FAIL_NAME}</code> (passed ${PASS_COUNT}/${TOTAL}, ${SUITE_MIN}m)
 
-⚠️ maw wake tester (investigation) เรียกไม่สำเร็จ — investigate manual จาก <code>${RUN_DIR}/${FIRST_FAIL_NAME}.log</code>
+⚠️ maw wake pg-tester (investigation) เรียกไม่สำเร็จ — investigate manual จาก <code>${RUN_DIR}/${FIRST_FAIL_NAME}.log</code>
 
 Tests ที่ยังไม่ได้รัน (${REMAINING_COUNT}):
 ${REMAINING_SHORT}"
@@ -367,7 +367,7 @@ ${REMAINING_SHORT}"
 
 <b>Fail list:</b>
 ${FAIL_SHORT}
-⚠️ maw wake tester (investigation) เรียกไม่สำเร็จ — ต้อง investigate manual จาก <code>${RUN_DIR}/</code>"
+⚠️ maw wake pg-tester (investigation) เรียกไม่สำเร็จ — ต้อง investigate manual จาก <code>${RUN_DIR}/</code>"
   fi
 fi
 

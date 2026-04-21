@@ -92,12 +92,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 declare -A REPOS=(
   ["pg-writer"]="$HOME/Code/github.com/kokarat/mobiz-payment-gateway"
   ["bot-writer"]="$HOME/Code/github.com/kokarat/bank-bot"
-  ["tester"]="$HOME/Code/github.com/kokarat/mobiz-payment-gateway"
+  ["pg-tester"]="$HOME/Code/github.com/kokarat/mobiz-payment-gateway"
 )
 declare -A STEP_NAMES=(
   ["pg-writer"]="8b"   # mobiz W2 has Step 8b for Telegram (mcp: telegram)
   ["bot-writer"]="6b"  # bank-bot W2 has Step 6b for Telegram (mcp: telegram)
-  ["tester"]="7b"      # mobiz tester W1 has Step 7b for Telegram (mcp: tester-telegram)
+  ["pg-tester"]="7b"      # mobiz tester W1 has Step 7b for Telegram (mcp: tester-telegram)
 )
 
 log() {
@@ -176,7 +176,7 @@ cmd_status() {
     # ── downstream chain / full-sweep info (per role) ─────────────────────
     # pg-writer/bot-writer: show W9 chain state (W9 runs after W2 in same wake)
     # tester:               show that W1 is full-sweep, no chain
-    if [ "$role" = "tester" ]; then
+    if [ "$role" = "pg-tester" ]; then
       echo "  Wake runs: W1 validate-integration-tests (full-sweep, no chain)"
       echo "      scope:          static analysis of every integration-tests/test-*.sh"
       echo "      commit-aware:   STALE candidates scoped to \$PRIOR_BASELINE..HEAD"
@@ -304,7 +304,7 @@ cmd_run() {
             # Prompt branches by role: writers (pg-writer/bot-writer) run
             # W2→W9 chained; tester runs W1 full-sweep solo (no chain, no
             # Telegram step today — see header comment).
-            if [ "$role" = "tester" ]; then
+            if [ "$role" = "pg-tester" ]; then
               prompt="อ่าน .agent/skills/tester/SKILL.md + .agent/skills/tester/references/workflow-1-validate-integration-tests.md ให้ครบ แล้วรัน W1 validate-integration-tests จนจบ. W1 เป็น full-sweep static analysis ของทุก integration-tests/test-*.sh — ใช้ \$PRIOR_BASELINE..HEAD จาก docs/test-index.md header เพื่อ scope STALE candidates. เสร็จ Step 7 (commit+PR) + Step ${step} (Telegram summary via mcp__tester-telegram__telegram_send — ไม่ใช่ generic telegram MCP ของ writer fleet) + Step 8 (retro) แล้วจบ pass — ไม่ต้อง chain workflow อื่น. ถ้า zero production-surface commits ใน range และ pattern library (\`.agent/skills/integration-test-writer/\`) ไม่ได้แก้ ให้ skip Step 7 PR (no-op) แต่ยังส่ง Telegram short-note ว่า 'วันนี้ validate N tests, 0 regression' เพื่อรักษา cadence, แล้วเขียน retro ว่า no-op."
             else
               # W9 chained after W2 in the same wake (Option A from 2026-04-21
@@ -326,7 +326,7 @@ cmd_run() {
               # keeps the watcher loop unblocked — the runner can take 30-60
               # min, which would otherwise freeze the poll cadence for the
               # other roles.
-              if [ "$role" = "tester" ]; then
+              if [ "$role" = "pg-tester" ]; then
                 log "[$role] chaining regression-then-investigate.sh (fire-and-forget)"
                 nohup bash "$SCRIPT_DIR/regression-then-investigate.sh" \
                   >> "$STATE_DIR/regression.log" 2>&1 &
