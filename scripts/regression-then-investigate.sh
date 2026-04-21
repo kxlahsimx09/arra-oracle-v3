@@ -128,12 +128,41 @@ if [ ${#MISSING[@]} -gt 0 ]; then
   exit 1
 fi
 
-# ── Step 2: Start infrastructure ───────────────────────────────────────────
+# ── Step 2a: Rebuild images (backend + bank-bot) against HEAD ──────────────
+# User's setup is DOCKER_MODE (persistent containers for backend, bank-bot,
+# bank-bot-ktb, mock-bank). Images must be rebuilt when source changes,
+# otherwise tests run against stale code = misleading green/red.
+#
+# Rebuild all three relevant images every run. Docker layer cache keeps this
+# fast when nothing relevant changed (~5-10s), slow on cold/first-run
+# (~2-5min). mock-bank is skipped — it's mostly static JS.
 cd "$MOBIZ" || { log "ABORT: cannot cd into $MOBIZ"; exit 1; }
 
 INFRA_LOG="$RUN_DIR/infra.log"
-log "Starting infrastructure (docker + backend + mock-bank)..."
-bash integration-tests/run-integration-test.sh > "$INFRA_LOG" 2>&1 &
+log "Rebuilding backend + bank-bot + bank-bot-ktb images (docker layer cache will short-circuit if no changes)..."
+BUILD_START=$(date +%s)
+if ! docker compose -f integration-tests/docker-compose.yml build \
+    backend bank-bot bank-bot-ktb >> "$INFRA_LOG" 2>&1; then
+  log "ABORT: docker compose build failed — see $INFRA_LOG"
+  send_tg "🔴 <b>Regression aborted</b> (run <code>${RUN_ID}</code>)
+<code>docker compose build</code> failed. Source error or build-time failure — ไม่ได้รัน test เลย
+
+ดู <code>${INFRA_LOG}</code>"
+  exit 1
+fi
+BUILD_ELAPSED=$(($(date +%s) - BUILD_START))
+log "  build done (${BUILD_ELAPSED}s)"
+
+# ── Step 2b: Start infrastructure ──────────────────────────────────────────
+# DOCKER_MODE=true — setup-infra.sh skips native go build + mock-bank native
+#                   startup; waits for existing containers instead.
+# SKIP_INFRA=true  — setup-infra.sh skips `docker compose up -d`
+#                   AND infra_cleanup skips `docker compose down -v` — so our
+#                   teardown (SIGTERM → trap → infra_cleanup) will NOT
+#                   destroy the user's persistent stack.
+log "Starting infrastructure (DOCKER_MODE=true SKIP_INFRA=true — respects user's persistent containers)..."
+DOCKER_MODE=true SKIP_INFRA=true \
+  bash integration-tests/run-integration-test.sh >> "$INFRA_LOG" 2>&1 &
 INFRA_PID=$!
 log "  run-integration-test.sh pid=$INFRA_PID — waiting up to ${INFRA_READY_TIMEOUT}s for ready marker"
 
@@ -152,12 +181,12 @@ done
 
 if [ "$READY" != true ]; then
   log "ABORT: infrastructure failed to come up within ${INFRA_READY_TIMEOUT}s"
+  # Polite: SIGTERM only. The spawned script's EXIT trap runs infra_cleanup
+  # which respects SKIP_INFRA=true → leaves user's docker stack alone.
   kill "$INFRA_PID" 2>/dev/null
-  bash integration-tests/run-integration-test.sh --cleanup >> "$INFRA_LOG" 2>&1 || true
   send_tg "🔴 <b>Regression aborted</b> (run <code>${RUN_ID}</code>)
 Infrastructure failed to start within ${INFRA_READY_TIMEOUT}s.
-
-ดู <code>${INFRA_LOG}</code>"
+Backend/mock-bank container may be unhealthy — check <code>docker ps</code> + <code>${INFRA_LOG}</code>"
   exit 1
 fi
 
@@ -188,10 +217,16 @@ SUITE_ELAPSED=$(($(date +%s) - SUITE_START))
 SUITE_MIN=$((SUITE_ELAPSED / 60))
 
 # ── Step 4: Teardown ───────────────────────────────────────────────────────
-log "Tearing down infrastructure..."
+# SIGTERM the spawned run-integration-test.sh. Its EXIT trap runs infra_cleanup,
+# which with DOCKER_MODE=true skips native process kill and with SKIP_INFRA=true
+# skips `docker compose down -v`. So the user's persistent container stack
+# remains running after this script exits.
+#
+# We do NOT call `run-integration-test.sh --cleanup` here — that path hardcodes
+# `docker compose down -v` and would destroy the stack regardless of flags.
+log "Tearing down infrastructure (SIGTERM; respects SKIP_INFRA so stack survives)..."
 kill "$INFRA_PID" 2>/dev/null
 sleep 2
-bash integration-tests/run-integration-test.sh --cleanup >> "$INFRA_LOG" 2>&1 || true
 
 # ── Step 5: Report ─────────────────────────────────────────────────────────
 PASS_COUNT=${#PASSED[@]}
