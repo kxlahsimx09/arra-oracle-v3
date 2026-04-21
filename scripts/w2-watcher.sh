@@ -1,20 +1,36 @@
 #!/usr/bin/env bash
-# w2-watcher.sh — watch mobiz + bank-bot for new commits, trigger W2 (and W9
-# chained immediately after) with debounce.
+# w2-watcher.sh — watch mobiz + bank-bot for new commits, trigger per-role
+# commit-driven workflows with debounce. Originally a pg-writer/bot-writer W2
+# watcher (hence the name); now also fires tester W1 full-sweep validation
+# against mobiz. Rename deferred to keep blast radius small — the old name is
+# still cited in retros/learnings per P-001.
 #
-# Philosophy: W2 should fire *when there is work to do*, not on a dumb cron.
+# Philosophy: wakes should fire *when there is work to do*, not on a dumb cron.
 # When commits do arrive they tend to burst (analysis 2026-04-19: mobiz 54%,
 # bank-bot 39% of commits land within 30 min of a prior one), so we wait for
-# the burst to settle before triggering — otherwise W2 would fire 3-5 times
-# in 30 min on the same cluster.
+# the burst to settle before triggering — otherwise a wake would fire 3-5
+# times in 30 min on the same cluster.
 #
 # Design (derived from 14-day commit-pattern analysis):
 #   - POLL_INTERVAL (5 min)    — check for new commits on origin/main
 #   - SETTLE_WINDOW (30 min)   — quiet period after the last new commit;
 #                                 we only fire once the repo is quiet for
 #                                 this long, so bursts get batched
-#   - MIN_GAP (2 hr)           — floor between consecutive W2 runs on the
-#                                 same repo, even if new commits keep landing
+#   - MIN_GAP (2 hr)           — floor between consecutive runs of the same
+#                                 role, even if new commits keep landing.
+#                                 Independent per role (pg-writer, bot-writer,
+#                                 tester each track their own last_run).
+#
+# Roles wired today:
+#   - pg-writer  — mobiz  — W2 track-commit → W9 track-flows (chained in wake)
+#   - bot-writer — bank-bot — W2 track-commit → W9 track-flows (chained in wake)
+#   - tester     — mobiz  — W1 validate-integration-tests (full-sweep, no chain)
+#
+# Note on pg-writer vs tester sharing mobiz: both watch the same repo, but
+# each has its own state file and independent settle/min_gap timer. A mobiz
+# commit burst triggers both wakes (separately — different roles, different
+# skills, different tmux sessions). W9 is chained inside the pg-writer wake
+# (not a separate role) because it's owned by the same technical-writer skill.
 #
 # W9 chaining (added 2026-04-21):
 #   - W9 spec mandates "parallel to W2 on the daily cron" but no separate cron
@@ -27,11 +43,24 @@
 #     extend the open W9 PR rather than stacking new ones — same shape as the
 #     fix we landed for W2 the same week.
 #
+# Tester W1 integration (added 2026-04-21):
+#   - Tester W1 is full-sweep static analysis (validates every test-*.sh
+#     against the integration-test-writer pattern library). It's "commit-
+#     aware" — uses `$PRIOR_BASELINE..HEAD` to scope STALE-candidate surface —
+#     but runs the same full sweep regardless. Baseline tracking is internal
+#     (docs/test-index.md header), so the watcher only needs to decide WHEN
+#     to fire; W1 itself handles WHAT to scope.
+#   - No Telegram step in W1 today (unlike W2 Step 8b/6b). Gap flagged for
+#     tester role to decide; watcher just skips the Telegram hint in the
+#     wake prompt. If tester later adds a Telegram step, update STEP_NAMES.
+#   - No chain after W1. Tester W2/W3 are human-triggered workflows (new test
+#     authoring, mock-bank drift check), not commit-watchable.
+#
 # Usage:
 #   bash w2-watcher.sh              # foreground (tail -f style logs to stdout)
 #   bash w2-watcher.sh &             # background
 #   nohup bash w2-watcher.sh > ~/w2-watcher.log 2>&1 &   # persist past shell exit
-#   bash w2-watcher.sh status        # show state per repo, whether W2 is primed
+#   bash w2-watcher.sh status        # show state per role, whether wake is primed
 #   bash w2-watcher.sh stop          # kill a running watcher (by pid file)
 #
 # Override defaults from shell:
@@ -54,14 +83,16 @@ PID_FILE=$STATE_DIR/watcher.pid
 LOG_FILE=${LOG_FILE:-$STATE_DIR/watcher.log}
 mkdir -p "$STATE_DIR"
 
-# role → (repo_path, step_name_for_prompt)
+# role → (repo_path, telegram_step_for_wake_prompt)
 declare -A REPOS=(
   ["pg-writer"]="$HOME/Code/github.com/kokarat/mobiz-payment-gateway"
   ["bot-writer"]="$HOME/Code/github.com/kokarat/bank-bot"
+  ["tester"]="$HOME/Code/github.com/kokarat/mobiz-payment-gateway"
 )
 declare -A STEP_NAMES=(
   ["pg-writer"]="8b"   # mobiz W2 has Step 8b for Telegram
   ["bot-writer"]="6b"  # bank-bot W2 has Step 6b for Telegram (fewer steps)
+  ["tester"]=""        # tester W1 has no Telegram step today — see header note
 )
 
 log() {
@@ -101,10 +132,11 @@ cmd_status() {
     echo "    repo:           $repo_slug"
     echo ""
 
-    # ── W2 trigger gate ───────────────────────────────────────────────────
-    # The settle/min_gap math here decides WHEN the wake fires. Once it does,
-    # the wake's prompt runs W2 first, then chains W9 (see W9 section below).
-    echo "  W2 trigger gate (when to wake):"
+    # ── trigger gate ──────────────────────────────────────────────────────
+    # The settle/min_gap math here decides WHEN the wake fires for this role.
+    # Once it does, the wake's prompt is built per-role (see cmd_run): writers
+    # run W2→W9 chained; tester runs W1 full-sweep solo.
+    echo "  Trigger gate (when to wake):"
     if [ -f "$state_file" ]; then
       source "$state_file"
       now=$(date +%s)
@@ -136,26 +168,32 @@ cmd_status() {
     fi
     echo ""
 
-    # ── W9 chain (downstream of W2 inside the same wake) ──────────────────
-    # When the wake fires, claude runs W2 to completion, then reads the W9
-    # spec and runs it. This block tells you what the W9 portion will do
-    # by querying GitHub for the same signal Step 8.0 detect uses inline.
-    echo "  W9 chain (runs after W2 in same wake):"
-    if command -v gh > /dev/null 2>&1; then
-      w9_pr=$(gh pr list --repo "$repo_slug" --search "head:docs/flow-track- state:open" --author "@me" --json number,headRefName,title,createdAt --jq '.[0]' 2>/dev/null)
-      if [ -n "$w9_pr" ] && [ "$w9_pr" != "null" ]; then
-        pr_num=$(jq -r .number <<< "$w9_pr" 2>/dev/null)
-        pr_branch=$(jq -r .headRefName <<< "$w9_pr" 2>/dev/null)
-        pr_age_iso=$(jq -r .createdAt <<< "$w9_pr" 2>/dev/null)
-        echo "      open W9 PR:     #$pr_num ($pr_branch)"
-        echo "      opened:         $pr_age_iso"
-        echo "      next path:      8.A — amend the open PR (extend cumulative range)"
-      else
-        echo "      open W9 PR:     none"
-        echo "      next path:      8.B — open a new PR (clean cycle)"
-      fi
+    # ── downstream chain / full-sweep info (per role) ─────────────────────
+    # pg-writer/bot-writer: show W9 chain state (W9 runs after W2 in same wake)
+    # tester:               show that W1 is full-sweep, no chain
+    if [ "$role" = "tester" ]; then
+      echo "  Wake runs: W1 validate-integration-tests (full-sweep, no chain)"
+      echo "      scope:          static analysis of every integration-tests/test-*.sh"
+      echo "      commit-aware:   STALE candidates scoped to \$PRIOR_BASELINE..HEAD"
+      echo "      baseline:       tracked internally in docs/test-index.md header"
     else
-      echo "      (gh CLI unavailable — install/authenticate to surface W9 chain state)"
+      echo "  W9 chain (runs after W2 in same wake):"
+      if command -v gh > /dev/null 2>&1; then
+        w9_pr=$(gh pr list --repo "$repo_slug" --search "head:docs/flow-track- state:open" --author "@me" --json number,headRefName,title,createdAt --jq '.[0]' 2>/dev/null)
+        if [ -n "$w9_pr" ] && [ "$w9_pr" != "null" ]; then
+          pr_num=$(jq -r .number <<< "$w9_pr" 2>/dev/null)
+          pr_branch=$(jq -r .headRefName <<< "$w9_pr" 2>/dev/null)
+          pr_age_iso=$(jq -r .createdAt <<< "$w9_pr" 2>/dev/null)
+          echo "      open W9 PR:     #$pr_num ($pr_branch)"
+          echo "      opened:         $pr_age_iso"
+          echo "      next path:      8.A — amend the open PR (extend cumulative range)"
+        else
+          echo "      open W9 PR:     none"
+          echo "      next path:      8.B — open a new PR (clean cycle)"
+        fi
+      else
+        echo "      (gh CLI unavailable — install/authenticate to surface W9 chain state)"
+      fi
     fi
     echo ""
   done
@@ -253,20 +291,24 @@ cmd_run() {
 
         if [ "$settle_elapsed" -ge "$SETTLE_WINDOW" ]; then
           if [ "$gap_elapsed" -ge "$MIN_GAP" ] || [ "$last_run" -eq 0 ]; then
-            log "[$role] TRIGGER W2 (settle=$((settle_elapsed/60))min, gap=$((gap_elapsed/60))min)"
+            log "[$role] TRIGGER wake (settle=$((settle_elapsed/60))min, gap=$((gap_elapsed/60))min)"
             # maw wake fires fresh worktree + fresh claude + sends the task.
-            # Output is one-shot print-mode. If it fails mid-workflow the W2
-            # spec's own fallback (#telegram-failed learning, retro note)
-            # captures partial state. See mobiz/bank-bot workflow-2-track-commit.md.
+            # Output is one-shot print-mode. If it fails mid-workflow, each
+            # spec's own fallback (retro note / learning) captures partial state.
             #
-            # W9 is chained after W2 in the same wake (Option A from 2026-04-21
-            # design discussion). One claude session, one worktree, two specs run
-            # sequentially. Saves wake cost vs running two parallel watchers and
-            # respects the W9 Step 8.0/8.A/8.B detect→amend gate (claude inside
-            # the wake will check for an open docs/flow-track-* PR before opening
-            # a new one). If the W9 portion is a no-op (no flow-territory commits),
-            # the agent should log it in its retro and skip the W9 PR.
-            prompt="อ่าน .agent/skills/technical-writer/references/workflow-2-track-commit.md ให้ครบ แล้วรัน W2 จนจบ (รวม Step ${step} Telegram summary). หลังจาก W2 commit + PR + retro เสร็จเรียบร้อย ให้อ่าน .agent/skills/technical-writer/references/workflow-9-track-flows.md ต่อทันที แล้วรัน W9 จนจบเช่นกัน — ตรวจ flow pointer drift, ทำตาม Step 8.0 detect (ถ้ามี open docs/flow-track-* PR ค้างอยู่ → 8.A amend; ถ้าไม่มี → 8.B new PR), เขียน retro แยกตามที่ W9 spec กำหนด. ถ้า W9 เป็น no-op (zero-drift, no flow-territory commits in range) ให้ log ใน retro แล้วจบ pass — ไม่ต้องเปิด PR เปล่า."
+            # Prompt branches by role: writers (pg-writer/bot-writer) run
+            # W2→W9 chained; tester runs W1 full-sweep solo (no chain, no
+            # Telegram step today — see header comment).
+            if [ "$role" = "tester" ]; then
+              prompt="อ่าน .agent/skills/tester/SKILL.md + .agent/skills/tester/references/workflow-1-validate-integration-tests.md ให้ครบ แล้วรัน W1 validate-integration-tests จนจบ. W1 เป็น full-sweep static analysis ของทุก integration-tests/test-*.sh — ใช้ \$PRIOR_BASELINE..HEAD จาก docs/test-index.md header เพื่อ scope STALE candidates. เสร็จ Step 7 (commit+PR) + Step 8 (retro) แล้วจบ pass — ไม่ต้อง chain workflow อื่น. ถ้า zero production-surface commits ใน range และ pattern library (\`.agent/skills/integration-test-writer/\`) ไม่ได้แก้ ให้ log ใน retro ว่า no-op แล้วไม่ต้องเปิด PR เปล่า."
+            else
+              # W9 chained after W2 in the same wake (Option A from 2026-04-21
+              # design discussion). One claude session, one worktree, two specs
+              # run sequentially. Respects the W9 Step 8.0/8.A/8.B detect→amend
+              # gate (claude inside the wake will check for an open
+              # docs/flow-track-* PR before opening a new one).
+              prompt="อ่าน .agent/skills/technical-writer/references/workflow-2-track-commit.md ให้ครบ แล้วรัน W2 จนจบ (รวม Step ${step} Telegram summary). หลังจาก W2 commit + PR + retro เสร็จเรียบร้อย ให้อ่าน .agent/skills/technical-writer/references/workflow-9-track-flows.md ต่อทันที แล้วรัน W9 จนจบเช่นกัน — ตรวจ flow pointer drift, ทำตาม Step 8.0 detect (ถ้ามี open docs/flow-track-* PR ค้างอยู่ → 8.A amend; ถ้าไม่มี → 8.B new PR), เขียน retro แยกตามที่ W9 spec กำหนด. ถ้า W9 เป็น no-op (zero-drift, no flow-territory commits in range) ให้ log ใน retro แล้วจบ pass — ไม่ต้องเปิด PR เปล่า."
+            fi
             if maw wake "$role" --fresh "$prompt" >> "$LOG_FILE" 2>&1; then
               log "[$role] wake succeeded"
               last_run=$now
