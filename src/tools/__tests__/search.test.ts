@@ -9,7 +9,9 @@ import {
   normalizeFtsScore,
   parseConceptsFromMetadata,
   combineResults,
+  vectorSearch,
 } from '../search.ts';
+import type { ToolContext } from '../types.ts';
 
 // ============================================================================
 // sanitizeFtsQuery
@@ -157,5 +159,35 @@ describe('combineResults', () => {
     expect(combineResults([], [])).toEqual([]);
     expect(combineResults(ftsResults, [])).toHaveLength(2);
     expect(combineResults([], vectorResults)).toHaveLength(2);
+  });
+});
+
+// ============================================================================
+// vectorSearch error propagation (regression: 2026-04-21 silent LanceDB failure)
+// ============================================================================
+
+describe('vectorSearch error handling', () => {
+  it('propagates store errors instead of swallowing them', async () => {
+    const storeError = new Error('lance error: Not found: data/foo.lance');
+    const ctx = {
+      vectorStore: {
+        query: async () => { throw storeError; },
+      },
+    } as unknown as ToolContext;
+
+    await expect(vectorSearch(ctx, 'any query', 'all', 5)).rejects.toThrow(
+      /lance error/,
+    );
+  });
+
+  it('returns empty array when store returns no ids (not an error)', async () => {
+    const ctx = {
+      vectorStore: {
+        query: async () => ({ ids: [], documents: [], distances: [], metadatas: [] }),
+      },
+    } as unknown as ToolContext;
+
+    const results = await vectorSearch(ctx, 'any query', 'all', 5);
+    expect(results).toEqual([]);
   });
 });
