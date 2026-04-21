@@ -172,6 +172,51 @@ Operator contract: <code>\$MOBIZ</code> must stay on <code>main</code>, clean, f
 fi
 log "  \$MOBIZ at $(git rev-parse --short HEAD) ($(git log -1 --format='%s' | head -c 60))"
 
+# ── Step 2.5: Sync $MOBIZ/bank-bot with origin/main ────────────────────────
+# bank-bot/ is a gitignored subfolder in mobiz but is actually a separate
+# git clone of kokarat/bank-bot (same remote as the standalone repo).
+# docker-compose's bank-bot + bank-bot-ktb services build their image from
+# this folder — so its freshness matters equally to $MOBIZ itself.
+#
+# Operator contract (agreed 2026-04-21): same as $MOBIZ — main, clean,
+# ff-able. Dev work happens in separate worktrees.
+BANK_BOT="$MOBIZ/bank-bot"
+if [ ! -d "$BANK_BOT/.git" ]; then
+  log "ABORT: $BANK_BOT is not a git repo (expected a kokarat/bank-bot clone)"
+  send_tg "🟡 <b>Regression skipped</b> (run <code>${RUN_ID}</code>)
+<code>\$MOBIZ/bank-bot</code> is not a git checkout. Expected a clone of <code>kokarat/bank-bot</code>.
+
+ดู <code>$RUN_DIR/runner.log</code>"
+  exit 1
+fi
+cd "$BANK_BOT" || { log "ABORT: cannot cd into $BANK_BOT"; exit 1; }
+log "Syncing \$BANK_BOT with origin/main..."
+if ! git fetch origin main --quiet 2>>"$RUN_DIR/runner.log"; then
+  log "ABORT: git fetch origin main failed in bank-bot"
+  send_tg "🟡 <b>Regression skipped</b> (run <code>${RUN_ID}</code>)
+<code>git fetch origin main</code> failed in <code>\$MOBIZ/bank-bot</code>. Network? Remote?
+
+ดู <code>$RUN_DIR/runner.log</code>"
+  exit 1
+fi
+if ! git pull --ff-only origin main --quiet 2>>"$RUN_DIR/runner.log"; then
+  BB_BRANCH=$(git branch --show-current 2>/dev/null)
+  BB_DIRTY=$(git status --porcelain 2>/dev/null | head -1)
+  log "ABORT: bank-bot pull failed (branch=$BB_BRANCH, dirty=${BB_DIRTY:+yes})"
+  send_tg "🟡 <b>Regression skipped</b> (run <code>${RUN_ID}</code>)
+<code>git pull --ff-only origin main</code> failed in <code>\$MOBIZ/bank-bot</code>.
+branch: <code>$BB_BRANCH</code> | dirty: <code>${BB_DIRTY:+yes}${BB_DIRTY:-no}</code>
+
+Operator contract: <code>\$MOBIZ/bank-bot</code> must stay on <code>main</code>, clean, ff-able. ทำ dev อื่นใน worktree. แก้ state ก่อน re-run
+
+ดู <code>$RUN_DIR/runner.log</code>"
+  exit 1
+fi
+log "  \$BANK_BOT at $(git rev-parse --short HEAD) ($(git log -1 --format='%s' | head -c 60))"
+
+# Return cwd to $MOBIZ for subsequent docker compose + test invocations
+cd "$MOBIZ"
+
 # ── Step 2a: Rebuild images (backend + mock-bank + bank-bot) against HEAD ──
 # User's setup is DOCKER_MODE (persistent containers for backend, bank-bot,
 # bank-bot-ktb, mock-bank). Images must be rebuilt when source changes,
