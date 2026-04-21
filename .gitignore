@@ -49,3 +49,6 @@ vault-repos.html
 vault-data.json
 .agent
 /.claude
+
+# Project-scope MCP config can carry tokens in clear text — gitignore as safety net
+.mcp.json
