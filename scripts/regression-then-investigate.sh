@@ -137,6 +137,41 @@ if [ ${#MISSING[@]} -gt 0 ]; then
   exit 1
 fi
 
+# ── Step 2: Sync $MOBIZ with origin/main ──────────────────────────────────
+# Contract with the operator (agreed 2026-04-21): $MOBIZ is kept on main,
+# clean, and ff-able at all times — any dev work happens in separate
+# worktrees. So a forced fetch + pull --ff-only is always safe here and
+# guarantees docker build uses the exact commit that triggered the watcher
+# (not stale user-local state).
+#
+# If the pull fails (wrong branch, dirty tree, diverged history), the
+# contract was violated — abort + Telegram so the operator sees it and fixes.
+cd "$MOBIZ" || { log "ABORT: cannot cd into $MOBIZ"; exit 1; }
+
+log "Syncing \$MOBIZ with origin/main..."
+if ! git fetch origin main --quiet 2>>"$RUN_DIR/runner.log"; then
+  log "ABORT: git fetch origin main failed"
+  send_tg "🟡 <b>Regression skipped</b> (run <code>${RUN_ID}</code>)
+<code>git fetch origin main</code> failed in <code>\$MOBIZ</code>. Network? Ref issue?
+
+ดู <code>$RUN_DIR/runner.log</code>"
+  exit 1
+fi
+if ! git pull --ff-only origin main --quiet 2>>"$RUN_DIR/runner.log"; then
+  BRANCH=$(git branch --show-current 2>/dev/null)
+  DIRTY=$(git status --porcelain 2>/dev/null | head -1)
+  log "ABORT: git pull --ff-only failed (branch=$BRANCH, dirty=${DIRTY:+yes})"
+  send_tg "🟡 <b>Regression skipped</b> (run <code>${RUN_ID}</code>)
+<code>git pull --ff-only origin main</code> failed in <code>\$MOBIZ</code>.
+branch: <code>$BRANCH</code> | dirty: <code>${DIRTY:+yes}${DIRTY:-no}</code>
+
+Operator contract: <code>\$MOBIZ</code> must stay on <code>main</code>, clean, ff-able. ทำ dev อื่นใน worktree. แก้ state ก่อน re-run
+
+ดู <code>$RUN_DIR/runner.log</code>"
+  exit 1
+fi
+log "  \$MOBIZ at $(git rev-parse --short HEAD) ($(git log -1 --format='%s' | head -c 60))"
+
 # ── Step 2a: Rebuild images (backend + bank-bot) against HEAD ──────────────
 # User's setup is DOCKER_MODE (persistent containers for backend, bank-bot,
 # bank-bot-ktb, mock-bank). Images must be rebuilt when source changes,
@@ -145,7 +180,6 @@ fi
 # Rebuild all three relevant images every run. Docker layer cache keeps this
 # fast when nothing relevant changed (~5-10s), slow on cold/first-run
 # (~2-5min). mock-bank is skipped — it's mostly static JS.
-cd "$MOBIZ" || { log "ABORT: cannot cd into $MOBIZ"; exit 1; }
 
 INFRA_LOG="$RUN_DIR/infra.log"
 log "Rebuilding backend + bank-bot + bank-bot-ktb images (docker layer cache will short-circuit if no changes)..."
