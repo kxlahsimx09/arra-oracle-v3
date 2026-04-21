@@ -26,6 +26,15 @@
 
 set -u
 
+# Detach stdin from any inherited tty at script entry. Without this, deep
+# children (docker compose exec → mongosh) can receive SIGTTIN when they
+# probe /dev/tty in a background process group → process stops with state T
+# → whole chain hangs. Even if the caller forgot `</dev/null`, this line
+# makes the script self-isolating. Safe side effect: no interactive prompts
+# inside the script can succeed — which is the right behavior for
+# unattended runs anyway.
+exec </dev/null
+
 MOBIZ=${MOBIZ:-$HOME/Code/github.com/kokarat/mobiz-payment-gateway}
 SUITE=${SUITE:-$MOBIZ/docs/regression-suite.txt}
 LOG_ROOT=${LOG_ROOT:-$HOME/.cache/w2-watcher/regression}

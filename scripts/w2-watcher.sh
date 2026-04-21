@@ -69,6 +69,13 @@
 
 set -u
 
+# Detach stdin from any inherited tty. Defensive: if a user restarts the
+# watcher from an interactive zsh without `</dev/null`, the watcher would
+# inherit tty, and any child it spawns (maw wake → tmux, regression script
+# → docker compose exec) could hit SIGTTIN and hang (observed 2026-04-21
+# with 11 SIGSTOP'd processes in a manual regression chain).
+exec </dev/null
+
 POLL_INTERVAL=${POLL_INTERVAL:-300}     # 5 min
 SETTLE_WINDOW=${SETTLE_WINDOW:-1800}    # 30 min
 MIN_GAP=${MIN_GAP:-7200}                # 2 hr
