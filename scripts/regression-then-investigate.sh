@@ -350,8 +350,17 @@ Runner log: ${RUN_DIR}/runner.log
 Per-test logs: ${RUN_DIR}/<test-name>.log"
 fi  # end fail-fast vs multi-fail branch
 
-log "Spawning tester investigation wake..."
-if maw wake pg-tester --fresh "$INVESTIGATE_PROMPT" >> "$RUN_DIR/runner.log" 2>&1; then
+# maw wake's send-keys path truncates long multi-line prompts (Thai text +
+# HTML tags + ~600+ bytes → maw's "DONE" end-marker leaks into the prompt,
+# zsh gets stuck on an unclosed quote, claude never starts). Workaround:
+# write the full prompt to a file in the run-dir, and pass a short pointer
+# as the wake prompt. The wake shell can handle 1-line ASCII trivially.
+PROMPT_FILE="$RUN_DIR/investigation-prompt.md"
+printf '%s\n' "$INVESTIGATE_PROMPT" > "$PROMPT_FILE"
+WAKE_POINTER="อ่าน $PROMPT_FILE ให้จบก่อน — นั่นคือ task ของคุณ. ทำตามคำสั่งในไฟล์ investigate + report ผ่าน mcp__tester-telegram__telegram_send ห้ามแก้ code/test."
+
+log "Spawning tester investigation wake (prompt in $PROMPT_FILE)..."
+if maw wake pg-tester --fresh "$WAKE_POINTER" >> "$RUN_DIR/runner.log" 2>&1; then
   log "Investigation wake spawned — pg-tester will send Telegram summary"
 else
   log "FAIL: maw wake pg-tester failed — sending fallback Telegram"
