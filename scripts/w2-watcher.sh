@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# w2-watcher.sh — watch mobiz + bank-bot for new commits, trigger W2 with debounce
+# w2-watcher.sh — watch mobiz + bank-bot for new commits, trigger W2 (and W9
+# chained immediately after) with debounce.
 #
 # Philosophy: W2 should fire *when there is work to do*, not on a dumb cron.
 # When commits do arrive they tend to burst (analysis 2026-04-19: mobiz 54%,
@@ -14,6 +15,17 @@
 #                                 this long, so bursts get batched
 #   - MIN_GAP (2 hr)           — floor between consecutive W2 runs on the
 #                                 same repo, even if new commits keep landing
+#
+# W9 chaining (added 2026-04-21):
+#   - W9 spec mandates "parallel to W2 on the daily cron" but no separate cron
+#     infra exists yet (P2 follow-up flagged 2026-04-19 brew-ops audit). Same
+#     wake handles both: claude reads the W2 spec, runs it to completion (incl.
+#     Telegram), then reads the W9 spec and runs it. Mostly no-op for bank-bot
+#     today (1 flow doc) but mobiz (6 flows) will see real work.
+#   - W9 has its own Step 8.0/8.A/8.B detect→amend gate (added 2026-04-20 in
+#     mb_agent_oracle_memory commit 0357769/0bdfdc3) so successive cycles will
+#     extend the open W9 PR rather than stacking new ones — same shape as the
+#     fix we landed for W2 the same week.
 #
 # Usage:
 #   bash w2-watcher.sh              # foreground (tail -f style logs to stdout)
@@ -213,7 +225,15 @@ cmd_run() {
             # Output is one-shot print-mode. If it fails mid-workflow the W2
             # spec's own fallback (#telegram-failed learning, retro note)
             # captures partial state. See mobiz/bank-bot workflow-2-track-commit.md.
-            prompt="อ่าน .agent/skills/technical-writer/references/workflow-2-track-commit.md ให้ครบ แล้วรัน workflow จนจบ รวม Step ${step} Telegram summary"
+            #
+            # W9 is chained after W2 in the same wake (Option A from 2026-04-21
+            # design discussion). One claude session, one worktree, two specs run
+            # sequentially. Saves wake cost vs running two parallel watchers and
+            # respects the W9 Step 8.0/8.A/8.B detect→amend gate (claude inside
+            # the wake will check for an open docs/flow-track-* PR before opening
+            # a new one). If the W9 portion is a no-op (no flow-territory commits),
+            # the agent should log it in its retro and skip the W9 PR.
+            prompt="อ่าน .agent/skills/technical-writer/references/workflow-2-track-commit.md ให้ครบ แล้วรัน W2 จนจบ (รวม Step ${step} Telegram summary). หลังจาก W2 commit + PR + retro เสร็จเรียบร้อย ให้อ่าน .agent/skills/technical-writer/references/workflow-9-track-flows.md ต่อทันที แล้วรัน W9 จนจบเช่นกัน — ตรวจ flow pointer drift, ทำตาม Step 8.0 detect (ถ้ามี open docs/flow-track-* PR ค้างอยู่ → 8.A amend; ถ้าไม่มี → 8.B new PR), เขียน retro แยกตามที่ W9 spec กำหนด. ถ้า W9 เป็น no-op (zero-drift, no flow-territory commits in range) ให้ log ใน retro แล้วจบ pass — ไม่ต้องเปิด PR เปล่า."
             if maw wake "$role" --fresh "$prompt" >> "$LOG_FILE" 2>&1; then
               log "[$role] wake succeeded"
               last_run=$now
