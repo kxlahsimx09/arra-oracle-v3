@@ -207,7 +207,17 @@ SUITE_START=$(date +%s)
 # See integration-tests/test-deposit-collision*.sh, test-*-fifo*.sh etc.
 export TEST_RUNNER_MODE=1
 
-for test in "${TESTS[@]}"; do
+# Fail-fast mode (default): stop the suite on the first failure and investigate
+# that one immediately. The operator can fix + re-run the suite rather than
+# having noise from downstream failures caused by the same upstream bug.
+#
+# Override by setting FAIL_FAST=0 to run every test regardless (useful for a
+# final "is the whole suite green?" check after fixes land).
+FAIL_FAST=${FAIL_FAST:-1}
+
+REMAINING=()
+for idx in "${!TESTS[@]}"; do
+  test="${TESTS[$idx]}"
   test_log="$RUN_DIR/$test.log"
   t_start=$(date +%s)
   log "▶ $test"
@@ -220,6 +230,15 @@ for test in "${TESTS[@]}"; do
     t_elapsed=$(($(date +%s) - t_start))
     log "  ❌ $test (exit=$rc, ${t_elapsed}s)"
     FAILED+=("$test|$rc|$t_elapsed")
+    if [ "$FAIL_FAST" = "1" ]; then
+      # Capture everything that didn't run so the Telegram / investigation
+      # prompt can mention it. Index + 1 is the next unrun test.
+      for j in $(seq $((idx + 1)) $((TOTAL - 1))); do
+        REMAINING+=("${TESTS[$j]}")
+      done
+      log "  fail-fast STOP (${#REMAINING[@]} tests not run; investigation will focus on this single failure)"
+      break
+    fi
   fi
 done
 
@@ -252,8 +271,17 @@ Log: <code>${RUN_DIR}</code>"
   exit 0
 fi
 
-# Build fail summary
-log "FAIL: ${FAIL_COUNT}/${TOTAL} (${SUITE_MIN}m)"
+# ── Extract the single failing test (fail-fast mode: always exactly 1) ─────
+# In non-fail-fast mode (FAIL_FAST=0), FAILED[] may have multiple entries.
+# Investigation prompt below handles both via the FAIL_LIST loop, but the
+# single-fail path is the default and Telegram wording reflects it.
+FIRST_FAIL_ENTRY="${FAILED[0]}"
+IFS='|' read -r FIRST_FAIL_NAME FIRST_FAIL_RC FIRST_FAIL_SEC <<< "$FIRST_FAIL_ENTRY"
+REMAINING_COUNT=${#REMAINING[@]}
+
+log "FAIL-FAST stop: ${FIRST_FAIL_NAME} (passed ${PASS_COUNT} before, ${REMAINING_COUNT} not run, elapsed ${SUITE_MIN}m)"
+
+# Build fail summary (supports multi-fail when FAIL_FAST=0)
 FAIL_LIST=""
 FAIL_SHORT=""
 for entry in "${FAILED[@]}"; do
@@ -264,8 +292,44 @@ for entry in "${FAILED[@]}"; do
 "
 done
 
+REMAINING_SHORT=""
+if [ "$REMAINING_COUNT" -gt 0 ]; then
+  for r in "${REMAINING[@]}"; do REMAINING_SHORT="${REMAINING_SHORT}• ${r}
+"; done
+fi
+
 # ── Step 6: Spawn investigation wake ───────────────────────────────────────
-INVESTIGATE_PROMPT="regression รันจบแล้ว เจอ ${FAIL_COUNT} test fail จาก ${TOTAL} ใน ${SUITE_MIN} นาที. อ่าน log ใน ${RUN_DIR}/ ของทุก test ที่ fail (รายการด้านล่าง), investigate ทีละตัวด้วย tester discipline (อ่าน test script + production code ที่ test เรียก + log output), แล้วส่ง summary ไป mcp__tester-telegram__telegram_send เป็นภาษาไทยง่ายๆ.
+# Fail-fast mode = investigate ONE test. Non-fail-fast = multiple.
+if [ "$FAIL_COUNT" -eq 1 ]; then
+  INVESTIGATE_PROMPT="regression หยุดที่ test ตัวแรกที่ fail (fail-fast mode). ก่อนหน้านี้ผ่านไปแล้ว ${PASS_COUNT} tests ใน ${SUITE_MIN} นาที. อีก ${REMAINING_COUNT} tests ยังไม่ได้รัน (รอ fix + re-run).
+
+Test ที่ fail: <code>${FIRST_FAIL_NAME}</code> (exit=${FIRST_FAIL_RC}, ${FIRST_FAIL_SEC}s)
+Log หลักที่ต้องอ่าน: ${RUN_DIR}/${FIRST_FAIL_NAME}.log
+Runner log: ${RUN_DIR}/runner.log
+Infra log (docker + setup): ${RUN_DIR}/infra.log
+Test script: integration-tests/${FIRST_FAIL_NAME}
+
+Investigate ด้วย tester discipline:
+  1. อ่าน ${FIRST_FAIL_NAME}.log — หา first error / assertion fail / non-200 / trap exit
+  2. อ่าน test script integration-tests/${FIRST_FAIL_NAME} — เข้าใจว่ามัน assert อะไร, ทำ setup อะไร
+  3. อ่าน production code ที่ test เรียก (controllers/services/routes ที่เกี่ยว) ณ HEAD
+  4. Classify + report
+
+Classify เป็น 1 ใน 4 ประเภท:
+  1. code bug — production code เพิ่งเปลี่ยนและ break expected behavior → ระบุ commit/file:line
+  2. test invalid — test เอง stale/wrong-assumption → ระบุว่าต้องแก้ assertion อะไร
+  3. flaky — transient (timing/race/env) → reproduce ไม่ stable
+  4. infra — docker/mock-bank/backend crash → ไม่ใช่ test issue
+
+ส่ง summary ผ่าน mcp__tester-telegram__telegram_send เป็นภาษาไทยง่ายๆ:
+- หัวข้อ: '🔴 Regression ${RUN_ID} — fail ที่ ${FIRST_FAIL_NAME}'
+- ประเภทปัญหา + ปัญหา 1-2 ประโยค + ต้องแก้ที่ไหน (ระบุ file:line ถ้าได้)
+- ถ้าเป็น flaky/infra: แนะนำว่า re-run อย่างเดียวพอไหม หรือต้อง investigate เพิ่ม
+
+**ห้ามแก้ code/test** — แค่ investigate + report. Human จะ fix หลังเห็น Telegram แล้ว re-run regression"
+else
+  # FAIL_FAST=0 path — multi-test investigation (same as before)
+  INVESTIGATE_PROMPT="regression รันจบแล้ว (FAIL_FAST=0) เจอ ${FAIL_COUNT} test fail จาก ${TOTAL} ใน ${SUITE_MIN} นาที. อ่าน log ใน ${RUN_DIR}/ ของทุก test ที่ fail (รายการด้านล่าง), investigate ทีละตัวด้วย tester discipline (อ่าน test script + production code ที่ test เรียก + log output), แล้วส่ง summary ไป mcp__tester-telegram__telegram_send เป็นภาษาไทยง่ายๆ.
 
 สำหรับแต่ละ test ที่ fail ให้ classify เป็น 1 ใน 4 ประเภท:
   1. code bug — production code เพิ่งเปลี่ยนและ break expected behavior → ระบุ commit/file:line
@@ -284,17 +348,27 @@ ${FAIL_LIST}
 Infra log: ${RUN_DIR}/infra.log
 Runner log: ${RUN_DIR}/runner.log
 Per-test logs: ${RUN_DIR}/<test-name>.log"
+fi  # end fail-fast vs multi-fail branch
 
 log "Spawning tester investigation wake..."
 if maw wake tester --fresh "$INVESTIGATE_PROMPT" >> "$RUN_DIR/runner.log" 2>&1; then
   log "Investigation wake spawned — tester will send Telegram summary"
 else
   log "FAIL: maw wake tester failed — sending fallback Telegram"
-  send_tg "🔴 <b>Regression ${RUN_ID}</b> — ${FAIL_COUNT}/${TOTAL} failed ในเวลา ${SUITE_MIN}m
+  if [ "$FAIL_COUNT" -eq 1 ]; then
+    send_tg "🔴 <b>Regression ${RUN_ID}</b> — fail-fast stop at <code>${FIRST_FAIL_NAME}</code> (passed ${PASS_COUNT}/${TOTAL}, ${SUITE_MIN}m)
+
+⚠️ maw wake tester (investigation) เรียกไม่สำเร็จ — investigate manual จาก <code>${RUN_DIR}/${FIRST_FAIL_NAME}.log</code>
+
+Tests ที่ยังไม่ได้รัน (${REMAINING_COUNT}):
+${REMAINING_SHORT}"
+  else
+    send_tg "🔴 <b>Regression ${RUN_ID}</b> — ${FAIL_COUNT}/${TOTAL} failed ในเวลา ${SUITE_MIN}m
 
 <b>Fail list:</b>
 ${FAIL_SHORT}
 ⚠️ maw wake tester (investigation) เรียกไม่สำเร็จ — ต้อง investigate manual จาก <code>${RUN_DIR}/</code>"
+  fi
 fi
 
 exit 1
