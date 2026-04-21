@@ -197,6 +197,16 @@ declare -a PASSED=()
 declare -a FAILED=()
 SUITE_START=$(date +%s)
 
+# TEST_RUNNER_MODE=1 signals to each test.sh that it's running headless/
+# automated (not interactive). Two effects that matter for the runner:
+#   1. Native bank-bot spawns (e.g. collision-dual) use HEADLESS=true instead
+#      of the default HEADLESS=false — keeps browser windows from popping up
+#      during unattended regression runs.
+#   2. Post-success hooks `exit 0` instead of trapping INT + `wait` forever,
+#      so each test.sh terminates cleanly and the runner moves to the next.
+# See integration-tests/test-deposit-collision*.sh, test-*-fifo*.sh etc.
+export TEST_RUNNER_MODE=1
+
 for test in "${TESTS[@]}"; do
   test_log="$RUN_DIR/$test.log"
   t_start=$(date +%s)
