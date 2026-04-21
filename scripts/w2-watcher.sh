@@ -50,9 +50,10 @@
 #     but runs the same full sweep regardless. Baseline tracking is internal
 #     (docs/test-index.md header), so the watcher only needs to decide WHEN
 #     to fire; W1 itself handles WHAT to scope.
-#   - No Telegram step in W1 today (unlike W2 Step 8b/6b). Gap flagged for
-#     tester role to decide; watcher just skips the Telegram hint in the
-#     wake prompt. If tester later adds a Telegram step, update STEP_NAMES.
+#   - W1 has Step 7b Telegram via mcp__tester-telegram__telegram_send (bot
+#     `@ampay_test_alert_bot`, chat 2002026175 — user's personal channel,
+#     separate from the writer fleet's `telegram` MCP). Registration lives
+#     in ~/.claude.json under the mobiz project block.
 #   - No chain after W1. Tester W2/W3 are human-triggered workflows (new test
 #     authoring, mock-bank drift check), not commit-watchable.
 #
@@ -90,9 +91,9 @@ declare -A REPOS=(
   ["tester"]="$HOME/Code/github.com/kokarat/mobiz-payment-gateway"
 )
 declare -A STEP_NAMES=(
-  ["pg-writer"]="8b"   # mobiz W2 has Step 8b for Telegram
-  ["bot-writer"]="6b"  # bank-bot W2 has Step 6b for Telegram (fewer steps)
-  ["tester"]=""        # tester W1 has no Telegram step today — see header note
+  ["pg-writer"]="8b"   # mobiz W2 has Step 8b for Telegram (mcp: telegram)
+  ["bot-writer"]="6b"  # bank-bot W2 has Step 6b for Telegram (mcp: telegram)
+  ["tester"]="7b"      # mobiz tester W1 has Step 7b for Telegram (mcp: tester-telegram)
 )
 
 log() {
@@ -300,7 +301,7 @@ cmd_run() {
             # W2→W9 chained; tester runs W1 full-sweep solo (no chain, no
             # Telegram step today — see header comment).
             if [ "$role" = "tester" ]; then
-              prompt="อ่าน .agent/skills/tester/SKILL.md + .agent/skills/tester/references/workflow-1-validate-integration-tests.md ให้ครบ แล้วรัน W1 validate-integration-tests จนจบ. W1 เป็น full-sweep static analysis ของทุก integration-tests/test-*.sh — ใช้ \$PRIOR_BASELINE..HEAD จาก docs/test-index.md header เพื่อ scope STALE candidates. เสร็จ Step 7 (commit+PR) + Step 8 (retro) แล้วจบ pass — ไม่ต้อง chain workflow อื่น. ถ้า zero production-surface commits ใน range และ pattern library (\`.agent/skills/integration-test-writer/\`) ไม่ได้แก้ ให้ log ใน retro ว่า no-op แล้วไม่ต้องเปิด PR เปล่า."
+              prompt="อ่าน .agent/skills/tester/SKILL.md + .agent/skills/tester/references/workflow-1-validate-integration-tests.md ให้ครบ แล้วรัน W1 validate-integration-tests จนจบ. W1 เป็น full-sweep static analysis ของทุก integration-tests/test-*.sh — ใช้ \$PRIOR_BASELINE..HEAD จาก docs/test-index.md header เพื่อ scope STALE candidates. เสร็จ Step 7 (commit+PR) + Step ${step} (Telegram summary via mcp__tester-telegram__telegram_send — ไม่ใช่ generic telegram MCP ของ writer fleet) + Step 8 (retro) แล้วจบ pass — ไม่ต้อง chain workflow อื่น. ถ้า zero production-surface commits ใน range และ pattern library (\`.agent/skills/integration-test-writer/\`) ไม่ได้แก้ ให้ skip Step 7 PR (no-op) แต่ยังส่ง Telegram short-note ว่า 'วันนี้ validate N tests, 0 regression' เพื่อรักษา cadence, แล้วเขียน retro ว่า no-op."
             else
               # W9 chained after W2 in the same wake (Option A from 2026-04-21
               # design discussion). One claude session, one worktree, two specs
