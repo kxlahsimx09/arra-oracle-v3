@@ -412,25 +412,43 @@ PROMPT_FILE="$RUN_DIR/investigation-prompt.md"
 printf '%s\n' "$INVESTIGATE_PROMPT" > "$PROMPT_FILE"
 WAKE_POINTER="อ่าน $PROMPT_FILE ให้จบก่อน — นั่นคือ task ของคุณ. ทำตามคำสั่งในไฟล์ investigate + report ผ่าน mcp__tester-telegram__telegram_send ห้ามแก้ code/test."
 
+# ── Primary notification (ALWAYS send, before spawning investigation) ─────
+# The investigation wake can fail silently (Anthropic API overload, claude
+# CLI crash in -p mode, maw wake succeeds but pasted command breaks). maw
+# wake exits 0 as soon as it send-keys into the tmux pane — it does NOT
+# wait for claude to finish. So "maw wake exit 0" ≠ "user got Telegram".
+#
+# Fix: send the primary fail notification via direct curl BEFORE spawning
+# the investigation wake. Investigation is a nice-to-have depth — if it
+# runs, the user gets a 2nd detailed Telegram; if it dies silently, the
+# user still has this primary one and can re-run investigation manually.
+#
+# Observed live 2026-04-21 18:46 — API Error overloaded_error killed the
+# investigation claude immediately, user got silent failure for 30+ min.
+if [ "$FAIL_COUNT" -eq 1 ]; then
+  send_tg "🔴 <b>Regression ${RUN_ID}</b> — fail-fast stop at <code>${FIRST_FAIL_NAME}</code>
+
+exit=${FIRST_FAIL_RC}, ${FIRST_FAIL_SEC}s. Passed ${PASS_COUNT}/${TOTAL} before this. ${REMAINING_COUNT} tests not run (fail-fast).
+Elapsed ${SUITE_MIN}m.
+
+Log: <code>${RUN_DIR}/${FIRST_FAIL_NAME}.log</code>
+
+🔎 Investigation wake spawning — detailed classification follows if pg-tester API OK. ถ้า Telegram นี้ค้างไม่มี detail ต่อใน 5-10 min = investigation ล้ม, ต้อง investigate manual"
+else
+  send_tg "🔴 <b>Regression ${RUN_ID}</b> — ${FAIL_COUNT}/${TOTAL} failed
+
+Elapsed ${SUITE_MIN}m.
+
+<b>Failed:</b>
+${FAIL_SHORT}
+🔎 Investigation wake spawning — per-test detail follows if pg-tester API OK"
+fi
+
 log "Spawning tester investigation wake (prompt in $PROMPT_FILE)..."
 if maw wake pg-tester --fresh "$WAKE_POINTER" >> "$RUN_DIR/runner.log" 2>&1; then
-  log "Investigation wake spawned — pg-tester will send Telegram summary"
+  log "Investigation wake spawned — pg-tester MAY send detailed Telegram (best-effort; depends on API availability)"
 else
-  log "FAIL: maw wake pg-tester failed — sending fallback Telegram"
-  if [ "$FAIL_COUNT" -eq 1 ]; then
-    send_tg "🔴 <b>Regression ${RUN_ID}</b> — fail-fast stop at <code>${FIRST_FAIL_NAME}</code> (passed ${PASS_COUNT}/${TOTAL}, ${SUITE_MIN}m)
-
-⚠️ maw wake pg-tester (investigation) เรียกไม่สำเร็จ — investigate manual จาก <code>${RUN_DIR}/${FIRST_FAIL_NAME}.log</code>
-
-Tests ที่ยังไม่ได้รัน (${REMAINING_COUNT}):
-${REMAINING_SHORT}"
-  else
-    send_tg "🔴 <b>Regression ${RUN_ID}</b> — ${FAIL_COUNT}/${TOTAL} failed ในเวลา ${SUITE_MIN}m
-
-<b>Fail list:</b>
-${FAIL_SHORT}
-⚠️ maw wake pg-tester (investigation) เรียกไม่สำเร็จ — ต้อง investigate manual จาก <code>${RUN_DIR}/</code>"
-  fi
+  log "FAIL: maw wake pg-tester returned non-zero (user already has primary Telegram above; no extra fallback needed)"
 fi
 
 exit 1
