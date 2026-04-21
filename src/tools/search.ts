@@ -176,9 +176,14 @@ export async function vectorSearch(
 
     return mappedResults;
   } catch (error) {
+    // Re-throw so handleSearch's outer catch surfaces the real error in the
+    // response warning. Swallowing here causes silent degradation: callers
+    // see "returned no results" when the store is actually broken (seen
+    // 2026-04-21 when LanceDB manifest drifted from data fragments for 3
+    // days before an audit caught it).
     const errorMsg = error instanceof Error ? error.stack || error.message : String(error);
     console.error('[ChromaDB ERROR]', errorMsg);
-    return [];
+    throw error;
   }
 }
 
