@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# regression-then-investigate.sh — chain after tester W1 wake
+#
+# Called by w2-watcher.sh in background after `maw wake tester` returns exit 0.
+#
+# Flow:
+#   1. Gate — verify tester W1 passed (`Newly-broken = 0` in docs/test-index.md)
+#   2. Start infra — spawn run-integration-test.sh, wait for "Environment Ready"
+#   3. Run every test in docs/regression-suite.txt sequentially (30-min safety
+#      timeout per test; each test has its own MAX_WAIT internally)
+#   4. Teardown infra
+#   5. If all pass → Telegram curl direct to ampay_test_alert_bot chat
+#      If any fail → maw wake tester --fresh "investigate <logs>" → tester
+#                    reads failure logs, classifies, reports via
+#                    mcp__tester-telegram__telegram_send (plain Thai)
+#
+# Usage (normally invoked by watcher):
+#   bash scripts/regression-then-investigate.sh
+#
+# Env overrides:
+#   MOBIZ        — path to mobiz repo (default: ghq default location)
+#   SUITE        — path to regression-suite.txt (default: $MOBIZ/docs/regression-suite.txt)
+#   LOG_ROOT     — where per-run log dirs go (default: ~/.cache/w2-watcher/regression)
+#   PER_TEST_TIMEOUT — safety-net timeout per test (default: 30m)
+#   INFRA_READY_TIMEOUT — how long to wait for "Environment Ready" (default: 300s)
+
+set -u
+
+MOBIZ=${MOBIZ:-$HOME/Code/github.com/kokarat/mobiz-payment-gateway}
+SUITE=${SUITE:-$MOBIZ/docs/regression-suite.txt}
+LOG_ROOT=${LOG_ROOT:-$HOME/.cache/w2-watcher/regression}
+PER_TEST_TIMEOUT=${PER_TEST_TIMEOUT:-30m}
+INFRA_READY_TIMEOUT=${INFRA_READY_TIMEOUT:-300}
+
+RUN_ID=$(date '+%Y%m%d-%H%M%S')
+RUN_DIR=$LOG_ROOT/$RUN_ID
+mkdir -p "$RUN_DIR"
+
+# ── Telegram creds — read from ~/.claude.json (same source as the MCP) ─────
+TOKEN=$(jq -r --arg p "$MOBIZ" '.projects[$p].mcpServers["tester-telegram"].env.TELEGRAM_BOT_TOKEN // empty' "$HOME/.claude.json" 2>/dev/null)
+CHAT=$(jq -r --arg p "$MOBIZ" '.projects[$p].mcpServers["tester-telegram"].env.TELEGRAM_DEFAULT_CHAT_ID // empty' "$HOME/.claude.json" 2>/dev/null)
+
+log() {
+  local ts=$(date '+%Y-%m-%d %H:%M:%S')
+  echo "[$ts] $*" | tee -a "$RUN_DIR/runner.log"
+}
+
+send_tg() {
+  # usage: send_tg "<html text>"
+  local text="$1"
+  if [ -z "$TOKEN" ] || [ -z "$CHAT" ]; then
+    log "WARN: telegram creds not found in ~/.claude.json — skipping send"
+    return
+  fi
+  curl -sf "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${CHAT}" \
+    --data-urlencode "text=${text}" \
+    --data-urlencode "parse_mode=HTML" \
+    --data-urlencode "disable_web_page_preview=true" \
+    -o /dev/null 2>>"$RUN_DIR/runner.log" \
+    || log "WARN: telegram send failed"
+}
+
+log "regression-then-investigate started"
+log "  MOBIZ=$MOBIZ"
+log "  SUITE=$SUITE"
+log "  RUN_DIR=$RUN_DIR"
+
+# ── Step 0: W1 gate ────────────────────────────────────────────────────────
+TEST_INDEX="$MOBIZ/docs/test-index.md"
+if [ ! -f "$TEST_INDEX" ]; then
+  log "ABORT: $TEST_INDEX not found — tester W1 may not have run or MOBIZ path is wrong"
+  send_tg "🟡 <b>Regression skipped</b> — <code>docs/test-index.md</code> not found. Tester W1 didn't land its output, or MOBIZ path is wrong. Run <code>$RUN_DIR/runner.log</code>"
+  exit 1
+fi
+
+NEWLY_BROKEN=$(grep -E '^\- Newly-broken since prior baseline: ' "$TEST_INDEX" | head -1 | grep -oE '[0-9]+' | head -1)
+if [ -z "$NEWLY_BROKEN" ]; then
+  log "ABORT: could not parse Newly-broken count from $TEST_INDEX"
+  send_tg "🟡 <b>Regression skipped</b> — could not parse <code>Newly-broken</code> count from tester W1's <code>docs/test-index.md</code>. Format may have drifted. Run <code>$RUN_DIR</code>"
+  exit 1
+fi
+
+if [ "$NEWLY_BROKEN" -ne 0 ]; then
+  log "SKIP: W1 reports Newly-broken=$NEWLY_BROKEN — regression would run against stale tests"
+  send_tg "🟡 <b>Regression skipped</b> (run <code>${RUN_ID}</code>)
+Tester W1 reports <b>Newly-broken = ${NEWLY_BROKEN}</b> — ต้องเคลียร์ STALE list ก่อน regression จะรันได้แบบมีความหมาย
+
+ดู <code>docs/test-index.md</code> + <code>${RUN_DIR}/runner.log</code>"
+  exit 0
+fi
+
+log "W1 gate passed (Newly-broken=0)"
+
+# ── Step 1: Parse suite ────────────────────────────────────────────────────
+if [ ! -f "$SUITE" ]; then
+  log "ABORT: suite file not found: $SUITE"
+  send_tg "🟡 <b>Regression skipped</b> — <code>docs/regression-suite.txt</code> missing in mobiz"
+  exit 1
+fi
+
+TESTS=()
+while IFS= read -r line; do
+  line="${line%%#*}"            # strip trailing comments
+  line="${line#"${line%%[![:space:]]*}"}"  # ltrim
+  line="${line%"${line##*[![:space:]]}"}"  # rtrim
+  [ -n "$line" ] && TESTS+=("$line")
+done < "$SUITE"
+
+TOTAL=${#TESTS[@]}
+log "Parsed $TOTAL tests from $SUITE"
+
+if [ "$TOTAL" -eq 0 ]; then
+  log "ABORT: no tests parsed from $SUITE"
+  send_tg "🟡 <b>Regression skipped</b> — zero tests parsed from <code>$SUITE</code>"
+  exit 1
+fi
+
+# Verify every referenced test file exists
+MISSING=()
+for t in "${TESTS[@]}"; do
+  [ -f "$MOBIZ/integration-tests/$t" ] || MISSING+=("$t")
+done
+if [ ${#MISSING[@]} -gt 0 ]; then
+  log "ABORT: ${#MISSING[@]} test files missing from integration-tests/:"
+  printf '  - %s\n' "${MISSING[@]}" | tee -a "$RUN_DIR/runner.log"
+  send_tg "🟡 <b>Regression skipped</b> — ${#MISSING[@]} test file(s) listed in <code>regression-suite.txt</code> but missing from <code>integration-tests/</code>: $(printf '%s, ' "${MISSING[@]}")"
+  exit 1
+fi
+
+# ── Step 2: Start infrastructure ───────────────────────────────────────────
+cd "$MOBIZ" || { log "ABORT: cannot cd into $MOBIZ"; exit 1; }
+
+INFRA_LOG="$RUN_DIR/infra.log"
+log "Starting infrastructure (docker + backend + mock-bank)..."
+bash integration-tests/run-integration-test.sh > "$INFRA_LOG" 2>&1 &
+INFRA_PID=$!
+log "  run-integration-test.sh pid=$INFRA_PID — waiting up to ${INFRA_READY_TIMEOUT}s for ready marker"
+
+READY=false
+for _ in $(seq 1 "$INFRA_READY_TIMEOUT"); do
+  if grep -q "Integration Test Environment Ready" "$INFRA_LOG" 2>/dev/null; then
+    READY=true
+    break
+  fi
+  if ! ps -p "$INFRA_PID" > /dev/null 2>&1; then
+    log "  infra process died before ready signal"
+    break
+  fi
+  sleep 1
+done
+
+if [ "$READY" != true ]; then
+  log "ABORT: infrastructure failed to come up within ${INFRA_READY_TIMEOUT}s"
+  kill "$INFRA_PID" 2>/dev/null
+  bash integration-tests/run-integration-test.sh --cleanup >> "$INFRA_LOG" 2>&1 || true
+  send_tg "🔴 <b>Regression aborted</b> (run <code>${RUN_ID}</code>)
+Infrastructure failed to start within ${INFRA_READY_TIMEOUT}s.
+
+ดู <code>${INFRA_LOG}</code>"
+  exit 1
+fi
+
+log "Infrastructure ready"
+
+# ── Step 3: Run tests sequentially ─────────────────────────────────────────
+declare -a PASSED=()
+declare -a FAILED=()
+SUITE_START=$(date +%s)
+
+for test in "${TESTS[@]}"; do
+  test_log="$RUN_DIR/$test.log"
+  t_start=$(date +%s)
+  log "▶ $test"
+  if timeout "$PER_TEST_TIMEOUT" bash "integration-tests/$test" > "$test_log" 2>&1; then
+    t_elapsed=$(($(date +%s) - t_start))
+    log "  ✅ $test (${t_elapsed}s)"
+    PASSED+=("$test")
+  else
+    rc=$?
+    t_elapsed=$(($(date +%s) - t_start))
+    log "  ❌ $test (exit=$rc, ${t_elapsed}s)"
+    FAILED+=("$test|$rc|$t_elapsed")
+  fi
+done
+
+SUITE_ELAPSED=$(($(date +%s) - SUITE_START))
+SUITE_MIN=$((SUITE_ELAPSED / 60))
+
+# ── Step 4: Teardown ───────────────────────────────────────────────────────
+log "Tearing down infrastructure..."
+kill "$INFRA_PID" 2>/dev/null
+sleep 2
+bash integration-tests/run-integration-test.sh --cleanup >> "$INFRA_LOG" 2>&1 || true
+
+# ── Step 5: Report ─────────────────────────────────────────────────────────
+PASS_COUNT=${#PASSED[@]}
+FAIL_COUNT=${#FAILED[@]}
+
+if [ "$FAIL_COUNT" -eq 0 ]; then
+  log "ALL PASS (${PASS_COUNT}/${TOTAL}, ${SUITE_MIN}m)"
+  send_tg "✅ <b>Regression ${RUN_ID}</b> — ${PASS_COUNT}/${TOTAL} passed (${SUITE_MIN}m)
+
+ตรวจครบทุก test ใน <code>docs/regression-suite.txt</code> (22 VALID + 2 UNKNOWN probation) — ไม่เจอ regression
+
+Log: <code>${RUN_DIR}</code>"
+  exit 0
+fi
+
+# Build fail summary
+log "FAIL: ${FAIL_COUNT}/${TOTAL} (${SUITE_MIN}m)"
+FAIL_LIST=""
+FAIL_SHORT=""
+for entry in "${FAILED[@]}"; do
+  IFS='|' read -r tname rc tsec <<< "$entry"
+  FAIL_LIST="${FAIL_LIST}- ${tname} (exit=${rc}, ${tsec}s) — log: ${RUN_DIR}/${tname}.log
+"
+  FAIL_SHORT="${FAIL_SHORT}• ${tname}
+"
+done
+
+# ── Step 6: Spawn investigation wake ───────────────────────────────────────
+INVESTIGATE_PROMPT="regression รันจบแล้ว เจอ ${FAIL_COUNT} test fail จาก ${TOTAL} ใน ${SUITE_MIN} นาที. อ่าน log ใน ${RUN_DIR}/ ของทุก test ที่ fail (รายการด้านล่าง), investigate ทีละตัวด้วย tester discipline (อ่าน test script + production code ที่ test เรียก + log output), แล้วส่ง summary ไป mcp__tester-telegram__telegram_send เป็นภาษาไทยง่ายๆ.
+
+สำหรับแต่ละ test ที่ fail ให้ classify เป็น 1 ใน 4 ประเภท:
+  1. code bug — production code เพิ่งเปลี่ยนและ break expected behavior → ระบุ commit/file:line
+  2. test invalid — test เอง stale/wrong-assumption → ระบุว่าต้องแก้ assertion อะไร
+  3. flaky — transient (timing/race/env) → reproduce ไม่ stable
+  4. infra — docker/mock-bank/backend crash → ไม่ใช่ test issue
+
+Format Telegram summary (ส่งครั้งเดียว, ไม่เกิน 3000 chars):
+- หัวข้อ: '🔴 Regression ${RUN_ID} — ${FAIL_COUNT}/${TOTAL} failed'
+- ต่อ test: ชื่อ + classification + ปัญหา 1 ประโยค + ต้องแก้ที่ไหน (ระบุ file:line ถ้าได้)
+- **ห้ามแก้ code/test** — แค่ investigate + report
+
+Tests ที่ fail:
+${FAIL_LIST}
+
+Infra log: ${RUN_DIR}/infra.log
+Runner log: ${RUN_DIR}/runner.log
+Per-test logs: ${RUN_DIR}/<test-name>.log"
+
+log "Spawning tester investigation wake..."
+if maw wake tester --fresh "$INVESTIGATE_PROMPT" >> "$RUN_DIR/runner.log" 2>&1; then
+  log "Investigation wake spawned — tester will send Telegram summary"
+else
+  log "FAIL: maw wake tester failed — sending fallback Telegram"
+  send_tg "🔴 <b>Regression ${RUN_ID}</b> — ${FAIL_COUNT}/${TOTAL} failed ในเวลา ${SUITE_MIN}m
+
+<b>Fail list:</b>
+${FAIL_SHORT}
+⚠️ maw wake tester (investigation) เรียกไม่สำเร็จ — ต้อง investigate manual จาก <code>${RUN_DIR}/</code>"
+fi
+
+exit 1

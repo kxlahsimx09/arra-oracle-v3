@@ -84,6 +84,10 @@ PID_FILE=$STATE_DIR/watcher.pid
 LOG_FILE=${LOG_FILE:-$STATE_DIR/watcher.log}
 mkdir -p "$STATE_DIR"
 
+# Resolve this script's directory so we can invoke sibling scripts
+# (regression-then-investigate.sh, etc.) via absolute path regardless of cwd.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # role → (repo_path, telegram_step_for_wake_prompt)
 declare -A REPOS=(
   ["pg-writer"]="$HOME/Code/github.com/kokarat/mobiz-payment-gateway"
@@ -314,6 +318,20 @@ cmd_run() {
               log "[$role] wake succeeded"
               last_run=$now
               last_new=0
+
+              # For tester wakes, chain the regression runner in the background.
+              # The script itself gates on `Newly-broken = 0` in the freshly-
+              # written docs/test-index.md; if W1 flagged broken tests, the
+              # script skips regression and Telegrams a "skipped" note. This
+              # keeps the watcher loop unblocked — the runner can take 30-60
+              # min, which would otherwise freeze the poll cadence for the
+              # other roles.
+              if [ "$role" = "tester" ]; then
+                log "[$role] chaining regression-then-investigate.sh (fire-and-forget)"
+                nohup bash "$SCRIPT_DIR/regression-then-investigate.sh" \
+                  >> "$STATE_DIR/regression.log" 2>&1 &
+                disown
+              fi
             else
               log "[$role] wake returned non-zero — will retry next settle"
               # leave last_new set so the next settled cycle retries,
