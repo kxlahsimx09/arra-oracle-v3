@@ -54,6 +54,92 @@ export const learnToolDef = {
 // ============================================================================
 
 /**
+ * Known-project whitelist for arra_learn input validation.
+ *
+ * Pattern (2026-04-21 brew-ops session): four project-field typos in five days
+ * — `cbank-bot`, `bank-bot<` (stray bracket), `kokarat/kokarat` (repo name == owner),
+ * `pure-bot` — each created a phantom project entry that needed manual cleanup +
+ * arra_supersede chain. Strict whitelist catches them at the MCP boundary before
+ * the bad write lands. New projects are rare; adding one means a one-line edit
+ * here + a code review (which is desirable provenance for a new vault namespace).
+ *
+ * All values lowercase because normalizeProject() lowercases its output.
+ */
+export const KNOWN_PROJECTS = new Set<string>([
+  'github.com/soul-brews-studio/arra-oracle-v3',
+  'github.com/soul-brews-studio/arra-oracle-v2',  // legacy
+  'github.com/soul-brews-studio/maw-js',
+  'github.com/soul-brews-studio/oracle-studio',
+  'github.com/soul-brews-studio/ui-studio-oracle-studio',  // canonical name on github
+  'github.com/kokarat/mobiz-payment-gateway',
+  'github.com/kokarat/bank-bot',
+  'github.com/kxlahsimx09/mb_agent_oracle_memory',
+]);
+
+/**
+ * Levenshtein edit distance — used to suggest the closest known project when
+ * a typo'd one is rejected. Tiny DP; both inputs are short paths so quadratic
+ * cost is irrelevant.
+ */
+export function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const prev = new Array(b.length + 1);
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    let curr = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      const next = Math.min(curr + 1, prev[j] + 1, prev[j - 1] + cost);
+      prev[j - 1] = curr;
+      curr = next;
+    }
+    prev[b.length] = curr;
+  }
+  return prev[b.length];
+}
+
+/**
+ * Find the closest known project to an unknown input — for a helpful "did you
+ * mean?" suggestion in the rejection error. Returns null if every known project
+ * is more than `maxDist` edits away (meaning the input is more likely a brand-new
+ * project than a typo, and the operator should add it to KNOWN_PROJECTS).
+ */
+export function suggestClosestProject(input: string, maxDist: number = 6): string | null {
+  let bestDist = Infinity;
+  let bestMatch: string | null = null;
+  for (const known of KNOWN_PROJECTS) {
+    const d = levenshtein(input, known);
+    if (d < bestDist) {
+      bestDist = d;
+      bestMatch = known;
+    }
+  }
+  return bestDist <= maxDist ? bestMatch : null;
+}
+
+/**
+ * Validate a normalized project string against the known-project whitelist.
+ * Returns null for valid (or null/universal) input; throws with a helpful
+ * suggestion otherwise. See KNOWN_PROJECTS docstring for rationale.
+ */
+export function validateProjectInput(project: string | null): void {
+  if (project === null) return;             // universal docs allowed
+  if (KNOWN_PROJECTS.has(project)) return;  // known
+  const suggestion = suggestClosestProject(project);
+  const knownList = Array.from(KNOWN_PROJECTS).sort().join('\n  - ');
+  const suggestLine = suggestion
+    ? `\n\nDid you mean: ${suggestion}?`
+    : '\n\n(No close match found — if this is a genuinely new project, add it to KNOWN_PROJECTS in src/tools/learn.ts.)';
+  throw new Error(
+    `Unknown project: ${project}` +
+    suggestLine +
+    `\n\nKnown projects:\n  - ${knownList}`
+  );
+}
+
+/**
  * Normalize project input to "github.com/owner/repo" format.
  * Accepts: github.com/owner/repo, owner/repo, GitHub URLs, local ghq paths.
  */
@@ -194,6 +280,16 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
   const project = normalizeProject(projectInput)
     || extractProjectFromSource(source)
     || detectProject(ctx.repoRoot);
+
+  // Reject project-field typos at the MCP boundary (see KNOWN_PROJECTS docstring).
+  // Only validates explicit `projectInput` — extractProjectFromSource and
+  // detectProject derive from trusted sources (source string + cwd) and don't
+  // share the typo failure mode that arra_learn(project=...) hand-typing does.
+  if (projectInput) {
+    const normalized = normalizeProject(projectInput);
+    validateProjectInput(normalized);
+  }
+
   const projectDir = (project || '_universal').toLowerCase();
 
   let filePath: string;
