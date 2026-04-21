@@ -391,7 +391,12 @@ for idx in "${!TESTS[@]}"; do
     if [ "$FAIL_FAST" = "1" ]; then
       # Capture everything that didn't run so the Telegram / investigation
       # prompt can mention it. Index + 1 is the next unrun test.
-      for j in $(seq $((idx + 1)) $((TOTAL - 1))); do
+      # Use bash C-style loop instead of `seq $((idx+1)) $((TOTAL-1))`:
+      # on macOS (BSD seq), `seq 1 0` prints `1 0` descending — when the
+      # failing test is the last (or only) one, that triggers a bogus
+      # iteration that reads TESTS[TOTAL] → `set -u` unbound variable abort.
+      # The C-style form cleanly skips when start >= TOTAL.
+      for (( j = idx + 1; j < TOTAL; j++ )); do
         REMAINING+=("${TESTS[$j]}")
       done
       log "  fail-fast STOP (${#REMAINING[@]} tests not run; investigation will focus on this single failure)"
