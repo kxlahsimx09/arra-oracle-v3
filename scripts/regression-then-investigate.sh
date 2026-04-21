@@ -45,6 +45,40 @@ RUN_ID=$(date '+%Y%m%d-%H%M%S')
 RUN_DIR=$LOG_ROOT/$RUN_ID
 mkdir -p "$RUN_DIR"
 
+# ── Single-instance lock ───────────────────────────────────────────────────
+# Two concurrent regression runs would race on the shared docker stack
+# (mongodb, redis, backend :3099, bank-bot containers) → non-deterministic
+# test results. Watcher's MIN_GAP (2h) usually prevents it, but a long
+# regression (> 2h) + newly-settled commits, OR a manual spawn during a
+# watcher-triggered run, can cause overlap. Skip + Telegram if another
+# instance is alive.
+LOCK=$LOG_ROOT/.regression.lock
+mkdir -p "$(dirname "$LOCK")"
+if [ -f "$LOCK" ]; then
+  OTHER_PID=$(cat "$LOCK" 2>/dev/null)
+  if [ -n "$OTHER_PID" ] && ps -p "$OTHER_PID" > /dev/null 2>&1; then
+    # Telegram creds read opportunistically (send_tg isn't defined yet)
+    TOKEN=$(jq -r --arg p "$MOBIZ" '.projects[$p].mcpServers["tester-telegram"].env.TELEGRAM_BOT_TOKEN // empty' "$HOME/.claude.json" 2>/dev/null)
+    CHAT=$(jq -r --arg p "$MOBIZ" '.projects[$p].mcpServers["tester-telegram"].env.TELEGRAM_DEFAULT_CHAT_ID // empty' "$HOME/.claude.json" 2>/dev/null)
+    if [ -n "$TOKEN" ] && [ -n "$CHAT" ]; then
+      curl -sf "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${CHAT}" \
+        --data-urlencode "parse_mode=HTML" \
+        --data-urlencode "text=🟡 <b>Regression skipped</b> (run <code>${RUN_ID}</code>)
+Another regression instance is still running (pid=<code>${OTHER_PID}</code>). Skipping to avoid concurrent docker-stack races.
+
+ถ้ามันค้าง → <code>kill -9 ${OTHER_PID} && rm ${LOCK}</code> แล้ว re-run" \
+        -o /dev/null 2>/dev/null
+    fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: another regression running (pid=$OTHER_PID), lock=$LOCK" >&2
+    exit 0
+  fi
+  # Stale lock (pid dead) — reclaim
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] reclaiming stale lock (pid=$OTHER_PID no longer alive)" >&2
+fi
+echo $$ > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
+
 # ── Telegram creds — read from ~/.claude.json (same source as the MCP) ─────
 TOKEN=$(jq -r --arg p "$MOBIZ" '.projects[$p].mcpServers["tester-telegram"].env.TELEGRAM_BOT_TOKEN // empty' "$HOME/.claude.json" 2>/dev/null)
 CHAT=$(jq -r --arg p "$MOBIZ" '.projects[$p].mcpServers["tester-telegram"].env.TELEGRAM_DEFAULT_CHAT_ID // empty' "$HOME/.claude.json" 2>/dev/null)
