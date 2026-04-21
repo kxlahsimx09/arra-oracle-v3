@@ -329,7 +329,12 @@ cmd_run() {
       printf 'last_seen=%s\nlast_new=%s\nlast_run=%s\n' "$last_seen" "$last_new" "$last_run" > "$state_file"
     done
 
-    sleep "$POLL_INTERVAL"
+    # sleep in 1-second ticks instead of one long sleep. Lets the INT/TERM
+    # trap fire within ~1s instead of waiting for a 5-min `sleep` child to
+    # exit first (bash queues signals while a child is running — fix
+    # prompted by 2026-04-21 watcher-restart incident where `stop` appeared
+    # to hang for minutes before the trap ran).
+    for _ in $(seq 1 "$POLL_INTERVAL"); do sleep 1; done
   done
 }
 
