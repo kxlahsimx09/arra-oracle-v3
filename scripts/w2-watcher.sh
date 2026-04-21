@@ -94,6 +94,7 @@ cmd_status() {
   fi
   echo ""
   for role in "${!REPOS[@]}"; do
+    repo=${REPOS[$role]}
     state_file=$STATE_DIR/$role.state
     echo "── $role ──"
     if [ -f "$state_file" ]; then
@@ -124,6 +125,25 @@ cmd_status() {
       fi
     else
       echo "    (uninitialized — run the watcher once to seed)"
+    fi
+
+    # W9 chain status — query GitHub for the current open W9 PR (if any).
+    # This is what claude inside the wake will check via Step 8.0 detect →
+    # 8.A (amend) if non-empty / 8.B (new) if empty. See workflow-9-track-flows.md.
+    repo_slug=$(echo "$repo" | sed 's|.*/github\.com/||')
+    if command -v gh > /dev/null 2>&1; then
+      w9_pr=$(gh pr list --repo "$repo_slug" --search "head:docs/flow-track- state:open" --author "@me" --json number,headRefName,title,createdAt --jq '.[0]' 2>/dev/null)
+      if [ -n "$w9_pr" ] && [ "$w9_pr" != "null" ]; then
+        pr_num=$(jq -r .number <<< "$w9_pr" 2>/dev/null)
+        pr_branch=$(jq -r .headRefName <<< "$w9_pr" 2>/dev/null)
+        pr_age_iso=$(jq -r .createdAt <<< "$w9_pr" 2>/dev/null)
+        echo "    W9 PR open:     #$pr_num ($pr_branch, opened $pr_age_iso)"
+        echo "                    → next wake takes 8.A amend path on the W9 portion"
+      else
+        echo "    W9 PR:          none open → next wake takes 8.B new-PR path on the W9 portion"
+      fi
+    else
+      echo "    W9 PR:          (gh CLI unavailable — install/authenticate to surface W9 chain state)"
     fi
   done
 }
