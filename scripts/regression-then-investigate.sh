@@ -209,6 +209,14 @@ TOTAL=${#TESTS[@]}
 cd "$MOBIZ" || { log "ABORT: cannot cd into $MOBIZ"; exit 1; }
 
 log "Syncing \$MOBIZ with origin/main..."
+# Race-safe sync: `git pull --ff-only origin main` reads .git/FETCH_HEAD,
+# which is shared across worktrees. When pg-writer wake fires its claude
+# in another worktree concurrently and that claude does any `git fetch`,
+# FETCH_HEAD gets contaminated and our pull errors with
+# "Cannot fast-forward to multiple branches" (observed live 2026-04-22
+# 01:27 — pg-writer wake fired 5s after our regression spawn, race blew up
+# the pull). Fix: use explicit ref `merge --ff-only origin/main` which
+# reads the remote-tracking ref directly, no FETCH_HEAD dependency.
 if ! git fetch origin main --quiet 2>>"$RUN_DIR/runner.log"; then
   log "ABORT: git fetch origin main failed"
   send_tg "🟡 <b>Regression skipped</b> (run <code>${RUN_ID}</code>)
@@ -217,12 +225,12 @@ if ! git fetch origin main --quiet 2>>"$RUN_DIR/runner.log"; then
 ดู <code>$RUN_DIR/runner.log</code>"
   exit 1
 fi
-if ! git pull --ff-only origin main --quiet 2>>"$RUN_DIR/runner.log"; then
+if ! git merge --ff-only origin/main --quiet 2>>"$RUN_DIR/runner.log"; then
   BRANCH=$(git branch --show-current 2>/dev/null)
   DIRTY=$(git status --porcelain 2>/dev/null | head -1)
-  log "ABORT: git pull --ff-only failed (branch=$BRANCH, dirty=${DIRTY:+yes})"
+  log "ABORT: git merge --ff-only origin/main failed (branch=$BRANCH, dirty=${DIRTY:+yes})"
   send_tg "🟡 <b>Regression skipped</b> (run <code>${RUN_ID}</code>)
-<code>git pull --ff-only origin main</code> failed in <code>\$MOBIZ</code>.
+<code>git merge --ff-only origin/main</code> failed in <code>\$MOBIZ</code>.
 branch: <code>$BRANCH</code> | dirty: <code>${DIRTY:+yes}${DIRTY:-no}</code>
 
 Operator contract: <code>\$MOBIZ</code> must stay on <code>main</code>, clean, ff-able. ทำ dev อื่นใน worktree. แก้ state ก่อน re-run
@@ -259,12 +267,12 @@ if ! git fetch origin main --quiet 2>>"$RUN_DIR/runner.log"; then
 ดู <code>$RUN_DIR/runner.log</code>"
   exit 1
 fi
-if ! git pull --ff-only origin main --quiet 2>>"$RUN_DIR/runner.log"; then
+if ! git merge --ff-only origin/main --quiet 2>>"$RUN_DIR/runner.log"; then
   BB_BRANCH=$(git branch --show-current 2>/dev/null)
   BB_DIRTY=$(git status --porcelain 2>/dev/null | head -1)
-  log "ABORT: bank-bot pull failed (branch=$BB_BRANCH, dirty=${BB_DIRTY:+yes})"
+  log "ABORT: bank-bot merge --ff-only failed (branch=$BB_BRANCH, dirty=${BB_DIRTY:+yes})"
   send_tg "🟡 <b>Regression skipped</b> (run <code>${RUN_ID}</code>)
-<code>git pull --ff-only origin main</code> failed in <code>\$MOBIZ/bank-bot</code>.
+<code>git merge --ff-only origin/main</code> failed in <code>\$MOBIZ/bank-bot</code>.
 branch: <code>$BB_BRANCH</code> | dirty: <code>${BB_DIRTY:+yes}${BB_DIRTY:-no}</code>
 
 Operator contract: <code>\$MOBIZ/bank-bot</code> must stay on <code>main</code>, clean, ff-able. ทำ dev อื่นใน worktree. แก้ state ก่อน re-run

@@ -321,7 +321,24 @@ cmd_run() {
               # docs/flow-track-* PR before opening a new one).
               prompt="อ่าน .agent/skills/technical-writer/references/workflow-2-track-commit.md ให้ครบ แล้วรัน W2 จนจบ (รวม Step ${step} Telegram summary). หลังจาก W2 commit + PR + retro เสร็จเรียบร้อย ให้อ่าน .agent/skills/technical-writer/references/workflow-9-track-flows.md ต่อทันที แล้วรัน W9 จนจบเช่นกัน — ตรวจ flow pointer drift, ทำตาม Step 8.0 detect (ถ้ามี open docs/flow-track-* PR ค้างอยู่ → 8.A amend; ถ้าไม่มี → 8.B new PR), เขียน retro แยกตามที่ W9 spec กำหนด. ถ้า W9 เป็น no-op (zero-drift, no flow-territory commits in range) ให้ log ใน retro แล้วจบ pass — ไม่ต้องเปิด PR เปล่า."
             fi
-            if maw wake "$role" --fresh "$prompt" >> "$LOG_FILE" 2>&1; then
+
+            # File-pointer pattern: maw wake's send-keys path truncates long
+            # multi-line Thai/HTML prompts (~600+ bytes) — its "DONE" sentinel
+            # leaks into the pasted text mid-sentence, leaving zsh stuck on
+            # `cmdand cursh quote>` and claude never starts. Observed live
+            # 2026-04-22 01:27 (pg-writer wake) + 02:30 (bot-writer wake) —
+            # both succeeded from maw's POV but no W2/W9 ran inside, so no
+            # Telegram fired all night.
+            #
+            # Workaround: write the long prompt to a file in $STATE_DIR and
+            # send maw a short pointer command. Same fix applied to the
+            # investigation wake in regression-then-investigate.sh.
+            mkdir -p "$STATE_DIR/wake-prompts"
+            wake_ts=$(date +%Y%m%d-%H%M%S)
+            wake_prompt_file="$STATE_DIR/wake-prompts/${role}-${wake_ts}.md"
+            printf '%s\n' "$prompt" > "$wake_prompt_file"
+            wake_pointer="อ่าน $wake_prompt_file ให้จบก่อน — นั่นคือ task ของคุณ ครบทุกบรรทัด. ทำตามคำสั่งในไฟล์ทั้งหมด ห้ามข้าม."
+            if maw wake "$role" --fresh "$wake_pointer" >> "$LOG_FILE" 2>&1; then
               log "[$role] wake succeeded"
               last_run=$now
               last_new=0
