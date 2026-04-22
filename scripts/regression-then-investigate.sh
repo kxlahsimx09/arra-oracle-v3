@@ -18,11 +18,14 @@
 #   bash scripts/regression-then-investigate.sh
 #
 # Env overrides:
-#   MOBIZ        — path to mobiz repo (default: ghq default location)
-#   SUITE        — path to regression-suite.txt (default: $MOBIZ/docs/regression-suite.txt)
-#   LOG_ROOT     — where per-run log dirs go (default: ~/.cache/w2-watcher/regression)
+#   MOBIZ            — path to mobiz repo (default: ghq default location)
+#   SUITE            — path to regression-suite.txt (default: $MOBIZ/docs/regression-suite.txt)
+#   LOG_ROOT         — where per-run log dirs go (default: ~/.cache/w2-watcher/regression)
 #   PER_TEST_TIMEOUT — safety-net timeout per test (default: 30m)
 #   INFRA_READY_TIMEOUT — how long to wait for "Environment Ready" (default: 300s)
+#   BRANCH           — mobiz branch to sync + test (default: main)
+#   BANK_BOT_BRANCH  — bank-bot branch to sync (default: main)
+#   SINGLE_TEST      — run just one test file under integration-tests/ (e.g. test-mixed-flow.sh)
 
 set -u
 
@@ -40,6 +43,14 @@ SUITE=${SUITE:-$MOBIZ/docs/regression-suite.txt}
 LOG_ROOT=${LOG_ROOT:-$HOME/.cache/w2-watcher/regression}
 PER_TEST_TIMEOUT=${PER_TEST_TIMEOUT:-30m}
 INFRA_READY_TIMEOUT=${INFRA_READY_TIMEOUT:-300}
+
+# Branch overrides (default: main). Let the operator re-verify a fix that's
+# pushed to a feature branch without having to `git checkout` it inside
+# $MOBIZ (which would violate the main-only contract and collide with other
+# worktrees). $MOBIZ and $MOBIZ/bank-bot can be pointed at different branches
+# independently — a backend-only fix typically keeps BANK_BOT_BRANCH=main.
+BRANCH=${BRANCH:-main}
+BANK_BOT_BRANCH=${BANK_BOT_BRANCH:-main}
 
 RUN_ID=$(date '+%Y%m%d-%H%M%S')
 RUN_DIR=$LOG_ROOT/$RUN_ID
@@ -197,57 +208,64 @@ fi
 
 TOTAL=${#TESTS[@]}
 
-# ── Step 2: Sync $MOBIZ with origin/main ──────────────────────────────────
+# ── Step 2: Sync $MOBIZ with origin/$BRANCH ───────────────────────────────
 # Contract with the operator (agreed 2026-04-21): $MOBIZ is kept on main,
 # clean, and ff-able at all times — any dev work happens in separate
 # worktrees. So a forced fetch + pull --ff-only is always safe here and
 # guarantees docker build uses the exact commit that triggered the watcher
 # (not stale user-local state).
 #
+# BRANCH env (default: main) lets the operator re-verify a fix pushed to
+# a feature branch. The local checked-out branch must match $BRANCH for
+# ff-merge to succeed — operator is responsible for `git checkout $BRANCH`
+# in $MOBIZ before overriding.
+#
 # If the pull fails (wrong branch, dirty tree, diverged history), the
 # contract was violated — abort + Telegram so the operator sees it and fixes.
 cd "$MOBIZ" || { log "ABORT: cannot cd into $MOBIZ"; exit 1; }
 
-log "Syncing \$MOBIZ with origin/main..."
-# Race-safe sync: `git pull --ff-only origin main` reads .git/FETCH_HEAD,
+log "Syncing \$MOBIZ with origin/$BRANCH..."
+# Race-safe sync: `git pull --ff-only origin <branch>` reads .git/FETCH_HEAD,
 # which is shared across worktrees. When pg-writer wake fires its claude
 # in another worktree concurrently and that claude does any `git fetch`,
 # FETCH_HEAD gets contaminated and our pull errors with
 # "Cannot fast-forward to multiple branches" (observed live 2026-04-22
 # 01:27 — pg-writer wake fired 5s after our regression spawn, race blew up
-# the pull). Fix: use explicit ref `merge --ff-only origin/main` which
+# the pull). Fix: use explicit ref `merge --ff-only origin/<branch>` which
 # reads the remote-tracking ref directly, no FETCH_HEAD dependency.
-if ! git fetch origin main --quiet 2>>"$RUN_DIR/runner.log"; then
-  log "ABORT: git fetch origin main failed"
+if ! git fetch origin "$BRANCH" --quiet 2>>"$RUN_DIR/runner.log"; then
+  log "ABORT: git fetch origin $BRANCH failed"
   send_tg "🟡 <b>Regression skipped</b> (run <code>${RUN_ID}</code>)
-<code>git fetch origin main</code> failed in <code>\$MOBIZ</code>. Network? Ref issue?
+<code>git fetch origin $BRANCH</code> failed in <code>\$MOBIZ</code>. Network? Ref issue?
 
 ดู <code>$RUN_DIR/runner.log</code>"
   exit 1
 fi
-if ! git merge --ff-only origin/main --quiet 2>>"$RUN_DIR/runner.log"; then
-  BRANCH=$(git branch --show-current 2>/dev/null)
+if ! git merge --ff-only "origin/$BRANCH" --quiet 2>>"$RUN_DIR/runner.log"; then
+  CUR_BRANCH=$(git branch --show-current 2>/dev/null)
   DIRTY=$(git status --porcelain 2>/dev/null | head -1)
-  log "ABORT: git merge --ff-only origin/main failed (branch=$BRANCH, dirty=${DIRTY:+yes})"
+  log "ABORT: git merge --ff-only origin/$BRANCH failed (on=$CUR_BRANCH, dirty=${DIRTY:+yes})"
   send_tg "🟡 <b>Regression skipped</b> (run <code>${RUN_ID}</code>)
-<code>git merge --ff-only origin/main</code> failed in <code>\$MOBIZ</code>.
-branch: <code>$BRANCH</code> | dirty: <code>${DIRTY:+yes}${DIRTY:-no}</code>
+<code>git merge --ff-only origin/$BRANCH</code> failed in <code>\$MOBIZ</code>.
+on: <code>$CUR_BRANCH</code> | want: <code>$BRANCH</code> | dirty: <code>${DIRTY:+yes}${DIRTY:-no}</code>
 
-Operator contract: <code>\$MOBIZ</code> must stay on <code>main</code>, clean, ff-able. ทำ dev อื่นใน worktree. แก้ state ก่อน re-run
+Operator contract: <code>\$MOBIZ</code> must be checked out to <code>\$BRANCH</code> (default main), clean, ff-able. ทำ dev อื่นใน worktree. แก้ state ก่อน re-run
 
 ดู <code>$RUN_DIR/runner.log</code>"
   exit 1
 fi
 log "  \$MOBIZ at $(git rev-parse --short HEAD) ($(git log -1 --format='%s' | head -c 60))"
 
-# ── Step 2.5: Sync $MOBIZ/bank-bot with origin/main ────────────────────────
+# ── Step 2.5: Sync $MOBIZ/bank-bot with origin/$BANK_BOT_BRANCH ────────────
 # bank-bot/ is a gitignored subfolder in mobiz but is actually a separate
 # git clone of kokarat/bank-bot (same remote as the standalone repo).
 # docker-compose's bank-bot + bank-bot-ktb services build their image from
 # this folder — so its freshness matters equally to $MOBIZ itself.
 #
 # Operator contract (agreed 2026-04-21): same as $MOBIZ — main, clean,
-# ff-able. Dev work happens in separate worktrees.
+# ff-able. Dev work happens in separate worktrees. BANK_BOT_BRANCH env
+# (default: main) lets the operator pin bank-bot to a feature branch
+# independently of $BRANCH for the backend.
 BANK_BOT="$MOBIZ/bank-bot"
 if [ ! -d "$BANK_BOT/.git" ]; then
   log "ABORT: $BANK_BOT is not a git repo (expected a kokarat/bank-bot clone)"
@@ -258,24 +276,24 @@ if [ ! -d "$BANK_BOT/.git" ]; then
   exit 1
 fi
 cd "$BANK_BOT" || { log "ABORT: cannot cd into $BANK_BOT"; exit 1; }
-log "Syncing \$BANK_BOT with origin/main..."
-if ! git fetch origin main --quiet 2>>"$RUN_DIR/runner.log"; then
-  log "ABORT: git fetch origin main failed in bank-bot"
+log "Syncing \$BANK_BOT with origin/$BANK_BOT_BRANCH..."
+if ! git fetch origin "$BANK_BOT_BRANCH" --quiet 2>>"$RUN_DIR/runner.log"; then
+  log "ABORT: git fetch origin $BANK_BOT_BRANCH failed in bank-bot"
   send_tg "🟡 <b>Regression skipped</b> (run <code>${RUN_ID}</code>)
-<code>git fetch origin main</code> failed in <code>\$MOBIZ/bank-bot</code>. Network? Remote?
+<code>git fetch origin $BANK_BOT_BRANCH</code> failed in <code>\$MOBIZ/bank-bot</code>. Network? Remote?
 
 ดู <code>$RUN_DIR/runner.log</code>"
   exit 1
 fi
-if ! git merge --ff-only origin/main --quiet 2>>"$RUN_DIR/runner.log"; then
+if ! git merge --ff-only "origin/$BANK_BOT_BRANCH" --quiet 2>>"$RUN_DIR/runner.log"; then
   BB_BRANCH=$(git branch --show-current 2>/dev/null)
   BB_DIRTY=$(git status --porcelain 2>/dev/null | head -1)
-  log "ABORT: bank-bot merge --ff-only failed (branch=$BB_BRANCH, dirty=${BB_DIRTY:+yes})"
+  log "ABORT: bank-bot merge --ff-only failed (on=$BB_BRANCH, want=$BANK_BOT_BRANCH, dirty=${BB_DIRTY:+yes})"
   send_tg "🟡 <b>Regression skipped</b> (run <code>${RUN_ID}</code>)
-<code>git merge --ff-only origin/main</code> failed in <code>\$MOBIZ/bank-bot</code>.
-branch: <code>$BB_BRANCH</code> | dirty: <code>${BB_DIRTY:+yes}${BB_DIRTY:-no}</code>
+<code>git merge --ff-only origin/$BANK_BOT_BRANCH</code> failed in <code>\$MOBIZ/bank-bot</code>.
+on: <code>$BB_BRANCH</code> | want: <code>$BANK_BOT_BRANCH</code> | dirty: <code>${BB_DIRTY:+yes}${BB_DIRTY:-no}</code>
 
-Operator contract: <code>\$MOBIZ/bank-bot</code> must stay on <code>main</code>, clean, ff-able. ทำ dev อื่นใน worktree. แก้ state ก่อน re-run
+Operator contract: <code>\$MOBIZ/bank-bot</code> must be checked out to <code>\$BANK_BOT_BRANCH</code> (default main), clean, ff-able. ทำ dev อื่นใน worktree. แก้ state ก่อน re-run
 
 ดู <code>$RUN_DIR/runner.log</code>"
   exit 1
