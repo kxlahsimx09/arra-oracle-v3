@@ -35,6 +35,37 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     console.log('[LanceDB] Closed');
   }
 
+  /**
+   * Detect LanceDB stale-snapshot errors.
+   *
+   * When a reindex (compaction + GC) runs while this process holds an open
+   * connection, the cached snapshot points at fragment files that no longer
+   * exist on disk. Subsequent reads surface as `lance error: Not found: ...
+   * .lance`. Re-opening the connection reads the latest manifest and resolves it.
+   */
+  private isStaleSnapshotError(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return /lance error:\s*Not found.*\.lance/i.test(msg);
+  }
+
+  private async reopenConnection(): Promise<void> {
+    this.db = null;
+    this.table = null;
+    await this.connect();
+    await this.ensureCollection();
+  }
+
+  private async withStaleRetry<T>(op: string, fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!this.isStaleSnapshotError(err)) throw err;
+      console.warn(`[LanceDB] Stale snapshot in ${op} — reopening connection and retrying once`);
+      await this.reopenConnection();
+      return await fn();
+    }
+  }
+
   async ensureCollection(): Promise<void> {
     if (!this.db) throw new Error('LanceDB not connected');
 
@@ -93,7 +124,9 @@ export class LanceDBAdapter implements VectorStoreAdapter {
 
     // Fetch extra results if filtering in JS (metadata is stored as string, not binary)
     const fetchLimit = where ? limit * 3 : limit;
-    const results = await this.table.search(queryEmbedding).limit(fetchLimit).toArray();
+    const results = await this.withStaleRetry<any[]>('query', () =>
+      this.table.search(queryEmbedding).limit(fetchLimit).toArray()
+    );
 
     // Filter metadata in JavaScript (LanceDB json_extract requires LargeBinary, not Utf8)
     let filtered = results;
@@ -116,13 +149,17 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     if (!this.table) await this.ensureCollection();
 
     // Get the document's vector using filter query (not vector search)
-    const rows = await this.table.query().where(`id = '${id}'`).limit(1).toArray();
+    const rows = await this.withStaleRetry<any[]>('queryById:lookup', () =>
+      this.table.query().where(`id = '${id}'`).limit(1).toArray()
+    );
     if (rows.length === 0) {
       throw new Error(`No embedding found for document: ${id}`);
     }
 
     const vector = Array.from(rows[0].vector);
-    const results = await this.table.search(vector).limit(nResults + 1).toArray();
+    const results = await this.withStaleRetry<any[]>('queryById:search', () =>
+      this.table.search(vector).limit(nResults + 1).toArray()
+    );
 
     const filtered = results.filter((r: any) => r.id !== id).slice(0, nResults);
 
@@ -148,7 +185,7 @@ export class LanceDBAdapter implements VectorStoreAdapter {
       if (!this.table) return { count: 0 };
     }
     try {
-      const count = await this.table.countRows();
+      const count = await this.withStaleRetry<number>('getStats', () => this.table.countRows());
       return { count };
     } catch {
       return { count: 0 };
@@ -163,7 +200,9 @@ export class LanceDBAdapter implements VectorStoreAdapter {
   async getAllEmbeddings(limit: number = 5000): Promise<{ ids: string[]; embeddings: number[][]; metadatas: any[] }> {
     if (!this.table) return { ids: [], embeddings: [], metadatas: [] };
 
-    const rows = await this.table.query().limit(limit).toArray();
+    const rows = await this.withStaleRetry<any[]>('getAllEmbeddings', () =>
+      this.table.query().limit(limit).toArray()
+    );
 
     return {
       ids: rows.map((r: any) => r.id),
