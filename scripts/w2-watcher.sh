@@ -343,14 +343,27 @@ cmd_run() {
               last_run=$now
               last_new=0
 
-              # For tester wakes, chain the regression runner in the background.
-              # The script itself gates on `Newly-broken = 0` in the freshly-
-              # written docs/test-index.md; if W1 flagged broken tests, the
-              # script skips regression and Telegrams a "skipped" note. This
-              # keeps the watcher loop unblocked — the runner can take 30-60
-              # min, which would otherwise freeze the poll cadence for the
-              # other roles.
-              if [ "$role" = "pg-tester" ]; then
+              # Chain regression runner in the background after two triggers:
+              #   - pg-tester (mobiz W1 validate pass): full-sweep integration
+              #     after a mobiz commit burst
+              #   - bot-writer (bank-bot W2 commit-track pass): bank-bot code is
+              #     loaded into the same integration stack (bank-bot container
+              #     builds from $MOBIZ/bank-bot), so a bank-bot commit also
+              #     warrants a regression run against mobiz main + new bot.
+              #
+              # The regression script gates on `Newly-broken = 0` in the
+              # freshly-written docs/test-index.md; if W1 flagged broken tests,
+              # it skips regression and Telegrams a "skipped" note. For the
+              # bot-writer trigger, the gate reads whichever docs/test-index.md
+              # the last pg-tester run left behind (orthogonal concern — the
+              # gate is about mobiz test-file validity, not bank-bot state).
+              #
+              # Keep the watcher loop unblocked — the runner can take 30-60 min.
+              # Concurrent fires (e.g. mobiz + bank-bot push minutes apart) are
+              # handled by the runner's own single-instance lockfile, which
+              # skips + Telegrams "another regression running" without racing
+              # on the shared docker stack.
+              if [ "$role" = "pg-tester" ] || [ "$role" = "bot-writer" ]; then
                 log "[$role] chaining regression-then-investigate.sh (fire-and-forget)"
                 # </dev/null is load-bearing: without it, deep children (docker
                 # compose exec) inherit stdin from the parent's tty and can
