@@ -54,14 +54,28 @@ export const learnToolDef = {
 // ============================================================================
 
 /**
- * Known-project whitelist for arra_learn input validation.
+ * Baseline known-project set for arra_learn input validation.
  *
  * Pattern (2026-04-21 brew-ops session): four project-field typos in five days
  * — `cbank-bot`, `bank-bot<` (stray bracket), `kokarat/kokarat` (repo name == owner),
  * `pure-bot` — each created a phantom project entry that needed manual cleanup +
  * arra_supersede chain. Strict whitelist catches them at the MCP boundary before
- * the bad write lands. New projects are rare; adding one means a one-line edit
- * here + a code review (which is desirable provenance for a new vault namespace).
+ * the bad write lands.
+ *
+ * ## Baseline vs runtime-effective set
+ *
+ * `KNOWN_PROJECTS` is the **baseline** — a safety-net hard-coded list that
+ * survives regardless of filesystem state. The **runtime-effective** whitelist
+ * is `getKnownProjects()`, which unions this baseline with project slugs
+ * discovered from fleet JSON files (`.agent/fleet/*.json`) in the central
+ * memory repo. That means adding a new repo no longer requires a code PR:
+ * dropping a fleet JSON in place is sufficient (added 2026-04-22 brew-ops,
+ * after `kxlahsimx09/mb-next-payment-gateway` blocked on this exact friction).
+ *
+ * The baseline still exists because:
+ *   - Cold-start machines may not have the central memory cloned yet.
+ *   - Legacy repos (e.g. `arra-oracle-v2`) have no fleet JSON.
+ *   - If fleet scan fails, arra_learn stays functional on baseline entries.
  *
  * All values lowercase because normalizeProject() lowercases its output.
  */
@@ -75,6 +89,90 @@ export const KNOWN_PROJECTS = new Set<string>([
   'github.com/kokarat/bank-bot',
   'github.com/kxlahsimx09/mb_agent_oracle_memory',
 ]);
+
+/**
+ * Derive additional project slugs from fleet JSON files in the central memory repo.
+ *
+ * Fleet files at `<central>/github.com/<owner>/<repo>/.agent/fleet/*.json` declare
+ * `project_repos: ["owner/repo", ...]` as part of the maw tmux-window config for
+ * each repo. Unioning these with the baseline lets a new repo register purely by
+ * sitting in the central memory repo — the same act that activates an agent there.
+ *
+ * Returns `[]` (falls through to baseline only) when:
+ *   - `vault_repo` setting is unconfigured (first-time setup).
+ *   - Central memory is configured but not yet cloned locally.
+ *   - `<central>/github.com/` does not exist (no per-repo scaffold yet).
+ *
+ * Malformed individual fleet JSONs are skipped silently; other files still contribute.
+ * Slugs that don't match `owner/repo` shape are dropped.
+ *
+ * Uncached worker — the public entry point is `getKnownProjects()`.
+ */
+function deriveFleetProjects(): string[] {
+  const vault = getVaultPsiRoot();
+  if ('needsInit' in vault) return [];
+  const githubRoot = path.join(vault.path, 'github.com');
+  if (!fs.existsSync(githubRoot)) return [];
+
+  const results: string[] = [];
+  const partPattern = /^[\w.-]+$/;
+
+  let owners: string[];
+  try { owners = fs.readdirSync(githubRoot); } catch { return []; }
+  for (const owner of owners) {
+    const ownerDir = path.join(githubRoot, owner);
+    try {
+      if (!fs.statSync(ownerDir).isDirectory()) continue;
+    } catch { continue; }
+    let repos: string[];
+    try { repos = fs.readdirSync(ownerDir); } catch { continue; }
+    for (const repo of repos) {
+      const fleetDir = path.join(ownerDir, repo, '.agent', 'fleet');
+      if (!fs.existsSync(fleetDir)) continue;
+      let entries: string[];
+      try { entries = fs.readdirSync(fleetDir); } catch { continue; }
+      for (const entry of entries) {
+        if (!entry.endsWith('.json')) continue;
+        const file = path.join(fleetDir, entry);
+        try {
+          const raw = fs.readFileSync(file, 'utf-8');
+          const json = JSON.parse(raw);
+          const declared = Array.isArray(json?.project_repos) ? json.project_repos : [];
+          for (const slug of declared) {
+            if (typeof slug !== 'string') continue;
+            const parts = slug.split('/');
+            if (parts.length !== 2) continue;
+            if (!parts.every((p: string) => partPattern.test(p))) continue;
+            results.push(`github.com/${slug}`.toLowerCase());
+          }
+        } catch { /* skip malformed fleet JSON; siblings still count */ }
+      }
+    }
+  }
+  return results;
+}
+
+let cachedKnownProjects: Set<string> | null = null;
+
+/**
+ * Runtime-effective known-project whitelist: `KNOWN_PROJECTS` ∪ fleet-derived.
+ *
+ * Cached after first call — fleet JSONs change rarely and requiring an MCP-server
+ * restart to pick up a new one is cheaper than re-scanning on every arra_learn.
+ * Tests reset via `_resetKnownProjectsCacheForTests()`.
+ */
+export function getKnownProjects(): Set<string> {
+  if (cachedKnownProjects) return cachedKnownProjects;
+  const result = new Set(KNOWN_PROJECTS);
+  for (const slug of deriveFleetProjects()) result.add(slug);
+  cachedKnownProjects = result;
+  return result;
+}
+
+/** Reset the `getKnownProjects()` cache. Exported for test isolation, not runtime. */
+export function _resetKnownProjectsCacheForTests(): void {
+  cachedKnownProjects = null;
+}
 
 /**
  * Levenshtein edit distance — used to suggest the closest known project when
@@ -104,12 +202,13 @@ export function levenshtein(a: string, b: string): number {
  * Find the closest known project to an unknown input — for a helpful "did you
  * mean?" suggestion in the rejection error. Returns null if every known project
  * is more than `maxDist` edits away (meaning the input is more likely a brand-new
- * project than a typo, and the operator should add it to KNOWN_PROJECTS).
+ * project than a typo, and the operator should register it via fleet JSON —
+ * see `getKnownProjects()` docstring).
  */
 export function suggestClosestProject(input: string, maxDist: number = 6): string | null {
   let bestDist = Infinity;
   let bestMatch: string | null = null;
-  for (const known of KNOWN_PROJECTS) {
+  for (const known of getKnownProjects()) {
     const d = levenshtein(input, known);
     if (d < bestDist) {
       bestDist = d;
@@ -122,16 +221,18 @@ export function suggestClosestProject(input: string, maxDist: number = 6): strin
 /**
  * Validate a normalized project string against the known-project whitelist.
  * Returns null for valid (or null/universal) input; throws with a helpful
- * suggestion otherwise. See KNOWN_PROJECTS docstring for rationale.
+ * suggestion otherwise. See `getKnownProjects()` docstring for the baseline-
+ * plus-fleet-derived semantics, and `KNOWN_PROJECTS` docstring for rationale.
  */
 export function validateProjectInput(project: string | null): void {
-  if (project === null) return;             // universal docs allowed
-  if (KNOWN_PROJECTS.has(project)) return;  // known
+  if (project === null) return;          // universal docs allowed
+  const known = getKnownProjects();
+  if (known.has(project)) return;        // known (baseline or fleet-derived)
   const suggestion = suggestClosestProject(project);
-  const knownList = Array.from(KNOWN_PROJECTS).sort().join('\n  - ');
+  const knownList = Array.from(known).sort().join('\n  - ');
   const suggestLine = suggestion
     ? `\n\nDid you mean: ${suggestion}?`
-    : '\n\n(No close match found — if this is a genuinely new project, add it to KNOWN_PROJECTS in src/tools/learn.ts.)';
+    : '\n\n(No close match found — to register a genuinely new project, add a fleet JSON at <central>/github.com/<owner>/<repo>/.agent/fleet/*.json with `project_repos: ["<owner>/<repo>"]` and restart the MCP server. For legacy repos without an .agent/ directory, add the slug to KNOWN_PROJECTS in src/tools/learn.ts.)';
   throw new Error(
     `Unknown project: ${project}` +
     suggestLine +

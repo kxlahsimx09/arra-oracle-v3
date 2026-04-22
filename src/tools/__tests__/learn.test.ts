@@ -2,8 +2,8 @@
  * Unit tests for learn helpers (pure functions).
  */
 
-import { describe, it, expect } from 'bun:test';
-import { normalizeProject, extractProjectFromSource, stripFrontmatterWrap, levenshtein, suggestClosestProject, validateProjectInput, KNOWN_PROJECTS } from '../learn.ts';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { normalizeProject, extractProjectFromSource, stripFrontmatterWrap, levenshtein, suggestClosestProject, validateProjectInput, KNOWN_PROJECTS, getKnownProjects, _resetKnownProjectsCacheForTests } from '../learn.ts';
 
 // ============================================================================
 // normalizeProject
@@ -227,9 +227,49 @@ describe('validateProjectInput (the guard)', () => {
   it('rejects pure-bot typo with bank-bot suggestion', () => {
     expect(() => validateProjectInput('github.com/kokarat/pure-bot')).toThrow(/Did you mean: github\.com\/kokarat\/bank-bot/);
   });
-  it('rejects truly-new far-distance project (asks operator to add to KNOWN_PROJECTS)', () => {
-    // Per current design, ALL non-whitelisted projects throw — the message just changes.
+  it('rejects truly-new far-distance project (points operator to fleet JSON)', () => {
+    // Per current design, ALL non-whitelisted projects throw — the error message
+    // directs the operator to the primary registration path (fleet JSON) with
+    // baseline KNOWN_PROJECTS as the legacy fallback.
     expect(() => validateProjectInput('github.com/some-totally-new-org/some-totally-new-repo-xyz123'))
-      .toThrow(/add it to KNOWN_PROJECTS/);
+      .toThrow(/register a genuinely new project/);
+  });
+});
+
+// ============================================================================
+// getKnownProjects (baseline ∪ fleet-derived)
+// ============================================================================
+
+describe('getKnownProjects', () => {
+  beforeEach(() => _resetKnownProjectsCacheForTests());
+  afterEach(() => _resetKnownProjectsCacheForTests());
+
+  it('includes every baseline KNOWN_PROJECTS entry', () => {
+    const known = getKnownProjects();
+    for (const p of KNOWN_PROJECTS) {
+      expect(known.has(p)).toBe(true);
+    }
+  });
+
+  it('returns a superset of the baseline (size >= baseline size)', () => {
+    const known = getKnownProjects();
+    expect(known.size).toBeGreaterThanOrEqual(KNOWN_PROJECTS.size);
+  });
+
+  it('caches after first call (reference equality)', () => {
+    const a = getKnownProjects();
+    const b = getKnownProjects();
+    expect(a).toBe(b);
+  });
+
+  it('reset lets subsequent call rebuild (returns a fresh Set instance)', () => {
+    const a = getKnownProjects();
+    _resetKnownProjectsCacheForTests();
+    const b = getKnownProjects();
+    expect(a).not.toBe(b);
+    // Content-equivalent: both contain every baseline entry.
+    for (const p of KNOWN_PROJECTS) {
+      expect(b.has(p)).toBe(true);
+    }
   });
 });
