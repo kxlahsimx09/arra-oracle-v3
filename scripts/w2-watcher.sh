@@ -338,7 +338,14 @@ cmd_run() {
             wake_prompt_file="$STATE_DIR/wake-prompts/${role}-${wake_ts}.md"
             printf '%s\n' "$prompt" > "$wake_prompt_file"
             wake_pointer="อ่าน $wake_prompt_file ให้จบก่อน — นั่นคือ task ของคุณ ครบทุกบรรทัด. ทำตามคำสั่งในไฟล์ทั้งหมด ห้ามข้าม."
-            if maw wake "$role" --fresh "$wake_pointer" >> "$LOG_FILE" 2>&1; then
+            # NOTE: --task flag, not positional. Positional [task] becomes
+            # wakeOpts.task → slugged into the worktree/tmux-pane name, which
+            # with this long Thai pointer produced panes like
+            # `cachew2-watcherwake-promptspg-tester-20` that tmux then can't
+            # resolve. `--task <prompt>` maps to wakeOpts.prompt and goes to
+            # Claude as-is without touching names. See maw-js wake plugin
+            # index.ts:80 vs :93.
+            if maw wake "$role" --task "$wake_pointer" --fresh >> "$LOG_FILE" 2>&1; then
               log "[$role] wake succeeded"
               last_run=$now
               last_new=0
