@@ -254,7 +254,8 @@ Operator contract: <code>\$MOBIZ</code> must be checked out to <code>\$BRANCH</c
 ดู <code>$RUN_DIR/runner.log</code>"
   exit 1
 fi
-log "  \$MOBIZ at $(git rev-parse --short HEAD) ($(git log -1 --format='%s' | head -c 60))"
+MOBIZ_SHA=$(git rev-parse --short HEAD)
+log "  \$MOBIZ at $MOBIZ_SHA ($(git log -1 --format='%s' | head -c 60))"
 
 # ── Step 2.5: Sync $MOBIZ/bank-bot with origin/$BANK_BOT_BRANCH ────────────
 # bank-bot/ is a gitignored subfolder in mobiz but is actually a separate
@@ -298,7 +299,8 @@ Operator contract: <code>\$MOBIZ/bank-bot</code> must be checked out to <code>\$
 ดู <code>$RUN_DIR/runner.log</code>"
   exit 1
 fi
-log "  \$BANK_BOT at $(git rev-parse --short HEAD) ($(git log -1 --format='%s' | head -c 60))"
+BANK_BOT_SHA=$(git rev-parse --short HEAD)
+log "  \$BANK_BOT at $BANK_BOT_SHA ($(git log -1 --format='%s' | head -c 60))"
 
 # Return cwd to $MOBIZ for subsequent docker compose + test invocations
 cd "$MOBIZ"
@@ -461,6 +463,7 @@ if [ "$FAIL_COUNT" -eq 0 ]; then
 
 ${PASS_BODY}
 
+<b>HEADs:</b> mobiz <code>${MOBIZ_SHA}</code> · bank-bot <code>${BANK_BOT_SHA}</code>
 Log: <code>${RUN_DIR}</code>"
   exit 0
 fi
@@ -572,6 +575,7 @@ if [ "$FAIL_COUNT" -eq 1 ]; then
 exit=${FIRST_FAIL_RC}, ${FIRST_FAIL_SEC}s. Passed ${PASS_COUNT}/${TOTAL} before this. ${REMAINING_COUNT} tests not run (fail-fast).
 Elapsed ${SUITE_MIN}m.
 
+<b>HEADs:</b> mobiz <code>${MOBIZ_SHA}</code> · bank-bot <code>${BANK_BOT_SHA}</code>
 Log: <code>${RUN_DIR}/${FIRST_FAIL_NAME}.log</code>
 
 🔎 Investigation wake spawning — detailed classification follows if pg-tester API OK. ถ้า Telegram นี้ค้างไม่มี detail ต่อใน 5-10 min = investigation ล้ม, ต้อง investigate manual"
@@ -579,6 +583,8 @@ else
   send_tg "🔴 <b>${RUN_LABEL} ${RUN_ID}</b> — ${FAIL_COUNT}/${TOTAL} failed
 
 Elapsed ${SUITE_MIN}m.
+
+<b>HEADs:</b> mobiz <code>${MOBIZ_SHA}</code> · bank-bot <code>${BANK_BOT_SHA}</code>
 
 <b>Failed:</b>
 ${FAIL_SHORT}
