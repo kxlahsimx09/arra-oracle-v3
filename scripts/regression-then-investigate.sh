@@ -592,7 +592,7 @@ ${FAIL_SHORT}
 fi
 
 log "Spawning tester investigation wake (prompt in $PROMPT_FILE)..."
-if maw wake pg-tester --fresh "$WAKE_POINTER" >> "$RUN_DIR/runner.log" 2>&1; then
+if maw wake pg-tester --task "$WAKE_POINTER" --fresh >> "$RUN_DIR/runner.log" 2>&1; then
   log "Investigation wake spawned — pg-tester MAY send detailed Telegram (best-effort; depends on API availability)"
 else
   log "FAIL: maw wake pg-tester returned non-zero (user already has primary Telegram above; no extra fallback needed)"
