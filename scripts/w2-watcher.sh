@@ -345,7 +345,12 @@ cmd_run() {
             # resolve. `--task <prompt>` maps to wakeOpts.prompt and goes to
             # Claude as-is without touching names. See maw-js wake plugin
             # index.ts:80 vs :93.
-            if maw wake "$role" --task "$wake_pointer" --fresh >> "$LOG_FILE" 2>&1; then
+            # --wt with unique timestamp prevents maw from silent-attaching
+            # to a stale pane (observed 2026-04-25 + 04-26: bot-writer pane
+            # %52 had a claude session running 4+ days, every new wake hit
+            # "session exists" and exited 0 without spawning W2 — backlog of
+            # 3 wakes / 5 commits silently dropped).
+            if maw wake "$role" --wt "$wake_ts" --task "$wake_pointer" --fresh >> "$LOG_FILE" 2>&1; then
               log "[$role] wake succeeded"
               last_run=$now
               last_new=0
