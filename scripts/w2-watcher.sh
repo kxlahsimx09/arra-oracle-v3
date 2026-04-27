@@ -410,6 +410,30 @@ cmd_run() {
               last_new=0
               pending_wake_ts=$now  # arm silent-fail detector
 
+              # Recover from maw's `claude --continue || claude -p` template
+              # bug: --continue exits 0 with "No conversation found" in fresh
+              # panes, so the || fallback never fires and claude -p never
+              # runs. We compounded this with --wt unique (every wake = fresh
+              # pane = no prior conversation = template always fails). 5s
+              # after wake, check if the pane is back at shell prompt with
+              # "No conversation found" visible — if so, send-keys claude -p
+              # directly to actually run the prompt.
+              sleep 5
+              case "$role" in
+                pg-writer|pg-tester) wake_session=03-payment-gateway ;;
+                bot-writer)          wake_session=02-bank-bot ;;
+                *)                   wake_session="" ;;
+              esac
+              wake_target="${wake_session}:${role}-${wake_ts}"
+              wake_pane_cmd=$(tmux list-panes -t "$wake_target" -F "#{pane_current_command}" 2>/dev/null | head -1)
+              if [ -n "$wake_pane_cmd" ] && echo "$wake_pane_cmd" | grep -qE "^(zsh|bash|sh|fish)$"; then
+                wake_pane_content=$(tmux capture-pane -t "$wake_target" -pS -15 2>/dev/null)
+                if echo "$wake_pane_content" | grep -q "No conversation found to continue"; then
+                  log "[$role] template fallback didn't fire — sending claude -p directly"
+                  tmux send-keys -t "$wake_target" "claude --dangerously-skip-permissions -p '$wake_pointer'" Enter
+                fi
+              fi
+
               # Chain regression runner in the background after two triggers:
               #   - pg-tester (mobiz W1 validate pass): full-sweep integration
               #     after a mobiz commit burst
