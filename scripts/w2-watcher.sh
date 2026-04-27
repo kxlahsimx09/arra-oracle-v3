@@ -112,6 +112,33 @@ log() {
   echo "[$ts] $*"
 }
 
+# Silent-fail detector: after a wake "succeeds" (maw exit 0), claude inside
+# can still die silently — auth 401, missing CLI, malformed prompt. Watcher
+# can't tell from maw's exit. Belt-and-suspenders: WAKE_VERIFY_TIMEOUT (default
+# 60 min) after wake, query gh for any new PR by @me on the role's repo. If
+# zero, send Telegram alert via tester-telegram bot (same channel as regression
+# fail-telegram for operator visibility).
+WAKE_VERIFY_TIMEOUT=${WAKE_VERIFY_TIMEOUT:-3600}
+SILENT_FAIL_TG_PROJECT=${SILENT_FAIL_TG_PROJECT:-$HOME/Code/github.com/kokarat/mobiz-payment-gateway}
+
+send_silent_fail_telegram() {
+  local role="$1" repo_slug="$2" wake_ts="$3" elapsed="$4"
+  local TOKEN CHAT
+  TOKEN=$(jq -r --arg p "$SILENT_FAIL_TG_PROJECT" '.projects[$p].mcpServers["tester-telegram"].env.TELEGRAM_BOT_TOKEN // empty' "$HOME/.claude.json" 2>/dev/null)
+  CHAT=$(jq -r --arg p "$SILENT_FAIL_TG_PROJECT" '.projects[$p].mcpServers["tester-telegram"].env.TELEGRAM_DEFAULT_CHAT_ID // empty' "$HOME/.claude.json" 2>/dev/null)
+  [ -z "$TOKEN" ] || [ -z "$CHAT" ] && return
+  local iso=$(date -r "$wake_ts" '+%Y-%m-%d %H:%M GMT+7')
+  curl -sf "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${CHAT}" \
+    --data-urlencode "parse_mode=HTML" \
+    --data-urlencode "text=⚠️ <b>Silent wake fail</b> (${role})
+Repo: <code>${repo_slug}</code>
+Wake: <code>${iso}</code> ($((elapsed/60))min ago)
+ไม่มี PR ของ @me ใน repo นี้ตั้งแต่ wake — claude ตายเงียบ (auth 401 / silent attach / prompt corrupt).
+ตรวจ pane <code>${role}-$(date -r "$wake_ts" '+%Y%m%d-%H%M%S')</code> + watcher.log" \
+    -o /dev/null 2>/dev/null
+}
+
 cleanup() {
   log "shutting down (pid=$$)"
   rm -f "$PID_FILE"
@@ -256,10 +283,37 @@ cmd_run() {
       last_seen=""
       last_new=0
       last_run=0
+      pending_wake_ts=0
       [ -f "$state_file" ] && source "$state_file"
 
+      # Silent-fail check: did the previous wake actually produce a PR?
+      # Runs before fetch so it fires even on offline rounds. Only checks
+      # once per pending wake; clears pending_wake_ts after either result.
+      now=$(date +%s)
+      if [ "${pending_wake_ts:-0}" -gt 0 ]; then
+        pending_elapsed=$((now - pending_wake_ts))
+        if [ "$pending_elapsed" -ge "$WAKE_VERIFY_TIMEOUT" ]; then
+          repo_slug=$(echo "$repo" | sed 's|.*/github\.com/||')
+          iso_filter=$(date -u -r "$pending_wake_ts" '+%Y-%m-%dT%H:%M:%SZ')
+          pr_count=$(gh pr list --repo "$repo_slug" --search "author:@me created:>=$iso_filter" --json number --jq 'length' 2>/dev/null || echo 0)
+          if [ "${pr_count:-0}" = "0" ]; then
+            log "[$role] SILENT-FAIL: 0 PRs landed in $((pending_elapsed/60))min since wake @ $(date -r "$pending_wake_ts" '+%H:%M') — alerting operator"
+            send_silent_fail_telegram "$role" "$repo_slug" "$pending_wake_ts" "$pending_elapsed"
+          else
+            log "[$role] wake verified: $pr_count PR(s) landed in $((pending_elapsed/60))min"
+          fi
+          pending_wake_ts=0
+        fi
+      fi
+
       # fetch quietly; skip this round if the repo is unreachable
-      if ! git -C "$repo" fetch origin main 2>/dev/null; then
+      # pull --ff-only keeps local main synced with origin/main, so worktrees
+      # maw creates from `main` ref see the latest commits. Plain `fetch` only
+      # advances origin/main — local main stays stale → claude in fresh
+      # worktree can't see commits the watcher already detected (observed
+      # 2026-04-25..27: bank-bot local main stuck at ffd626b while origin/main
+      # advanced 6 commits, every wake's worktree checkout was stale).
+      if ! git -C "$repo" pull --ff-only origin main 2>/dev/null; then
         log "[$role] fetch failed; skipping"
         continue
       fi
@@ -354,6 +408,7 @@ cmd_run() {
               log "[$role] wake succeeded"
               last_run=$now
               last_new=0
+              pending_wake_ts=$now  # arm silent-fail detector
 
               # Chain regression runner in the background after two triggers:
               #   - pg-tester (mobiz W1 validate pass): full-sweep integration
@@ -400,7 +455,7 @@ cmd_run() {
       fi
 
       # persist
-      printf 'last_seen=%s\nlast_new=%s\nlast_run=%s\n' "$last_seen" "$last_new" "$last_run" > "$state_file"
+      printf 'last_seen=%s\nlast_new=%s\nlast_run=%s\npending_wake_ts=%s\n' "$last_seen" "$last_new" "$last_run" "$pending_wake_ts" > "$state_file"
     done
 
     # sleep in 1-second ticks instead of one long sleep. Lets the INT/TERM
