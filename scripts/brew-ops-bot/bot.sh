@@ -87,21 +87,114 @@ audit() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$AUDIT_FILE"; }
 html_escape() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
 
 send_tg() {
-  local text="$1"
+  local text="$1" markup="${2:-}"
   if [ ${#text} -gt 3900 ]; then text="${text:0:3850}
 
 […truncated]"; fi
+  local args=(
+    --data-urlencode "chat_id=$CHAT"
+    --data-urlencode "parse_mode=HTML"
+    --data-urlencode "text=$text"
+  )
+  [ -n "$markup" ] && args+=(--data-urlencode "reply_markup=$markup")
   local resp
-  resp=$(curl -sf "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-    --data-urlencode "chat_id=$CHAT" \
-    --data-urlencode "parse_mode=HTML" \
-    --data-urlencode "text=$text" 2>&1)
+  resp=$(curl -sf "https://api.telegram.org/bot${TOKEN}/sendMessage" "${args[@]}" 2>&1)
   if [ -z "$resp" ] || ! echo "$resp" | jq -e '.ok' >/dev/null 2>&1; then
     log "send_tg failed: $(echo "$resp" | head -c 300)"
   fi
 }
 
+# Build inline keyboard JSON for chat picker. Args:
+#   $1 — action prefix (e.g. "chat", "close") sent as callback_data: "<action>:<role>/<slug>"
+#   $2 — optional role filter
+build_chat_keyboard() {
+  local action="$1" role_filter="${2:-}"
+  local rows="[]"
+  while IFS= read -r role; do
+    [ -n "$role_filter" ] && [ "$role" != "$role_filter" ] && continue
+    while IFS='|' read -r pane sess win cmd slug; do
+      [ -z "$pane" ] && continue
+      local marker; case "$cmd" in 2.*|claude|claude-*) marker="✅" ;; *) marker="⚪" ;; esac
+      local label="$marker $role/$slug"
+      local data="${action}:${role}/${slug}"
+      [ ${#data} -gt 60 ] && data="${data:0:60}"
+      rows=$(echo "$rows" | jq --arg l "$label" --arg d "$data" '. += [[{text: $l, callback_data: $d}]]')
+    done <<< "$(chats_for_role "$role")"
+  done <<< "$(all_roles)"
+  jq -nc --argjson kb "$rows" '{inline_keyboard: $kb}'
+}
+
+# Build inline keyboard for role picker (one button per role)
+build_role_keyboard() {
+  local action="$1"
+  local rows="[]"
+  while IFS= read -r role; do
+    [ -z "$role" ] && continue
+    local data="${action}:${role}"
+    rows=$(echo "$rows" | jq --arg l "$role" --arg d "$data" '. += [[{text: $l, callback_data: $d}]]')
+  done <<< "$(all_roles)"
+  jq -nc --argjson kb "$rows" '{inline_keyboard: $kb}'
+}
+
+# Acknowledge a callback_query (dismisses the loading spinner client-side)
+ack_callback() {
+  curl -sf "https://api.telegram.org/bot${TOKEN}/answerCallbackQuery?callback_query_id=$1" -o /dev/null 2>/dev/null
+}
+
 active_chat_file() { echo "${ACTIVE_CHAT_FILE_PREFIX}.$1"; }
+
+# Status message — single pinned Telegram message that always shows the
+# current active chat + watcher count. Updated in-place via editMessageText
+# whenever cmd_chat/cmd_new/cmd_end/cmd_close changes state.
+STATUS_MSG_FILE=$STATE_DIR/status-msg-id
+
+build_status_text() {
+  local tg_chat="$1"
+  local active="(none)"
+  local f; f=$(active_chat_file "$tg_chat")
+  [ -s "$f" ] && active=$(cat "$f")
+  local watchers=0
+  for pf in "$STATE_DIR"/watch.*.pid; do
+    [ -f "$pf" ] || continue
+    local pid; pid=$(cat "$pf" 2>/dev/null)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && watchers=$((watchers + 1))
+  done
+  echo "📍 active: <code>$active</code>
+🔔 watchers: $watchers running"
+}
+
+update_status() {
+  local tg_chat="${1:-$CHAT}"
+  local content; content=$(build_status_text "$tg_chat")
+  if [ -s "$STATUS_MSG_FILE" ]; then
+    local mid; mid=$(cat "$STATUS_MSG_FILE")
+    local resp
+    resp=$(curl -sf "https://api.telegram.org/bot${TOKEN}/editMessageText" \
+      --data-urlencode "chat_id=$tg_chat" \
+      --data-urlencode "message_id=$mid" \
+      --data-urlencode "parse_mode=HTML" \
+      --data-urlencode "text=$content" 2>&1)
+    # on success, done
+    echo "$resp" | jq -e '.ok' >/dev/null 2>&1 && return
+    # else fall through to recreate (message may have been deleted)
+    log "editMessageText failed, recreating: $(echo "$resp" | head -c 200)"
+  fi
+  # First-time send + pin
+  local resp mid
+  resp=$(curl -sf "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=$tg_chat" \
+    --data-urlencode "parse_mode=HTML" \
+    --data-urlencode "text=$content" 2>&1)
+  mid=$(echo "$resp" | jq -r '.result.message_id // empty' 2>/dev/null)
+  if [ -n "$mid" ]; then
+    echo "$mid" > "$STATUS_MSG_FILE"
+    # pin silently (best-effort; in DM bots can pin their own messages)
+    curl -sf "https://api.telegram.org/bot${TOKEN}/pinChatMessage" \
+      --data-urlencode "chat_id=$tg_chat" \
+      --data-urlencode "message_id=$mid" \
+      --data-urlencode "disable_notification=true" -o /dev/null 2>/dev/null
+  fi
+}
 
 # Path to the chat-watcher script (sibling file, same dir).
 SCRIPT_DIR_BOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -173,12 +266,25 @@ chats_for_role() {
     | awk -F'|' -v p="${role}-" 'index($3, p) == 1 { slug=substr($3, length(p)+1); print $0 "|" slug }'
 }
 
-# Resolve <role>/<slug> or just <role> to a pane line. Returns "" if ambiguous or not found.
+# Resolve <role>/<slug> or just <role> to a pane line. Slug supports prefix
+# match — e.g. "pg-writer/back" matches "pg-writer/backlog-20260428-..." if
+# unique. Exact match wins over prefix match. Returns "" if ambiguous or
+# not found.
 resolve_chat() {
   local target="$1"
   if [[ "$target" == *"/"* ]]; then
     local role="${target%%/*}" slug="${target#*/}"
-    chats_for_role "$role" | awk -F'|' -v s="$slug" '$5==s {print; exit}'
+    # exact match first
+    local exact
+    exact=$(chats_for_role "$role" | awk -F'|' -v s="$slug" '$5==s {print; exit}')
+    [ -n "$exact" ] && { echo "$exact"; return; }
+    # prefix match (substring at start of slug)
+    local matches
+    matches=$(chats_for_role "$role" | awk -F'|' -v s="$slug" 'index($5, s) == 1')
+    local n
+    n=$(echo "$matches" | grep -c .)
+    [ "$n" = "1" ] && { echo "$matches"; return; }
+    # 0 or >1: ambiguous; caller will list options
   else
     # bare <role>: only OK if exactly one chat exists
     local lines
@@ -361,7 +467,18 @@ cmd_chats() {
 
 cmd_chat() {
   local tg_chat="$1" target="$2"
-  [ -z "$target" ] && { send_tg "❌ usage: /chat &lt;role&gt; หรือ /chat &lt;role/slug&gt;"; return; }
+  if [ -z "$target" ]; then
+    # No arg → show inline keyboard with all chats
+    local kb; kb=$(build_chat_keyboard "chat")
+    local has_chats
+    has_chats=$(echo "$kb" | jq -r '.inline_keyboard | length')
+    if [ "${has_chats:-0}" = "0" ]; then
+      send_tg "ยังไม่มี chats — /new &lt;role&gt; [slug] เพื่อสร้าง"
+      return
+    fi
+    send_tg "💬 เลือก chat:" "$kb"
+    return
+  fi
   local resolved
   resolved=$(resolve_chat "$target")
   if [ -z "$resolved" ]; then
@@ -396,6 +513,7 @@ cmd_chat() {
   send_tg "✓ active chat: <code>$role/$slug</code> ($pane, cmd=$cmd)
 ส่งข้อความตอนนี้ → ไป chat นี้
 /watch ดู watcher status, /look /history ดูเนื้อหา"
+  update_status "$tg_chat"
 }
 
 cmd_new() {
@@ -476,343 +594,55 @@ status:
 <pre>$(echo "$out" | html_escape)</pre>"
     return
   fi
-  # start interactive claude
-  tmux send-keys -t "$pane" "claude --dangerously-skip-permissions" Enter 2>/dev/null
+  # Maw's send-keys template (`claude --continue || claude -p '<task>'`) often
+  # already starts an interactive claude in fresh worktrees — `--continue`
+  # silently opens a new session even with no prior conversation. So we MUST
+  # NOT blindly send-keys our own `claude --dangerously...` line; if claude is
+  # already up, that text would land inside claude's input box as a "user
+  # message" and trigger a response (observed 2026-04-28: brew-ops/20260428-195326
+  # got "That's the Claude Code CLI flag..." spurious turn).
+  #
+  # Wait for maw's template to settle, then check pane_current_command:
+  #   - shell (zsh/bash/sh/fish) → maw didn't start claude → start it ourselves
+  #   - claude version (e.g. 2.1.119) → maw started it → leave alone
   sleep 3
+  local pane_cmd
+  pane_cmd=$(tmux list-panes -t "$pane" -F "#{pane_current_command}" 2>/dev/null | head -1)
+  if echo "$pane_cmd" | grep -qE '^(zsh|bash|sh|fish)$'; then
+    log "/new $role/$slug — pane at $pane_cmd, starting claude"
+    tmux send-keys -t "$pane" -- "claude --dangerously-skip-permissions" 2>/dev/null
+    sleep 0.3
+    tmux send-keys -t "$pane" Enter 2>/dev/null
+    sleep 3
+  else
+    log "/new $role/$slug — pane already running $pane_cmd, skip claude start"
+  fi
   echo "$role/$slug" > "$(active_chat_file "$tg_chat")"
   start_watcher_for "$pane" "$role/$slug"
   send_tg "✓ created <code>$role/$slug</code> ($pane)
 ✓ now active chat
 🔔 auto-push เปิดอยู่
 ส่งข้อความเริ่มคุย หรือ /look ดู splash"
-}
-
-# Delegate chat audit + cleanup to a brew-ops claude session.
-# Generates a structured task prompt with the current chat list + per-chat
-# state (dirty / unpushed / claude-busy) and asks brew-ops to:
-#   - decide what to do per chat (close / commit-and-close / leave-alive)
-#   - actually execute (tmux kill-pane, git ops)
-#   - report back (output flows via chat-watcher → Telegram)
-delegate_close_to_brew_ops() {
-  local slug="audit-$(date +%H%M%S)"
-  local chat_id="brew-ops/$slug"
-  local repo; repo=$(role_repo "brew-ops")
-  if [ -z "$repo" ]; then send_tg "❌ no brew-ops role configured"; return; fi
-
-  # Build audit dump of every non-oracle chat
-  local audit_lines=""
-  while IFS= read -r role; do
-    [ -z "$role" ] && continue
-    while IFS='|' read -r pane sess win cmd s; do
-      [ -z "$pane" ] && continue
-      [ "$s" = "oracle" ] && continue
-      local cwd; cwd=$(tmux display-message -p -t "$pane" "#{pane_current_path}" 2>/dev/null)
-      local dirty=0 ahead=0 busy="no"
-      if [ -n "$cwd" ] && [ -e "$cwd/.git" ]; then
-        dirty=$(git -C "$cwd" status --short 2>/dev/null | wc -l | tr -d ' ')
-        ahead=$(git -C "$cwd" log origin/main..HEAD --oneline 2>/dev/null | wc -l | tr -d ' ')
-      fi
-      # Busy heuristic: present-progressive forms only ("Brewing", not "Brewed").
-      # "esc to interrupt" = claude actively running tool/streaming. Past-tense
-      # forms like "Baked for 2m 23s" mean DONE — we used to false-positive on those.
-      if tmux capture-pane -t "$pane" -pS -8 2>/dev/null | grep -qE "esc to interrupt|⏸|(Brew|Saut[eé]|Bak|Cogitat|Churn|Whisk|Steam|Knead|Toss|Simmer|Roast|Sizzl|Stew|Marinad|Glaz|Carameliz|Reduc|Blend|Fold|Drizzl)ing"; then
-        busy="yes"
-      fi
-      audit_lines+="- chat=$role/$s pane=$pane cmd=$cmd cwd=$cwd dirty=$dirty ahead=$ahead busy=$busy
-"
-    done <<< "$(chats_for_role "$role")"
-  done <<< "$(all_roles)"
-
-  if [ -z "$audit_lines" ]; then
-    send_tg "ไม่มี non-oracle chats ให้ปิด"
-    return
-  fi
-
-  # Write task prompt
-  local promptfile="$STATE_DIR/wake-prompts/brew-ops-$slug.md"
-  mkdir -p "$STATE_DIR/wake-prompts"
-  cat > "$promptfile" <<EOF
-You are brew-ops. The user has too many chats to review individually and wants you to handle cleanup. Decide what to close, wrap up, or leave alive — and report back. **Avoid losing work at all costs.**
-
-## Chats to audit (auto-collected)
-
-$audit_lines
-
-## Goal
-
-Close chats that are demonstrably safe, wrap up chats whose work can be finished cleanly, and leave alive anything ambiguous or in-progress.
-
-## Per-chat steps
-
-1. **Inspect context before deciding:**
-   - \`tmux capture-pane -t <pane> -pS -100\` — see what claude was doing
-   - \`git -C <cwd> status --short\` — what's dirty
-   - \`git -C <cwd> log origin/main..HEAD\` — commits ahead of main
-   - \`git -C <cwd> branch --show-current\` — current branch
-   - \`git -C <cwd> rev-parse --abbrev-ref @{u} 2>/dev/null\` — does it have an upstream?
-
-2. **GOLDEN RULE: NO DATA LOSS** ⚠️
-
-   **Do NOT kill a pane** until you've verified:
-   - (a) every commit exists on a remote (origin or fork) — \`git rev-list <branch> --not --remotes\` must return 0 lines
-   - (b) the worktree has no dirty / untracked files — \`git status --short\` must be empty (after any wrap-up commit/push)
-   - (c) **no SESSION-STRAY \`ψ/\` content in the worktree** — see exception list below. Stray ψ/ memory inside a worktree where it doesn't belong indicates an arra-oracle tools bug; if found, leave alive for human review.
-
-     **Exception list — repos where \`ψ/\` is legitimate, SKIP the check:**
-     - \`mb_agent_oracle_memory\` — canonical home of memory (ψ/ lives here by design)
-     - \`kokarat/mobiz-payment-gateway\` — legacy ψ/ from the project's developer, predates our oracle ecosystem
-     - \`kokarat/bank-bot\` — same legacy from project developer
-     For these repos: pretend ψ/ doesn't exist for guard (c) — don't check, don't block.
-
-     **For all other repos (arra-oracle-v3, maw-js, oracle-studio, mb-next-payment-gateway, etc.):**
-     Check: \`find <cwd> -type d -name "ψ" 2>/dev/null\` — must be empty.
-     ALSO check whether THIS session created any ψ/ content (catches the bug even in repos where ψ/ legitimately exists already): \`git -C <cwd> diff origin/main..HEAD --name-only -- "ψ/" | wc -l\` plus untracked: \`git -C <cwd> ls-files --others --exclude-standard -- "ψ/" | wc -l\` — sum must be 0. If session_added > 0 → stray (block).
-
-   - If ANY of (a)/(b)/(c) fails → **MUST leave alive** (no exceptions)
-
-   **Vault repo (\`mb_agent_oracle_memory\`) dirty is NOT a blocker** — that's the canonical home for memory. If you find uncommitted changes there during wrap-up, just commit + push to its current branch (likely \`main\`) and move on. Don't block on it.
-
-3. **For unsafe chats: infer the WIP intent before deciding**
-
-   If you're going to leave a chat alive, you need to understand what it was trying to do, so you can tell the user what's stuck and why "don't delete this one" is the right call. Sources:
-   - **JSONL session log:** \`~/.claude/projects/<encoded-cwd>/<uuid>.jsonl\` — read recent assistant + user turns to summarize the in-progress task
-   - **Pane scrollback:** \`tmux capture-pane -pS -200\` — recent context
-   - **Dirty file diff:** \`git -C <cwd> diff\` + \`git diff --cached\` — what content is being edited
-   - **Untracked files:** \`git status --short\` shows new files; cat them if small
-   - **Memory / retros:** if cwd is under \`mb_agent_oracle_memory\`, check ψ/memory/learnings + ψ/memory/retrospectives for files this session created
-   - **arra_thread:** if a thread was opened from this session, note its id
-
-   Summarize in 1–2 sentences: "was attempting <X>, blocked at <Y>" — used in the "Kept alive" report section.
-
-4. **Categorize:**
-
-   **A. SAFE close** — passes all 3 guards
-   - dirty=0, ahead=0 (or all commits on remote), claude exited (cmd=zsh)
-   - no stray ψ/ in worktree
-   - → \`tmux kill-pane -t <pane>\` + \`git -C <repo-root> worktree prune\`
-
-   **B. WRAP-UP then close** — has pending work that can finish cleanly
-   - dirty>0 and the changes look like a complete unit → \`git -C <cwd> add -A && git -C <cwd> commit -m "<descriptive message>" && git -C <cwd> push -u fork <branch>\`
-   - ahead>0 not pushed → \`git -C <cwd> push -u fork <branch>\` (or origin if you have push access)
-   - **vault repo dirty (mb_agent_oracle_memory)**: not a blocker — just \`git -C <vault> add -A && git -C <vault> commit -m "memory: session <chat> wrap" && git -C <vault> push\` on its current branch (typically \`main\`). Memory is supposed to live there.
-   - **After wrap-up: re-verify guards (a)+(b)+(c)** — if push failed / network glitch / stray ψ/ remains → leave alive
-
-   **C. LEAVE ALIVE** — do not close
-   - busy=yes (claude is brewing/cogitating/thinking) — typing into it is harmful
-   - dirty>0 but the files look like a work-in-progress that needs human review (you can't write a confident commit message)
-   - claude is waiting for a Y/N or other confirm — leave it for the user to answer
-   - branch has no upstream and no fork remote configured — can't push → leave alive
-   - any of guard (a)/(b)/(c) fails after a wrap-up attempt → **leave alive immediately** and report
-
-5. **Report via Telegram** using \`mcp__tester-telegram__telegram_send\` (chat 2002026175, bot \`@ampay_test_alert_bot\`). Format:
-
-\`\`\`
-🧹 brew-ops cleanup report
-
-✅ Closed (N) — verified safe:
-  - <chat>: clean, no ahead, claude exited
-  ...
-
-📤 Wrapped + closed (M) — committed/pushed/verified:
-  - <chat>: committed "<msg>" + pushed → fork/<branch> (sha=<short>)
-  ...
-
-⏸ Kept alive (K) — reason + WIP context:
-  - <chat>: claude busy (Brewing 3m)
-    └ Doing: <summarize from JSONL/scrollback what task is in progress>
-  - <chat>: dirty WIP files need human review (<files preview>)
-    └ Intent: <summarize from JSONL turns + dirty diff what is being attempted>
-    └ Last action: <claude last assistant turn snippet>
-  - <chat>: branch has no upstream + push failed
-    └ Intent: <inferred from history>
-  ...
-
-🔍 Verification on every closed chat:
-  - guard (a) all commits on remote: ✅
-  - guard (b) worktree clean (no dirty/untracked): ✅
-  - guard (c) no session-stray ψ/ added (legacy ψ/ in mobiz/bank-bot/vault is OK): ✅
-\`\`\`
-
-## Constraints
-
-- **Do NOT touch -oracle baselines** (keep them — user uses them)
-- **Do NOT close your own pane** (chat \`$chat_id\`) — the user will /close it themselves after reading your report
-- **Never \`push --force\`** (regular push only)
-- **Never \`rm -rf\` / \`git reset --hard\` / \`git stash drop\`** (preserve all data)
-- **Default to safe: when in doubt → leave alive** (no harm done)
-- Closing requires every commit and every dirty file to be on a remote (origin or fork) — otherwise keep
-- Branch with no upstream and no working push target → **leave alive**, never close
-- Vault repo dirty (\`mb_agent_oracle_memory\`) is fine — just commit + push to its main during wrap-up; never a blocker
-- Stray \`ψ/\` ADDED BY THIS SESSION is a blocker (tools-bug signal). But pre-existing ψ/ in the exception-list repos (\`mb_agent_oracle_memory\`, \`kokarat/mobiz-payment-gateway\`, \`kokarat/bank-bot\`) is fine and must be ignored — that's legacy / canonical-home content unrelated to our workflow.
-
-## Expected end state
-
-- ✅ All -oracle baselines still alive (untouched)
-- ✅ Your own chat (\`$chat_id\`) still alive (so user can read the report)
-- ❌ Non-oracle, non-self chats: each handled per the decision (closed / wrapped+closed / left-alive)
-
-## Notes
-
-- Chat worktrees live under \`.claude/worktrees/\` or \`<repo>.wt-N-<slug>\`
-- Some chats may already be on a feature branch (e.g. docs/track-*) — figure out from git branch
-- After killing a pane, run \`git -C <repo-root> worktree prune\` to clean orphans
-EOF
-
-  send_tg "🤖 spawning <code>$chat_id</code> ให้ brew-ops จัดการ chat cleanup
-รายงานจะ push กลับมาเมื่อ brew-ops ตอบ"
-
-  # Pre-flight: pull main (skip dirty-check noise; brew-ops worktree forks from main)
-  git -C "$repo" fetch origin main 2>/dev/null
-  local cur_b; cur_b=$(git -C "$repo" branch --show-current 2>/dev/null)
-  if [ "$cur_b" = "main" ]; then
-    git -C "$repo" merge --ff-only origin/main 2>/dev/null
-  else
-    git -C "$repo" update-ref refs/heads/main origin/main 2>/dev/null
-  fi
-
-  # Spawn worktree + pane via maw
-  maw wake brew-ops --wt "$slug" --fresh >/dev/null 2>&1
-  sleep 3
-
-  # Find the new pane
-  local pane; pane=$(tmux list-panes -a -F "#{pane_id}|#{window_name}" 2>/dev/null \
-    | awk -F'|' -v w="brew-ops-$slug" '$2==w{print $1; exit}')
-  if [ -z "$pane" ]; then
-    send_tg "❌ pane brew-ops-$slug ไม่ถูกสร้าง"
-    return
-  fi
-
-  # Start claude if at shell (race-safe with maw template)
-  local pcmd; pcmd=$(tmux list-panes -t "$pane" -F "#{pane_current_command}" 2>/dev/null | head -1)
-  if echo "$pcmd" | grep -qE '^(zsh|bash|sh|fish)$'; then
-    tmux send-keys -t "$pane" -- "claude --dangerously-skip-permissions" 2>/dev/null
-    sleep 0.3
-    tmux send-keys -t "$pane" Enter 2>/dev/null
-    sleep 3
-  fi
-
-  # Send the task pointer (claude reads file)
-  local task_msg="Read $promptfile in full — that is your task, every line. Follow all instructions in the file, do not skip any."
-  date +%s > "$(user_send_marker "$chat_id")"
-  tmux send-keys -t "$pane" -- "$task_msg" 2>/dev/null
-  sleep 0.3
-  tmux send-keys -t "$pane" Enter 2>/dev/null
-
-  # Set as active + start watcher
-  echo "$chat_id" > "$(active_chat_file "$CHAT")"
-  start_watcher_for "$pane" "$chat_id"
+  update_status "$tg_chat"
 }
 
 cmd_close() {
-  local target="$1" mode="${2:-}"
-  [ -z "$target" ] && { send_tg "❌ usage:
-  /close &lt;role/slug&gt;        — single chat
-  /close all                  — audit + ลบเฉพาะ safe (ไม่แตะ -oracle)
-  /close all force            — skip audit, kill ทุก non-oracle
-  /close all auto             — 🤖 delegate ให้ brew-ops agent จัดการ
-  /close everything           — audit + ลบ safe (รวม -oracle)
-  /close everything force     — kill ทุกอย่างเลย"; return; }
-
-  # /close all auto — spawn brew-ops chat to do audit + cleanup intelligently
-  if [ "$target" = "all" ] && [ "$mode" = "auto" ]; then
-    audit "/close all auto"
-    delegate_close_to_brew_ops
-    return
-  fi
-
-  # /close all (skip oracle) | /close everything (include oracle)
-  if [ "$target" = "all" ] || [ "$target" = "everything" ]; then
-    local include_oracle=false
-    [ "$target" = "everything" ] && include_oracle=true
-    local force=false
-    [ "$mode" = "force" ] && force=true
-    audit "/close $target $mode"
-
-    # Collect (chat, pane, cwd) tuples to consider
-    local candidates=""
-    while IFS= read -r role; do
-      [ -z "$role" ] && continue
-      while IFS='|' read -r pane sess win cmd slug; do
-        [ -z "$pane" ] && continue
-        if [ "$slug" = "oracle" ] && [ "$include_oracle" = "false" ]; then continue; fi
-        candidates+="$role/$slug|$pane|$cmd"$'\n'
-      done <<< "$(chats_for_role "$role")"
-    done <<< "$(all_roles)"
-
-    [ -z "$candidates" ] && { send_tg "ไม่มี chat ที่จะปิด"; return; }
-
-    if [ "$force" = "true" ]; then
-      # No audit — kill everything in candidates
-      local count=0
-      while IFS='|' read -r chat pane cmd; do
-        [ -z "$chat" ] && continue
-        stop_watcher_for "$chat"
-        tmux kill-pane -t "$pane" 2>/dev/null
-        count=$((count + 1))
-      done <<< "$candidates"
-      [ "$include_oracle" = "true" ] && rm -f "$STATE_DIR"/active-chat.* "$STATE_DIR"/last-line.* 2>/dev/null
-      send_tg "✓ force-closed $count chat(s)
-worktrees ที่ orphan: <code>git worktree prune</code> เอง"
+  local target="$1"
+  if [ -z "$target" ]; then
+    local kb; kb=$(build_chat_keyboard "close")
+    local has_chats
+    has_chats=$(echo "$kb" | jq -r '.inline_keyboard | length')
+    if [ "${has_chats:-0}" = "0" ]; then
+      send_tg "ยังไม่มี chats ให้ปิด"
       return
     fi
-
-    # Audit each candidate
-    local safe_list="" unsafe_report=""
-    local safe_n=0 unsafe_n=0
-    while IFS='|' read -r chat pane cmd; do
-      [ -z "$chat" ] && continue
-      local cwd; cwd=$(tmux display-message -p -t "$pane" "#{pane_current_path}" 2>/dev/null)
-      local issues=""
-      # 1. dirty worktree
-      if [ -n "$cwd" ] && [ -d "$cwd/.git" -o -f "$cwd/.git" ]; then
-        local dirty; dirty=$(git -C "$cwd" status --short 2>/dev/null | wc -l | tr -d ' ')
-        [ "$dirty" -gt 0 ] && issues+="
-   • $dirty dirty file(s)"
-        # 2. unpushed commits vs origin/main
-        local unpushed; unpushed=$(git -C "$cwd" log origin/main..HEAD --oneline 2>/dev/null | wc -l | tr -d ' ')
-        [ "$unpushed" -gt 0 ] && issues+="
-   • $unpushed commit(s) ahead of origin/main"
-      fi
-      # 3. claude busy heuristic — pane content shows spinner / interrupt hint
-      local pcontent; pcontent=$(tmux capture-pane -t "$pane" -pS -8 2>/dev/null | tail -8)
-      if echo "$pcontent" | grep -qE "esc to interrupt|✻|✶|✢|⏸|Brewing|Cogitating|Thinking"; then
-        issues+="
-   • claude อาจ busy หรือรอ confirm (ดู /look)"
-      fi
-
-      if [ -z "$issues" ]; then
-        safe_list+="$chat|$pane"$'\n'
-        safe_n=$((safe_n + 1))
-      else
-        unsafe_report+="
-⚠️ <code>$chat</code>:$issues"
-        unsafe_n=$((unsafe_n + 1))
-      fi
-    done <<< "$candidates"
-
-    # Close the safe ones
-    while IFS='|' read -r chat pane; do
-      [ -z "$chat" ] && continue
-      stop_watcher_for "$chat"
-      tmux kill-pane -t "$pane" 2>/dev/null
-    done <<< "$safe_list"
-
-    local note="🔍 <b>Audit + close $target</b>
-✅ closed $safe_n safe chat(s)"
-    if [ "$unsafe_n" -gt 0 ]; then
-      note+="
-
-🛑 <b>$unsafe_n unsafe (kept alive):</b>$unsafe_report
-
-ใช้ <code>/close $target force</code> เพื่อ kill ทั้งหมด (รวม unsafe)
-หรือจัดการรายตัวก่อน:
-  /look /chat &lt;chat&gt; → ดู/wrap up
-  cd worktree → commit/push/stash"
-    fi
-    send_tg "$note"
+    send_tg "✖️ เลือก chat ที่จะปิด:" "$kb"
     return
   fi
-
+  # Track if active chat is being closed → clear it
+  local active_f; active_f=$(active_chat_file "$CHAT")
+  local active_now=""
+  [ -s "$active_f" ] && active_now=$(cat "$active_f")
   local resolved
   resolved=$(resolve_chat "$target")
   [ -z "$resolved" ] && { send_tg "❌ ไม่เจอ chat <code>$target</code>"; return; }
@@ -821,11 +651,22 @@ worktrees ที่ orphan: <code>git worktree prune</code> เอง"
   audit "/close $target ($pane)"
   stop_watcher_for "$target"
   tmux kill-pane -t "$pane" 2>/dev/null
-  # clear active state if it was the target
-  local f; f=$(active_chat_file "$CHAT")
-  [ -s "$f" ] && [ "$(cat "$f")" = "$target" ] && rm -f "$f"
+  # If we just killed the active chat, clear active state
+  # (resolve_chat may have prefix-matched, so compare resolved target)
+  local resolved_target="$target"
+  # Try to derive the canonical role/slug we just closed from the resolved line
+  local closed_role closed_slug
+  while IFS= read -r r; do
+    case "$pane" in *) ;; esac
+    # not strictly needed; keep target as-is and just clear if matches active
+  done <<< ""
+  if [ -n "$active_now" ] && [[ "$active_now" == "$target" || "$active_now" == "${target%%/*}/"* ]]; then
+    # imprecise but ok: clear active if any close-match
+    rm -f "$active_f"
+  fi
   send_tg "✓ closed <code>$target</code> ($pane)
 หมายเหตุ: worktree ของ chat นี้ยัง orphan — รัน <code>git worktree prune</code> ใน repo นั้น"
+  update_status "$CHAT"
 }
 
 # ── Phase 3b history ───────────────────────────────────────────────────────
@@ -853,6 +694,7 @@ cmd_end() {
   local tg_chat="$1"
   rm -f "$(active_chat_file "$tg_chat")"
   send_tg "✓ cleared active chat (watchers ยังเปิดอยู่ — ใช้ /watch off &lt;chat&gt; ถ้าจะเงียบ)"
+  update_status "$tg_chat"
 }
 
 cmd_watch() {
@@ -1081,7 +923,7 @@ dispatch() {
     /chats)       cmd_chats "${2:-}" ;;
     /chat)        cmd_chat "$chat_id" "${2:-}" ;;
     /new)         cmd_new "$chat_id" "${2:-}" "${3:-}" ;;
-    /close)       cmd_close "${2:-}" "${3:-}" ;;
+    /close)       cmd_close "${2:-}" ;;
     /look)        cmd_look "$chat_id" "${2:-25}" ;;
     /end)         cmd_end "$chat_id" ;;
     /watch)       cmd_watch "${2:-list}" "${3:-}" ;;
@@ -1100,6 +942,8 @@ main() {
   trap 'log "shutting down (pid=$$)"; exit 0' INT TERM
   # Phase 4 v2: scan existing chats and spawn watchers (recover after restart)
   recover_watchers
+  # Refresh pinned status message so it reflects current state on boot
+  update_status "$CHAT"
   local last_id=0
   [ -f "$LAST_UPDATE_ID_FILE" ] && last_id=$(cat "$LAST_UPDATE_ID_FILE")
   while true; do
@@ -1108,12 +952,31 @@ main() {
     local n; n=$(echo "$resp" | jq '.result | length' 2>/dev/null)
     [ "${n:-0}" -eq 0 ] && continue
     for i in $(seq 0 $((n - 1))); do
-      local update_id chat_id text
+      local update_id chat_id text cb_id cb_data cb_chat
       update_id=$(echo "$resp" | jq ".result[$i].update_id")
-      chat_id=$(echo "$resp" | jq ".result[$i].message.chat.id // empty")
-      text=$(echo "$resp" | jq -r ".result[$i].message.text // empty")
       last_id=$update_id
       echo "$last_id" > "$LAST_UPDATE_ID_FILE"
+
+      # Inline keyboard tap → callback_query (separate from regular message)
+      cb_id=$(echo "$resp" | jq -r ".result[$i].callback_query.id // empty")
+      if [ -n "$cb_id" ]; then
+        cb_data=$(echo "$resp" | jq -r ".result[$i].callback_query.data // empty")
+        cb_chat=$(echo "$resp" | jq -r ".result[$i].callback_query.message.chat.id // empty")
+        ack_callback "$cb_id"
+        # Translate callback_data → command. Format: "<action>:<arg>"
+        case "$cb_data" in
+          chat:*)   dispatch "$cb_chat" "/chat ${cb_data#chat:}" ;;
+          close:*)  dispatch "$cb_chat" "/close ${cb_data#close:}" ;;
+          chats:*)  dispatch "$cb_chat" "/chats ${cb_data#chats:}" ;;
+          watch_off:*) dispatch "$cb_chat" "/watch off ${cb_data#watch_off:}" ;;
+          *)        log "unhandled callback: $cb_data" ;;
+        esac
+        continue
+      fi
+
+      # Regular text message
+      chat_id=$(echo "$resp" | jq ".result[$i].message.chat.id // empty")
+      text=$(echo "$resp" | jq -r ".result[$i].message.text // empty")
       [ -z "$chat_id" ] || [ -z "$text" ] && continue
       dispatch "$chat_id" "$text"
     done
