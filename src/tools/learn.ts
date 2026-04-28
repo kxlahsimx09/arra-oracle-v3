@@ -329,6 +329,107 @@ export function stripFrontmatterWrap(pattern: string): FrontmatterStripResult {
 }
 
 /**
+ * Known agent roles in the Soul-Brews fleet. Used to identify which role filed
+ * a learning so `arra_learn` can hint at trace-link candidates from the same
+ * role's recent work.
+ *
+ * Pattern (2026-04-27 next-architect retro): `arra_trace_link` was flagged as
+ * missed in 8+ consecutive retros because the trigger to call it was at retro
+ * time — too late, chain context already faded. The fix mirrors what makes
+ * `arra_supersede` reliably remembered: surface the candidate at the moment
+ * of action (right after `arra_learn` returns), not at end-of-session reflection.
+ *
+ * Roles match the `tags:` / `concepts:` 3-layer convention from .agent/AGENTS.md
+ * §7a layer 3 (the role-tag layer). Add new roles here when the fleet grows.
+ */
+export const KNOWN_ROLES = new Set<string>([
+  'brew-ops',
+  'system-architect',
+  'technical-writer',
+  'pg-writer',
+  'bot-writer',
+  'tester',
+  'pg-tester',
+]);
+
+/**
+ * Pull the role tag out of a concepts list. Returns the first concept that
+ * matches `KNOWN_ROLES`, or null when no role tag is present (universal docs,
+ * indexer-created entries, agents that forgot the role tag).
+ *
+ * Returning null cleanly skips the trace-link hint in `handleLearn` — when we
+ * cannot identify the role, listing "recent same-role learnings" is meaningless.
+ */
+export function extractRoleFromConcepts(concepts: string[]): string | null {
+  for (const c of concepts) {
+    const tag = String(c).trim().toLowerCase();
+    if (KNOWN_ROLES.has(tag)) return tag;
+  }
+  return null;
+}
+
+export interface TraceLinkCandidate {
+  id: string;
+  source_file: string;
+  created: string;
+}
+
+/**
+ * Find recent same-role learnings — candidates the just-filed learning may
+ * want to chain via `arra_trace_link`. Restricts to last `days` days, filters
+ * out superseded entries, and orders newest-first.
+ *
+ * Concepts column is JSON-encoded text (`["role","domain",...]`) so a quoted
+ * substring match is enough to filter — exact-token boundary thanks to the
+ * surrounding `"` chars from `JSON.stringify`. Avoids json_each() cost for a
+ * read on a one-time path.
+ */
+export function findRecentSameRoleLearnings(
+  ctx: ToolContext,
+  role: string,
+  excludeId: string,
+  days: number = 7,
+  limit: number = 5,
+): TraceLinkCandidate[] {
+  const since = Date.now() - days * 24 * 60 * 60 * 1000;
+  // Pull more than `limit` because the same source file can show up under
+  // multiple ids (arra_learn stores `learning_<date>_<slug>`, the indexer
+  // re-indexes the same markdown as `learning_<full-path>_<chunk>`, and
+  // chunks split a single file into _0/_2/_5/...). Dedupe by basename below
+  // so the agent sees one row per real learning.
+  const rows = ctx.sqlite.prepare(`
+    SELECT id, source_file, created_at
+    FROM oracle_documents
+    WHERE type = 'learning'
+      AND created_at >= ?
+      AND id != ?
+      AND superseded_by IS NULL
+      AND concepts LIKE ?
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(since, excludeId, `%"${role}"%`, limit * 4) as Array<{
+    id: string;
+    source_file: string;
+    created_at: number;
+  }>;
+
+  const seen = new Set<string>();
+  const result: TraceLinkCandidate[] = [];
+  for (const r of rows) {
+    const basename = r.source_file.split('/').pop() ?? r.source_file;
+    if (seen.has(basename)) continue;
+    seen.add(basename);
+    result.push({
+      id: r.id,
+      source_file: r.source_file,
+      created: new Date(r.created_at).toISOString(),
+    });
+    if (result.length >= limit) break;
+  }
+  return result;
+}
+
+/**
  * Extract project from source field (fallback).
  * Handles "arra_learn from github.com/owner/repo" and "rrr: org/repo" formats.
  */
@@ -493,6 +594,21 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
        'arra_learn generates its own frontmatter — pass prose in `pattern`, not a pre-formatted doc.']
     : undefined;
 
+  // Surface trace-link candidates at the moment of action — same mechanism that
+  // keeps `arra_supersede` reliably remembered. See KNOWN_ROLES docstring for
+  // the recurring-miss pattern this addresses.
+  const role = extractRoleFromConcepts(conceptsList);
+  const recentSameRole = role ? findRecentSameRoleLearnings(ctx, role, id) : [];
+  const traceLinkHint = recentSameRole.length > 0
+    ? {
+        role,
+        recent_same_role: recentSameRole,
+        message: `Filed as ${role}. Found ${recentSameRole.length} recent same-role learning(s) in the last 7 days. ` +
+                 `If this learning chains to any of them (ratifies, supersedes, or is a sibling pass), ` +
+                 `call arra_trace_link before the next commit — retro-time is too late.`,
+      }
+    : undefined;
+
   return {
     content: [{
       type: 'text',
@@ -503,6 +619,7 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
         embedding: embeddingStatus,
         message: `Pattern added to Oracle knowledge base${vaultRoot ? ' (vault)' : ''}${embeddingStatus === 'failed' ? ' — vector embedding failed, see server log' : ''}`,
         ...(warnings ? { warnings } : {}),
+        ...(traceLinkHint ? { trace_link_hint: traceLinkHint } : {}),
       }, null, 2)
     }]
   };

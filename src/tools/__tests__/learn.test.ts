@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { normalizeProject, extractProjectFromSource, stripFrontmatterWrap, levenshtein, suggestClosestProject, validateProjectInput, KNOWN_PROJECTS, getKnownProjects, _resetKnownProjectsCacheForTests } from '../learn.ts';
+import { normalizeProject, extractProjectFromSource, stripFrontmatterWrap, levenshtein, suggestClosestProject, validateProjectInput, KNOWN_PROJECTS, getKnownProjects, _resetKnownProjectsCacheForTests, extractRoleFromConcepts, KNOWN_ROLES } from '../learn.ts';
 
 // ============================================================================
 // normalizeProject
@@ -270,6 +270,44 @@ describe('getKnownProjects', () => {
     // Content-equivalent: both contain every baseline entry.
     for (const p of KNOWN_PROJECTS) {
       expect(b.has(p)).toBe(true);
+    }
+  });
+});
+
+// ============================================================================
+// extractRoleFromConcepts — feeds the trace-link hint in handleLearn
+// ============================================================================
+//
+// Pattern (2026-04-27 next-architect retro): arra_trace_link missed in 8+
+// consecutive retros. Hint surfaces candidates at learn-time; needs a reliable
+// way to pick the role from the 3-layer tag list.
+
+describe('extractRoleFromConcepts', () => {
+  it('returns null for an empty concepts list', () => {
+    expect(extractRoleFromConcepts([])).toBeNull();
+  });
+
+  it('returns null when no concept matches a known role', () => {
+    expect(extractRoleFromConcepts(['memory', 'fts5', 'gotcha'])).toBeNull();
+  });
+
+  it('picks the role tag regardless of position', () => {
+    expect(extractRoleFromConcepts(['repo:cross', 'memory', 'brew-ops'])).toBe('brew-ops');
+    expect(extractRoleFromConcepts(['system-architect', 'next', 'adr'])).toBe('system-architect');
+  });
+
+  it('picks the first role when multiple are tagged (cross-role learnings)', () => {
+    // Real example: 2026-04-16 maw-fleet gotcha tagged both brew-ops + tester.
+    expect(extractRoleFromConcepts(['brew-ops', 'tester', 'fleet'])).toBe('brew-ops');
+  });
+
+  it('normalizes case before matching', () => {
+    expect(extractRoleFromConcepts(['Brew-Ops', 'memory'])).toBe('brew-ops');
+  });
+
+  it('every entry in KNOWN_ROLES is picked up by the extractor', () => {
+    for (const role of KNOWN_ROLES) {
+      expect(extractRoleFromConcepts(['some-domain', role])).toBe(role);
     }
   });
 });
