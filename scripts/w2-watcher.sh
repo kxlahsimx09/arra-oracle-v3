@@ -120,6 +120,10 @@ log() {
 # fail-telegram for operator visibility).
 WAKE_VERIFY_TIMEOUT=${WAKE_VERIFY_TIMEOUT:-3600}
 SILENT_FAIL_TG_PROJECT=${SILENT_FAIL_TG_PROJECT:-$HOME/Code/github.com/kokarat/mobiz-payment-gateway}
+# Author of commits the workflows produce (W2/W9/W1 commits land via local
+# git config). Used by silent-fail detector to count AMEND-path commits in
+# addition to NEW PRs.
+COMMIT_AUTHOR=${COMMIT_AUTHOR:-amadeusmarsexpress}
 
 send_silent_fail_telegram() {
   local role="$1" repo_slug="$2" wake_ts="$3" elapsed="$4"
@@ -286,21 +290,49 @@ cmd_run() {
       pending_wake_ts=0
       [ -f "$state_file" ] && source "$state_file"
 
-      # Silent-fail check: did the previous wake actually produce a PR?
+      # Silent-fail check: did the previous wake actually produce output?
       # Runs before fetch so it fires even on offline rounds. Only checks
       # once per pending wake; clears pending_wake_ts after either result.
+      #
+      # Two signals (either >0 = wake verified):
+      #   1. NEW PRs by @me on this repo since wake     (covers 8.B path)
+      #   2. Commits by COMMIT_AUTHOR on any branch     (covers 8.A amend
+      #      path — pushed commits to existing PR's branch, no new PR)
+      #
+      # gh retry: transient keyring/network glitch caused false positives
+      # 2026-04-28 (pg-tester PR #326 existed but detector returned 0).
+      # Retry once before declaring silent.
       now=$(date +%s)
       if [ "${pending_wake_ts:-0}" -gt 0 ]; then
         pending_elapsed=$((now - pending_wake_ts))
         if [ "$pending_elapsed" -ge "$WAKE_VERIFY_TIMEOUT" ]; then
           repo_slug=$(echo "$repo" | sed 's|.*/github\.com/||')
           iso_filter=$(date -u -r "$pending_wake_ts" '+%Y-%m-%dT%H:%M:%SZ')
-          pr_count=$(gh pr list --repo "$repo_slug" --search "author:@me created:>=$iso_filter" --json number --jq 'length' 2>/dev/null || echo 0)
-          if [ "${pr_count:-0}" = "0" ]; then
-            log "[$role] SILENT-FAIL: 0 PRs landed in $((pending_elapsed/60))min since wake @ $(date -r "$pending_wake_ts" '+%H:%M') — alerting operator"
+
+          # Signal 1: NEW PRs by @me (with retry on gh failure)
+          pr_count=""
+          for attempt in 1 2; do
+            pr_count=$(gh pr list --repo "$repo_slug" --search "author:@me created:>=$iso_filter" --json number --jq 'length' 2>/dev/null) && break
+            sleep 10
+          done
+          pr_count=${pr_count:-0}
+
+          # Signal 2: commits by COMMIT_AUTHOR on any branch since wake.
+          # Refresh remote refs first so AMEND-path branches (e.g. existing
+          # docs/track-* / docs/flow-track-*) are visible.
+          git -C "$repo" fetch origin --prune --quiet 2>/dev/null
+          commit_count=$(git -C "$repo" log --all --remotes \
+            --author="$COMMIT_AUTHOR" \
+            --since="@$pending_wake_ts" \
+            --format=%h 2>/dev/null | wc -l | tr -d ' ')
+          commit_count=${commit_count:-0}
+
+          total_signal=$((pr_count + commit_count))
+          if [ "$total_signal" -eq 0 ]; then
+            log "[$role] SILENT-FAIL: 0 PRs + 0 commits in $((pending_elapsed/60))min since wake @ $(date -r "$pending_wake_ts" '+%H:%M') — alerting operator"
             send_silent_fail_telegram "$role" "$repo_slug" "$pending_wake_ts" "$pending_elapsed"
           else
-            log "[$role] wake verified: $pr_count PR(s) landed in $((pending_elapsed/60))min"
+            log "[$role] wake verified: $pr_count new PR(s) + $commit_count commit(s) in $((pending_elapsed/60))min"
           fi
           pending_wake_ts=0
         fi
