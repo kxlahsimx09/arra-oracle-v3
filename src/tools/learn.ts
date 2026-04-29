@@ -14,10 +14,43 @@ import { ensureVectorStoreConnected } from '../vector/factory.ts';
 import { REPO_ROOT } from '../config.ts';
 import type { ToolContext, ToolResponse, OracleLearnInput } from './types.ts';
 
-/** Coerce concepts to string[] — handles string, array, or undefined from MCP input */
+/**
+ * Coerce concepts to string[] — handles array, JSON-stringified array, comma
+ * string, or undefined from MCP input.
+ *
+ * The string-input path is more nuanced than it looks. Some MCP transports
+ * forward an `array<string>` argument as a JSON string (`'["a","b"]'`) rather
+ * than a true array. Comma-splitting that string treats every JSON syntax
+ * character (`[`, `"`, `]`) as part of the values, producing entries like
+ * `'["a"'` and `'"b"]'`. The corruption then breaks downstream LIKE queries
+ * (e.g. `concepts LIKE '%"brew-ops"%'` no longer matches `[\"brew-ops\"`)
+ * and role-tag extraction (`extractRoleFromConcepts` sees `'["brew-ops"'`,
+ * not `'brew-ops'`).
+ *
+ * Detection logic: if a string starts with `[` and ends with `]`, try
+ * `JSON.parse` first; only fall back to comma-split when parse fails.
+ *
+ * Discovered 2026-04-29 brew-ops smoke test: filed `arra_learn` with
+ * `concepts: ["brew-ops", "repo:arra-oracle-v3", ...]` and got back a
+ * response without `trace_link_hint`. Inspecting the DB row showed the
+ * concepts column stored as `["[\"brew-ops\"","\"repo:arra-oracle-v3\"",...]`
+ * — proof the MCP transport had stringified the array and the comma-split
+ * fallback had butchered it.
+ */
 export function coerceConcepts(concepts: unknown): string[] {
   if (Array.isArray(concepts)) return concepts.map(String);
-  if (typeof concepts === 'string') return concepts.split(',').map(s => s.trim()).filter(Boolean);
+  if (typeof concepts === 'string') {
+    const trimmed = concepts.trim();
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return parsed.map(String);
+      } catch {
+        // Not valid JSON — fall through to comma split.
+      }
+    }
+    return concepts.split(',').map(s => s.trim()).filter(Boolean);
+  }
   return [];
 }
 
