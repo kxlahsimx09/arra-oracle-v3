@@ -36,8 +36,14 @@ mkdir -p "$STATE_DIR"
 LOG_FILE=$STATE_DIR/watcher.log
 SAFE=$(echo "$CHAT_ID" | tr '/' '_')
 PID_FILE=$STATE_DIR/watch.$SAFE.pid
+# Persistent watch position so restarts/timeouts don't lose responses written
+# between prior shutdown and this startup. Format: <jsonl_path>|<line_count>
+LINE_STATE_FILE=$STATE_DIR/last-line.$SAFE
 
 POLL_INTERVAL=${POLL_INTERVAL:-2}
+# How long to wait for JSONL dir to appear after pane spawn. Claude with a
+# large CLAUDE.md can take >30s to first-write — use 120s default.
+JSONL_WAIT_SECONDS=${JSONL_WAIT_SECONDS:-120}
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$CHAT_ID/$$] $*" >> "$LOG_FILE"; }
 
@@ -162,28 +168,45 @@ trap 'log "shutting down"; rm -f "$PID_FILE"; exit 0' INT TERM
 
 log "starting (pane=$PANE)"
 
-# Discover JSONL location. Wait up to 30s for it to exist (claude may take
-# a moment to first-write after spawn).
+# Discover JSONL location. Wait up to JSONL_WAIT_SECONDS (default 120s) for
+# it to exist — claude with a large CLAUDE.md can take >30s to first-write.
 JSONL_DIR=""
-for _ in $(seq 1 15); do
+attempts=$((JSONL_WAIT_SECONDS / POLL_INTERVAL))
+for _ in $(seq 1 "$attempts"); do
   JSONL_DIR=$(resolve_jsonl_dir)
   [ -n "$JSONL_DIR" ] && [ -d "$JSONL_DIR" ] && break
-  sleep 2
+  sleep "$POLL_INTERVAL"
 done
 
 if [ -z "$JSONL_DIR" ] || [ ! -d "$JSONL_DIR" ]; then
-  log "JSONL dir never appeared — bailing"
+  log "JSONL dir never appeared after ${JSONL_WAIT_SECONDS}s — bailing"
   rm -f "$PID_FILE"
   exit 1
 fi
 log "JSONL dir: $JSONL_DIR"
 
-# Prime: take latest JSONL and start at its current line count, so we don't
-# replay history. We only push lines added AFTER the watcher started.
+# Prime: prefer persistent state if it points to the current JSONL — this
+# resumes after bot restart / watcher timeout without losing claude responses
+# that landed between shutdown and startup. Else fall back to current EOL.
 current_jsonl=$(latest_jsonl "$JSONL_DIR")
 last_line_count=0
-[ -n "$current_jsonl" ] && last_line_count=$(wc -l < "$current_jsonl" 2>/dev/null | tr -d ' ')
-log "primed at $current_jsonl ($last_line_count lines)"
+if [ -n "$current_jsonl" ]; then
+  if [ -s "$LINE_STATE_FILE" ]; then
+    saved=$(cat "$LINE_STATE_FILE" 2>/dev/null)
+    saved_path="${saved%|*}"
+    saved_count="${saved##*|}"
+    if [ "$saved_path" = "$current_jsonl" ] && [[ "$saved_count" =~ ^[0-9]+$ ]]; then
+      last_line_count=$saved_count
+      log "resumed from saved state: line $saved_count"
+    else
+      last_line_count=$(wc -l < "$current_jsonl" 2>/dev/null | tr -d ' ')
+      log "saved state stale (path mismatch) — priming at EOL ($last_line_count)"
+    fi
+  else
+    last_line_count=$(wc -l < "$current_jsonl" 2>/dev/null | tr -d ' ')
+    log "primed at EOL ($last_line_count) — no saved state"
+  fi
+fi
 
 while true; do
   # bail if pane is gone
@@ -216,6 +239,8 @@ while true; do
         log "pushed assistant turn (${#local_text} chars)"
       done
     last_line_count=$cur_count
+    # Persist position so a watcher restart / bot restart resumes from here.
+    echo "${current_jsonl}|${last_line_count}" > "$LINE_STATE_FILE"
   fi
 
   sleep "$POLL_INTERVAL"
