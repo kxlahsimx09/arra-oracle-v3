@@ -52,3 +52,4 @@ vault-data.json
 
 # Project-scope MCP config can carry tokens in clear text — gitignore as safety net
 .mcp.json
+scripts/brew-ops-bot/.env
