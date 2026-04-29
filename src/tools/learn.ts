@@ -597,15 +597,25 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
   // Surface trace-link candidates at the moment of action — same mechanism that
   // keeps `arra_supersede` reliably remembered. See KNOWN_ROLES docstring for
   // the recurring-miss pattern this addresses.
+  //
+  // Wording note (2026-04-29 brew-ops, thread #54): `arra_trace_link` chains
+  // *traces* (UUIDs in trace_log), not learnings — chain primitive is
+  // `arra_trace` first, then link. Message is explicit about all three steps so
+  // agents who haven't been creating traces (e.g. mb-next had 0 traces in 30d)
+  // see what they actually need to call.
   const role = extractRoleFromConcepts(conceptsList);
   const recentSameRole = role ? findRecentSameRoleLearnings(ctx, role, id) : [];
   const traceLinkHint = recentSameRole.length > 0
     ? {
         role,
         recent_same_role: recentSameRole,
-        message: `Filed as ${role}. Found ${recentSameRole.length} recent same-role learning(s) in the last 7 days. ` +
-                 `If this learning chains to any of them (ratifies, supersedes, or is a sibling pass), ` +
-                 `call arra_trace_link before the next commit — retro-time is too late.`,
+        message:
+          `Filed as ${role}. Found ${recentSameRole.length} recent same-role learning(s) in the last 7 days. ` +
+          `If this learning chains to any of them (ratifies, supersedes, or sibling pass): ` +
+          `(1) arra_trace foundLearnings=["${sourceFileRel}"] query="<this pass>" — log the session, ` +
+          `(2) arra_trace_list query="<prior learning's slug>" — find the prior trace UUID, ` +
+          `(3) arra_trace_link prevTraceId=<prior> nextTraceId=<this> — chain them. ` +
+          `Do it before the next commit. retro-time is too late, chain context will fade.`,
       }
     : undefined;
 
