@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { normalizeProject, extractProjectFromSource, stripFrontmatterWrap, levenshtein, suggestClosestProject, validateProjectInput, KNOWN_PROJECTS, getKnownProjects, _resetKnownProjectsCacheForTests, extractRoleFromConcepts, KNOWN_ROLES } from '../learn.ts';
+import { normalizeProject, extractProjectFromSource, stripFrontmatterWrap, levenshtein, suggestClosestProject, validateProjectInput, KNOWN_PROJECTS, getKnownProjects, _resetKnownProjectsCacheForTests, extractRoleFromConcepts, KNOWN_ROLES, coerceConcepts } from '../learn.ts';
 
 // ============================================================================
 // normalizeProject
@@ -309,5 +309,68 @@ describe('extractRoleFromConcepts', () => {
     for (const role of KNOWN_ROLES) {
       expect(extractRoleFromConcepts(['some-domain', role])).toBe(role);
     }
+  });
+});
+
+// ============================================================================
+// coerceConcepts — handles MCP transport quirks
+// ============================================================================
+//
+// Pattern (2026-04-29 brew-ops smoke test): MCP transport delivered an
+// array<string> argument as a JSON-stringified array ('["a","b"]'). The old
+// fallback comma-split butchered it into ['["a"', '"b"]'], which then broke
+// the LIKE query for trace_link_hint and role-tag extraction. Tests pin the
+// fix.
+
+describe('coerceConcepts', () => {
+  it('returns empty array for undefined / non-string-non-array input', () => {
+    expect(coerceConcepts(undefined)).toEqual([]);
+    expect(coerceConcepts(null)).toEqual([]);
+    expect(coerceConcepts(42)).toEqual([]);
+    expect(coerceConcepts({})).toEqual([]);
+  });
+
+  it('passes a true array through, coercing entries to string', () => {
+    expect(coerceConcepts(['a', 'b', 'c'])).toEqual(['a', 'b', 'c']);
+    expect(coerceConcepts(['brew-ops', 'memory'])).toEqual(['brew-ops', 'memory']);
+  });
+
+  it('parses JSON-stringified array (the MCP transport case)', () => {
+    expect(coerceConcepts('["brew-ops","repo:arra-oracle-v3","memory"]'))
+      .toEqual(['brew-ops', 'repo:arra-oracle-v3', 'memory']);
+  });
+
+  it('parses JSON-stringified array with whitespace + escaped quotes', () => {
+    expect(coerceConcepts('  ["a", "b", "c"]  ')).toEqual(['a', 'b', 'c']);
+  });
+
+  it('falls back to comma-split when string looks like comma list, not JSON', () => {
+    expect(coerceConcepts('git,safety,trust')).toEqual(['git', 'safety', 'trust']);
+    expect(coerceConcepts('a, b, c')).toEqual(['a', 'b', 'c']);
+  });
+
+  it('falls back to comma-split when JSON parse fails despite [...] shape', () => {
+    // Looks like a JSON array but isn't valid — comma-split is best effort.
+    expect(coerceConcepts('[broken,json]')).toEqual(['[broken', 'json]']);
+  });
+
+  it('coerces JSON-array entries that aren\'t strings into strings', () => {
+    expect(coerceConcepts('[1, 2, 3]')).toEqual(['1', '2', '3']);
+  });
+
+  it('handles empty inputs gracefully', () => {
+    expect(coerceConcepts('')).toEqual([]);
+    expect(coerceConcepts('[]')).toEqual([]);
+    expect(coerceConcepts([])).toEqual([]);
+  });
+
+  it('regression: stringified array does NOT produce the old butchered output', () => {
+    // The bug: comma-splitting '["brew-ops","memory"]' produced
+    // ['["brew-ops"', '"memory"]']. After fix, must produce clean tokens.
+    const input = '["brew-ops","memory"]';
+    const out = coerceConcepts(input);
+    expect(out).not.toContain('["brew-ops"');
+    expect(out).not.toContain('"memory"]');
+    expect(out).toEqual(['brew-ops', 'memory']);
   });
 });
