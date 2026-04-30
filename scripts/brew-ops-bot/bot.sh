@@ -148,18 +148,33 @@ active_chat_file() { echo "${ACTIVE_CHAT_FILE_PREFIX}.$1"; }
 # whenever cmd_chat/cmd_new/cmd_end/cmd_close changes state.
 STATUS_MSG_FILE=$STATE_DIR/status-msg-id
 
+chat_alias() {
+  local chat_id="$1" f
+  f=$(alias_file)
+  [ -f "$f" ] && grep -m1 "=${chat_id}$" "$f" | cut -d'=' -f1
+}
+
 build_status_text() {
   local tg_chat="$1"
   local active="(none)"
   local f; f=$(active_chat_file "$tg_chat")
   [ -s "$f" ] && active=$(cat "$f")
+  local alias_label=""
+  if [ "$active" != "(none)" ]; then
+    local al; al=$(chat_alias "$active")
+    [ -n "$al" ] && alias_label=" (<b>$al</b>)"
+  fi
   local watchers=0
   for pf in "$STATE_DIR"/watch.*.pid; do
     [ -f "$pf" ] || continue
     local pid; pid=$(cat "$pf" 2>/dev/null)
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && watchers=$((watchers + 1))
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      watchers=$((watchers + 1))
+    else
+      rm -f "$pf"
+    fi
   done
-  echo "📍 active: <code>$active</code>
+  echo "📍 active: <code>$active</code>${alias_label}
 🔔 watchers: $watchers running"
 }
 
