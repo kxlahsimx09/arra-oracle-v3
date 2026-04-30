@@ -593,7 +593,9 @@ cmd_chat() {
   if [ ! -f "$(watch_pid_file "$role/$slug")" ] || ! kill -0 "$(cat "$(watch_pid_file "$role/$slug")" 2>/dev/null)" 2>/dev/null; then
     start_watcher_for "$pane" "$role/$slug"
   fi
-  send_tg "✓ active chat: <code>$role/$slug</code> ($pane, cmd=$cmd)
+  local al; al=$(chat_alias "$role/$slug")
+  local al_label; [ -n "$al" ] && al_label=" (<b>$al</b>)" || al_label=""
+  send_tg "✓ active chat: <code>$role/$slug</code>${al_label} ($pane, cmd=$cmd)
 ส่งข้อความตอนนี้ → ไป chat นี้
 /watch ดู watcher status, /look /history ดูเนื้อหา"
   update_status "$tg_chat"
