@@ -372,6 +372,7 @@ cmd_alias() {
   echo "${name}=${target}" >> "$f"
   send_tg "✅ alias <code>$name</code> → <code>$target</code>
 ใช้ /chat $name ได้เลย"
+  update_status "$tg_chat"
 }
 
 # claude alive in pane = pane_current_command looks like a claude version (2.x)
