@@ -1055,8 +1055,10 @@ cmd_quota() {
       local first_ts
       first_ts=$(jq -r 'select(.timestamp) | .timestamp' "$j" 2>/dev/null | head -1)
       [ -z "$first_ts" ] && continue
-      local ts_s="${first_ts%%.*}"; ts_s="${ts_s/T/ }"
-      local epoch; epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$ts_s" "+%s" 2>/dev/null)
+      # JSONL timestamps are UTC (ISO 8601 with Z suffix). Parse with -u so
+      # we don't add the local timezone offset (would show +7h on GMT+7).
+      local ts_s="${first_ts%%.*}"  # strip fractional seconds, keep T
+      local epoch; epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "$ts_s" "+%s" 2>/dev/null)
       [ -z "$epoch" ] && continue
       local age_m=$(( (now - epoch) / 60 ))
       local al; al=$(chat_alias "$chat")
