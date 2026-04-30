@@ -995,13 +995,18 @@ cmd_ctx() {
   jsonl=$(find_jsonl "$cwd")
   [ -z "$jsonl" ] && { send_tg "❌ ไม่เจอ JSONL session ของ <code>$target</code>"; return; }
 
-  # Single jq pass so input_tokens / output_tokens / model come from the same line
+  # Single jq pass so input / output / model come from the same line.
+  # Context window load = input_tokens + cache_creation_input_tokens + cache_read_input_tokens.
+  # input_tokens alone is just the uncached delta of the latest turn (often 1) — almost
+  # all of the prompt lives in cache_read_input_tokens, which is what fills the 200k window.
   local usage_raw tokens out_tokens model
   usage_raw=$(jq -r '
     select(.type == "assistant") |
     select(.message.usage.input_tokens != null) |
     [
-      (.message.usage.input_tokens | tostring),
+      (((.message.usage.input_tokens // 0)
+        + (.message.usage.cache_creation_input_tokens // 0)
+        + (.message.usage.cache_read_input_tokens // 0)) | tostring),
       ((.message.usage.output_tokens // 0) | tostring),
       (.message.model // "")
     ] | join("\t")
@@ -1029,7 +1034,7 @@ model: <code>$model</code>"
 
   send_tg "📊 <b>${target}${al}</b>
 ${bar} <b>${pct}%</b>
-input:  <code>$tokens</code> / <code>$ctx_max</code>${out_tokens:+    output: <code>$out_tokens</code>}
+ctx:    <code>$tokens</code> / <code>$ctx_max</code>${out_tokens:+    output: <code>$out_tokens</code>}
 left:   <code>$remaining</code> tokens${model_line}"
 }
 
