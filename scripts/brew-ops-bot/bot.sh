@@ -189,8 +189,14 @@ update_status() {
       --data-urlencode "message_id=$mid" \
       --data-urlencode "parse_mode=HTML" \
       --data-urlencode "text=$content" 2>&1)
-    # on success, done
-    echo "$resp" | jq -e '.ok' >/dev/null 2>&1 && return
+    # on success, re-pin so clients refresh the banner preview
+    if echo "$resp" | jq -e '.ok' >/dev/null 2>&1; then
+      curl -sf "https://api.telegram.org/bot${TOKEN}/pinChatMessage" \
+        --data-urlencode "chat_id=$tg_chat" \
+        --data-urlencode "message_id=$mid" \
+        --data-urlencode "disable_notification=true" -o /dev/null 2>/dev/null
+      return
+    fi
     # else fall through to recreate (message may have been deleted)
     log "editMessageText failed, recreating: $(echo "$resp" | head -c 200)"
   fi
