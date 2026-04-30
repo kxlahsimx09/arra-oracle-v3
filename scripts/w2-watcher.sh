@@ -91,6 +91,14 @@ PID_FILE=$STATE_DIR/watcher.pid
 LOG_FILE=${LOG_FILE:-$STATE_DIR/watcher.log}
 mkdir -p "$STATE_DIR"
 
+# Route git fetch/pull over HTTPS using gh's stored token (osxkeychain credential
+# helper) instead of SSH. ssh-agent is empty on background runs once macOS locks
+# the screen / sleeps, so SSH-based fetches deny silently — observed 2026-04-29
+# evening: 15h of "fetch failed" with no commits detected, no wakes fired, no
+# silent-fail alerts. gh's token lives in keychain shared with the gh CLI and
+# stays usable while the user is logged in.
+GIT_AUTH_FLAGS=(-c "url.https://github.com/.insteadOf=git@github.com:")
+
 # Resolve this script's directory so we can invoke sibling scripts
 # (regression-then-investigate.sh, etc.) via absolute path regardless of cwd.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -320,7 +328,7 @@ cmd_run() {
           # Signal 2: commits by COMMIT_AUTHOR on any branch since wake.
           # Refresh remote refs first so AMEND-path branches (e.g. existing
           # docs/track-* / docs/flow-track-*) are visible.
-          git -C "$repo" fetch origin --prune --quiet 2>/dev/null
+          git "${GIT_AUTH_FLAGS[@]}" -C "$repo" fetch origin --prune --quiet 2>/dev/null
           commit_count=$(git -C "$repo" log --all --remotes \
             --author="$COMMIT_AUTHOR" \
             --since="@$pending_wake_ts" \
@@ -345,7 +353,7 @@ cmd_run() {
       # worktree can't see commits the watcher already detected (observed
       # 2026-04-25..27: bank-bot local main stuck at ffd626b while origin/main
       # advanced 6 commits, every wake's worktree checkout was stale).
-      if ! git -C "$repo" pull --ff-only origin main 2>/dev/null; then
+      if ! git "${GIT_AUTH_FLAGS[@]}" -C "$repo" pull --ff-only origin main 2>/dev/null; then
         log "[$role] fetch failed; skipping"
         continue
       fi
