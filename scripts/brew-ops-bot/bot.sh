@@ -425,6 +425,8 @@ cmd_help() {
 /history [target] [N]     claude JSONL (last N turns; default 20)
 /retro [role] [N]         workflow retros (default 5)
 /closed                   recently-ended chats with JSONL still on disk
+/ctx [role/slug]          context window usage % for active (or named) chat
+/quota                    Claude Code usage window / reset estimate
 
 <b>Power:</b>
 /list                     raw tmux panes (incl watcher-spawned)
@@ -973,6 +975,118 @@ cmd_closed() {
   send_tg "$out"
 }
 
+# ── /ctx — context window usage ───────────────────────────────────────────────
+
+cmd_ctx() {
+  local tg_chat="$1" target="${2:-}"
+  if [ -z "$target" ]; then
+    local f; f=$(active_chat_file "$tg_chat")
+    [ ! -f "$f" ] && { send_tg "❌ ไม่มี active chat — /chat ก่อน หรือ /ctx &lt;role/slug&gt;"; return; }
+    target=$(cat "$f")
+  fi
+  local role="${target%%/*}"
+  local repo; repo=$(role_repo "$role")
+  [ -z "$repo" ] && { send_tg "❌ unknown role: $role"; return; }
+
+  local cwd pane jsonl
+  pane=$(resolve_chat "$target" | cut -d'|' -f1)
+  [ -n "$pane" ] && cwd=$(tmux display-message -p -t "$pane" "#{pane_current_path}" 2>/dev/null)
+  [ -z "$cwd" ] && cwd="$repo"
+  jsonl=$(find_jsonl "$cwd")
+  [ -z "$jsonl" ] && { send_tg "❌ ไม่เจอ JSONL session ของ <code>$target</code>"; return; }
+
+  local tokens out_tokens model
+  tokens=$(jq -r 'select(.type == "assistant") | .message.usage.input_tokens // empty' \
+    "$jsonl" 2>/dev/null | grep -v '^$' | tail -1)
+  out_tokens=$(jq -r 'select(.type == "assistant") | .message.usage.output_tokens // empty' \
+    "$jsonl" 2>/dev/null | grep -v '^$' | tail -1)
+  model=$(jq -r 'select(.type == "assistant") | .message.model // empty' \
+    "$jsonl" 2>/dev/null | grep -v '^$' | tail -1)
+
+  [ -z "$tokens" ] && { send_tg "📊 <b>$target</b>: ยังไม่มีข้อมูล usage ใน session นี้"; return; }
+
+  local ctx_max=200000
+  local pct=$((tokens * 100 / ctx_max))
+  local remaining=$((ctx_max - tokens))
+
+  local filled=$((pct / 10)) i bar=""
+  for i in $(seq 1 10); do
+    [ "$i" -le "$filled" ] && bar="${bar}█" || bar="${bar}░"
+  done
+
+  local al; al=$(chat_alias "$target")
+  [ -n "$al" ] && al=" ($al)"
+  local model_line=""
+  [ -n "$model" ] && model_line="
+model: <code>$model</code>"
+
+  send_tg "📊 <b>${target}${al}</b>
+${bar} <b>${pct}%</b>
+input:  <code>$tokens</code> / <code>$ctx_max</code>${out_tokens:+    output: <code>$out_tokens</code>}
+left:   <code>$remaining</code> tokens${model_line}"
+}
+
+# ── /quota — Claude Code usage window / reset estimate ────────────────────────
+
+cmd_quota() {
+  local tg_chat="$1"
+  local out=""
+
+  # Search recent JSONL files for explicit rate-limit / quota messages
+  local rl_msg="" jf
+  for jf in $(ls -t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null | head -20); do
+    local found
+    found=$(jq -r '
+      select(.type == "assistant") |
+      ((.message.content // "") |
+        if type == "string" then .
+        elif type == "array" then (map(select(.type == "text") | .text) | join(" "))
+        else "" end) |
+      select(test("limit|quota|resets?"; "i"))
+    ' "$jf" 2>/dev/null | tail -1)
+    if [ -n "$found" ]; then rl_msg="${found:0:400}"; break; fi
+  done
+
+  [ -n "$rl_msg" ] && out="⚠️ <b>พบ quota/limit message:</b>
+<pre>$(echo "$rl_msg" | html_escape)</pre>
+"
+
+  # Session ages → 5h rolling window estimate
+  local now; now=$(date +%s)
+  local session_lines="" role
+  while IFS= read -r role; do
+    while IFS='|' read -r pane _s _w _cmd slug; do
+      [ -z "$pane" ] || [ -z "$slug" ] && continue
+      local chat="$role/$slug"
+      local cwd; cwd=$(tmux display-message -p -t "$pane" "#{pane_current_path}" 2>/dev/null)
+      [ -z "$cwd" ] && continue
+      local j; j=$(find_jsonl "$cwd")
+      [ -z "$j" ] && continue
+      local first_ts
+      first_ts=$(jq -r 'select(.timestamp) | .timestamp' "$j" 2>/dev/null | head -1)
+      [ -z "$first_ts" ] && continue
+      local ts_s="${first_ts%%.*}"; ts_s="${ts_s/T/ }"
+      local epoch; epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$ts_s" "+%s" 2>/dev/null)
+      [ -z "$epoch" ] && continue
+      local age_m=$(( (now - epoch) / 60 ))
+      local remain_m=$(( 300 - age_m ))
+      [ "$remain_m" -lt 0 ] && remain_m=0
+      local al; al=$(chat_alias "$chat")
+      [ -n "$al" ] && al=" ($al)"
+      session_lines+="• <code>${chat}${al}</code>: ${age_m}m ago → ~${remain_m}m left
+"
+    done <<< "$(chats_for_role "$role")"
+  done <<< "$(all_roles)"
+
+  if [ -n "$session_lines" ]; then
+    out+="⏱ <b>Usage window (5h est.)</b>:
+${session_lines}"
+  fi
+
+  [ -z "$out" ] && out="⏱ ไม่เจอข้อมูล quota — ยังไม่เคยชน limit ใน sessions ปัจจุบัน"
+  send_tg "$out"
+}
+
 # ── send to active chat ────────────────────────────────────────────────────
 
 cmd_send_to_chat() {
@@ -1024,6 +1138,8 @@ dispatch() {
     /history)     cmd_history "$chat_id" "${2:-}" "${3:-20}" ;;
     /retro)       cmd_retro "${2:-}" "${3:-}" ;;
     /closed)      cmd_closed ;;
+    /ctx)         cmd_ctx "$chat_id" "${2:-}" ;;
+    /quota)       cmd_quota "$chat_id" ;;
     /*)           send_tg "❌ unknown command — /help" ;;
     *)            cmd_send_to_chat "$chat_id" "$text" ;;
   esac
