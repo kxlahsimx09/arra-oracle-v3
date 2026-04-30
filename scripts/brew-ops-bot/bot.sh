@@ -270,8 +270,22 @@ chats_for_role() {
 # match — e.g. "pg-writer/back" matches "pg-writer/backlog-20260428-..." if
 # unique. Exact match wins over prefix match. Returns "" if ambiguous or
 # not found.
+alias_file() { echo "$STATE_DIR/aliases"; }
+
+# Resolve alias name → role/slug (empty if not found)
+resolve_alias() {
+  local name="$1" f
+  f=$(alias_file)
+  [ -f "$f" ] && grep -m1 "^${name}=" "$f" | cut -d'=' -f2-
+}
+
 resolve_chat() {
   local target="$1"
+  # Check alias first
+  local via_alias
+  via_alias=$(resolve_alias "$target")
+  [ -n "$via_alias" ] && target="$via_alias"
+
   if [[ "$target" == *"/"* ]]; then
     local role="${target%%/*}" slug="${target#*/}"
     # exact match first
@@ -291,6 +305,58 @@ resolve_chat() {
     lines=$(chats_for_role "$target")
     [ "$(echo "$lines" | grep -c .)" = "1" ] && echo "$lines"
   fi
+}
+
+cmd_alias() {
+  local tg_chat="$1" name="${2:-}" target="${3:-}"
+  local f; f=$(alias_file)
+
+  # /alias — list all
+  if [ -z "$name" ]; then
+    if [ ! -f "$f" ] || [ ! -s "$f" ]; then
+      send_tg "📎 ยังไม่มี alias — ใช้ /alias &lt;name&gt; เพื่อตั้ง"
+    else
+      local out="📎 <b>Aliases:</b>
+"
+      while IFS='=' read -r n v; do
+        out+="  <code>$n</code> → <code>$v</code>
+"
+      done < "$f"
+      send_tg "$out"
+    fi
+    return
+  fi
+
+  # /alias rm <name> — remove
+  if [ "$name" = "rm" ] && [ -n "$target" ]; then
+    if [ -f "$f" ] && grep -q "^${target}=" "$f"; then
+      sed -i '' "/^${target}=/d" "$f"
+      send_tg "🗑 ลบ alias <code>$target</code> แล้ว"
+    else
+      send_tg "❌ ไม่เจอ alias <code>$target</code>"
+    fi
+    return
+  fi
+
+  # /alias <name> [role/slug] — set alias
+  if [ -z "$target" ]; then
+    local af; af=$(active_chat_file "$tg_chat")
+    [ ! -f "$af" ] && { send_tg "❌ ไม่มี active chat — /chat ก่อน หรือระบุ /alias &lt;name&gt; &lt;role/slug&gt;"; return; }
+    target=$(cat "$af")
+  fi
+
+  # validate target exists
+  if [ -z "$(resolve_chat "$target")" ]; then
+    send_tg "❌ ไม่เจอ chat <code>$target</code>"
+    return
+  fi
+
+  # upsert: remove old entry for this name, append new
+  touch "$f"
+  sed -i '' "/^${name}=/d" "$f"
+  echo "${name}=${target}" >> "$f"
+  send_tg "✅ alias <code>$name</code> → <code>$target</code>
+ใช้ /chat $name ได้เลย"
 }
 
 # claude alive in pane = pane_current_command looks like a claude version (2.x)
@@ -320,7 +386,8 @@ cmd_help() {
 <b>Chat management:</b>
 /roles                    list roles + chat counts
 /chats [role]             list chats (all or by role)
-/chat &lt;role[/slug]&gt;       switch context (auto-pick if 1 chat)
+/chat &lt;role[/slug]|alias&gt;  switch context (auto-pick if 1 chat)
+/alias [name [role/slug]] set/list alias; /alias rm &lt;name&gt; ลบ
 /new &lt;role&gt; [slug]        spawn new chat (uses maw wake)
 /close &lt;role/slug&gt;        kill chat (pane + leaves worktree orphan)
 
@@ -922,6 +989,7 @@ dispatch() {
     /roles)       cmd_roles ;;
     /chats)       cmd_chats "${2:-}" ;;
     /chat)        cmd_chat "$chat_id" "${2:-}" ;;
+    /alias)       cmd_alias "$chat_id" "${2:-}" "${3:-}" ;;
     /new)         cmd_new "$chat_id" "${2:-}" "${3:-}" ;;
     /close)       cmd_close "${2:-}" ;;
     /look)        cmd_look "$chat_id" "${2:-25}" ;;
