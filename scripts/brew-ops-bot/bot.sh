@@ -1037,30 +1037,12 @@ left:   <code>$remaining</code> tokens${model_line}"
 
 cmd_quota() {
   local tg_chat="$1"
-  local out=""
-
-  # Search recent JSONL files for explicit rate-limit / quota messages.
-  # Specific phrases only — avoids matching the word "quota" in bot messages.
-  local rl_msg="" jf
-  for jf in $(ls -t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null | head -20); do
-    local found
-    found=$(jq -r '
-      select(.type == "assistant") |
-      ((.message.content // "") |
-        if type == "string" then .
-        elif type == "array" then (map(select(.type == "text") | .text) | join(" "))
-        else "" end) |
-      select(test("usage limit reached|rate limit|resets at|try again after|quota exceeded"; "i"))
-    ' "$jf" 2>/dev/null | tail -1)
-    if [ -n "$found" ]; then rl_msg="${found:0:400}"; break; fi
-  done
-
-  [ -n "$rl_msg" ] && out="⚠️ <b>พบ quota/limit message:</b>
-<pre>$(echo "$rl_msg" | html_escape)</pre>
-"
-
-  # Session ages → 5h rolling window estimate
+  # Claude Code's 5h rolling window starts at the first API call after a reset.
+  # Best proxy: find the oldest first-message timestamp across all active sessions
+  # that falls within the last 5h — that's when the current window likely opened.
+  # Sessions older than 5h don't constrain the window (it already reset after them).
   local now; now=$(date +%s)
+  local oldest_in_window=0  # epoch of earliest session within last 5h
   local session_lines="" role
   while IFS= read -r role; do
     while IFS='|' read -r pane _s _w _cmd slug; do
@@ -1077,25 +1059,32 @@ cmd_quota() {
       local epoch; epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$ts_s" "+%s" 2>/dev/null)
       [ -z "$epoch" ] && continue
       local age_m=$(( (now - epoch) / 60 ))
-      local window_note
-      if [ "$age_m" -lt 300 ]; then
-        window_note="~$(( 300 - age_m ))m left"
-      else
-        window_note="reset likely ($(( (age_m - 300) / 60 ))h $(( (age_m - 300) % 60 ))m ago)"
-      fi
       local al; al=$(chat_alias "$chat")
       [ -n "$al" ] && al=" ($al)"
-      session_lines+="• <code>${chat}${al}</code>: ${age_m}m old — ${window_note}
+      if [ "$age_m" -lt 300 ]; then
+        session_lines+="• <code>${chat}${al}</code>: started ${age_m}m ago (in window)
 "
+        [ "$epoch" -lt "$oldest_in_window" ] || [ "$oldest_in_window" -eq 0 ] && oldest_in_window=$epoch
+      else
+        local h=$(( age_m / 60 )) m=$(( age_m % 60 ))
+        session_lines+="• <code>${chat}${al}</code>: ${h}h ${m}m old (outside window)
+"
+      fi
     done <<< "$(chats_for_role "$role")"
   done <<< "$(all_roles)"
 
-  if [ -n "$session_lines" ]; then
-    out+="⏱ <b>Usage window (5h est.)</b>:
-${session_lines}"
+  local out=""
+  if [ "$oldest_in_window" -gt 0 ]; then
+    local window_age_m=$(( (now - oldest_in_window) / 60 ))
+    local reset_in_m=$(( 300 - window_age_m ))
+    out="⏱ <b>Quota window</b>: opened ${window_age_m}m ago → resets in ~<b>${reset_in_m}m</b>
+"
+  else
+    out="⏱ <b>Quota window</b>: ไม่มี session ในช่วง 5h — quota น่าจะ reset แล้ว
+"
   fi
-
-  [ -z "$out" ] && out="⏱ ไม่เจอข้อมูล quota — ยังไม่เคยชน limit ใน sessions ปัจจุบัน"
+  [ -n "$session_lines" ] && out+="
+${session_lines}"
   send_tg "$out"
 }
 
