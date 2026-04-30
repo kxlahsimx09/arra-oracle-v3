@@ -102,30 +102,40 @@ telegraph_publish() {
   echo "$resp" | jq -r '.result.url // empty' 2>/dev/null
 }
 
+# Reverse-lookup alias for a chat_id (role/slug → alias name)
+chat_alias_label() {
+  local chat_id="$1"
+  local f="$STATE_DIR/aliases"
+  [ -f "$f" ] || return
+  local al; al=$(grep -m1 "=${chat_id}$" "$f" | cut -d'=' -f1)
+  [ -n "$al" ] && echo " ($al)"
+}
+
 # Push an assistant text turn to Telegram. Decides:
 #   short (< $TELEGRAPH_THRESHOLD chars) → inline <pre> in Telegram
 #   long → telegraph page + Telegram preview with "📖 read full" link
 push_turn() {
   local text="$1" chat_id="$2"
+  local alias_label; alias_label=$(chat_alias_label "$chat_id")
+  local header="🔔 <b>${chat_id}${alias_label}</b>"
   local len=${#text}
   if [ "$len" -lt "$TELEGRAPH_THRESHOLD" ]; then
-    send_tg "🔔 <b>$chat_id</b>:
+    send_tg "${header}:
 <pre>$(echo "$text" | html_escape)</pre>"
     return
   fi
   # Long: try telegraph
-  local title="$chat_id — $(date '+%Y-%m-%d %H:%M')"
+  local title="${chat_id}${alias_label} — $(date '+%Y-%m-%d %H:%M')"
   local url
   url=$(telegraph_publish "$title" "$text")
   if [ -n "$url" ]; then
     local preview; preview="${text:0:800}"
-    send_tg "🔔 <b>$chat_id</b> (${len} chars):
+    send_tg "${header} (${len} chars):
 <pre>$(echo "$preview" | html_escape)</pre>
 …
 📖 <a href=\"$url\">read full on web</a>"
   else
-    # Fallback: send truncated inline (telegraph might be down/blocked)
-    send_tg "🔔 <b>$chat_id</b>:
+    send_tg "${header}:
 <pre>$(echo "$text" | html_escape)</pre>"
   fi
 }
