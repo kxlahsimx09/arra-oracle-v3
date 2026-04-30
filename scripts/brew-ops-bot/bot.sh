@@ -995,13 +995,20 @@ cmd_ctx() {
   jsonl=$(find_jsonl "$cwd")
   [ -z "$jsonl" ] && { send_tg "❌ ไม่เจอ JSONL session ของ <code>$target</code>"; return; }
 
-  local tokens out_tokens model
-  tokens=$(jq -r 'select(.type == "assistant") | .message.usage.input_tokens // empty' \
-    "$jsonl" 2>/dev/null | grep -v '^$' | tail -1)
-  out_tokens=$(jq -r 'select(.type == "assistant") | .message.usage.output_tokens // empty' \
-    "$jsonl" 2>/dev/null | grep -v '^$' | tail -1)
-  model=$(jq -r 'select(.type == "assistant") | .message.model // empty' \
-    "$jsonl" 2>/dev/null | grep -v '^$' | tail -1)
+  # Single jq pass so input_tokens / output_tokens / model come from the same line
+  local usage_raw tokens out_tokens model
+  usage_raw=$(jq -r '
+    select(.type == "assistant") |
+    select(.message.usage.input_tokens != null) |
+    [
+      (.message.usage.input_tokens | tostring),
+      ((.message.usage.output_tokens // 0) | tostring),
+      (.message.model // "")
+    ] | join("\t")
+  ' "$jsonl" 2>/dev/null | tail -1)
+  tokens=$(printf '%s' "$usage_raw" | cut -f1)
+  out_tokens=$(printf '%s' "$usage_raw" | cut -f2)
+  model=$(printf '%s' "$usage_raw" | cut -f3)
 
   [ -z "$tokens" ] && { send_tg "📊 <b>$target</b>: ยังไม่มีข้อมูล usage ใน session นี้"; return; }
 
@@ -1032,7 +1039,8 @@ cmd_quota() {
   local tg_chat="$1"
   local out=""
 
-  # Search recent JSONL files for explicit rate-limit / quota messages
+  # Search recent JSONL files for explicit rate-limit / quota messages.
+  # Specific phrases only — avoids matching the word "quota" in bot messages.
   local rl_msg="" jf
   for jf in $(ls -t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null | head -20); do
     local found
@@ -1042,7 +1050,7 @@ cmd_quota() {
         if type == "string" then .
         elif type == "array" then (map(select(.type == "text") | .text) | join(" "))
         else "" end) |
-      select(test("limit|quota|resets?"; "i"))
+      select(test("usage limit reached|rate limit|resets at|try again after|quota exceeded"; "i"))
     ' "$jf" 2>/dev/null | tail -1)
     if [ -n "$found" ]; then rl_msg="${found:0:400}"; break; fi
   done
@@ -1069,11 +1077,15 @@ cmd_quota() {
       local epoch; epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$ts_s" "+%s" 2>/dev/null)
       [ -z "$epoch" ] && continue
       local age_m=$(( (now - epoch) / 60 ))
-      local remain_m=$(( 300 - age_m ))
-      [ "$remain_m" -lt 0 ] && remain_m=0
+      local window_note
+      if [ "$age_m" -lt 300 ]; then
+        window_note="~$(( 300 - age_m ))m left"
+      else
+        window_note="reset likely ($(( (age_m - 300) / 60 ))h $(( (age_m - 300) % 60 ))m ago)"
+      fi
       local al; al=$(chat_alias "$chat")
       [ -n "$al" ] && al=" ($al)"
-      session_lines+="• <code>${chat}${al}</code>: ${age_m}m ago → ~${remain_m}m left
+      session_lines+="• <code>${chat}${al}</code>: ${age_m}m old — ${window_note}
 "
     done <<< "$(chats_for_role "$role")"
   done <<< "$(all_roles)"
