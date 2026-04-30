@@ -350,8 +350,13 @@ cmd_alias() {
     return
   fi
 
-  # /alias rm <name> — remove
-  if [ "$name" = "rm" ] && [ -n "$target" ]; then
+  # /alias rm <name> — remove. /alias rm alone falls here too — show usage instead
+  # of setting "rm" as an alias for the active chat.
+  if [ "$name" = "rm" ]; then
+    if [ -z "$target" ]; then
+      send_tg "❌ ใช้ <code>/alias rm &lt;name&gt;</code> เพื่อลบ — ดู /alias เพื่อดูรายชื่อ"
+      return
+    fi
     if [ -f "$f" ] && grep -q "^${target}=" "$f"; then
       sed -i '' "/^${target}=/d" "$f"
       send_tg "🗑 ลบ alias <code>$target</code> แล้ว"
