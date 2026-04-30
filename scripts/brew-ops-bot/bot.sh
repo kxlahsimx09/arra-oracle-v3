@@ -189,8 +189,10 @@ update_status() {
       --data-urlencode "message_id=$mid" \
       --data-urlencode "parse_mode=HTML" \
       --data-urlencode "text=$content" 2>&1)
-    # on success, re-pin so clients refresh the banner preview
+    # on success, unpin all then re-pin so clients always show the latest banner
     if echo "$resp" | jq -e '.ok' >/dev/null 2>&1; then
+      curl -sf "https://api.telegram.org/bot${TOKEN}/unpinAllChatMessages" \
+        --data-urlencode "chat_id=$tg_chat" -o /dev/null 2>/dev/null
       curl -sf "https://api.telegram.org/bot${TOKEN}/pinChatMessage" \
         --data-urlencode "chat_id=$tg_chat" \
         --data-urlencode "message_id=$mid" \
