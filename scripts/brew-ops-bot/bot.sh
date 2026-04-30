@@ -1003,9 +1003,9 @@ cmd_ctx() {
   # Single jq pass so input / output / model come from the same line.
   # Context window load = input_tokens + cache_creation_input_tokens + cache_read_input_tokens.
   # input_tokens alone is just the uncached delta of the latest turn (often 1) — almost
-  # all of the prompt lives in cache_read_input_tokens, which is what fills the 200k window.
-  local usage_raw tokens out_tokens model
-  usage_raw=$(jq -r '
+  # all of the prompt lives in cache_read_input_tokens, which is what fills the window.
+  local usage_all tokens out_tokens model max_ctx
+  usage_all=$(jq -r '
     select(.type == "assistant") |
     select(.message.usage.input_tokens != null) |
     [
@@ -1015,14 +1015,20 @@ cmd_ctx() {
       ((.message.usage.output_tokens // 0) | tostring),
       (.message.model // "")
     ] | join("\t")
-  ' "$jsonl" 2>/dev/null | tail -1)
-  tokens=$(printf '%s' "$usage_raw" | cut -f1)
-  out_tokens=$(printf '%s' "$usage_raw" | cut -f2)
-  model=$(printf '%s' "$usage_raw" | cut -f3)
+  ' "$jsonl" 2>/dev/null)
+  [ -z "$usage_all" ] && { send_tg "📊 <b>$target</b>: ยังไม่มีข้อมูล usage ใน session นี้"; return; }
 
-  [ -z "$tokens" ] && { send_tg "📊 <b>$target</b>: ยังไม่มีข้อมูล usage ใน session นี้"; return; }
+  local last_line; last_line=$(printf '%s' "$usage_all" | tail -1)
+  tokens=$(printf '%s' "$last_line" | cut -f1)
+  out_tokens=$(printf '%s' "$last_line" | cut -f2)
+  model=$(printf '%s' "$last_line" | cut -f3)
 
+  # Infer context-window tier from the high-water mark across the session.
+  # JSONL doesn't expose the [1m] beta — model field is just "claude-opus-4-7" for
+  # both 200k and 1M variants. If we ever observed >200k loaded, this must be 1M.
+  max_ctx=$(printf '%s' "$usage_all" | awk -F'\t' 'BEGIN{m=0} {if($1+0>m) m=$1+0} END{print m+0}')
   local ctx_max=200000
+  [ "$max_ctx" -gt 200000 ] && ctx_max=1000000
   local pct=$((tokens * 100 / ctx_max))
   local remaining=$((ctx_max - tokens))
 
