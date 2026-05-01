@@ -418,6 +418,7 @@ cmd_help() {
 /chat &lt;role[/slug]|alias&gt;  switch context (auto-pick if 1 chat)
 /alias [name [role/slug]] set/list alias; /alias rm &lt;name&gt; ลบ
 /new &lt;role&gt; [slug]        spawn new chat (uses maw wake)
+/relaunch [role/slug]     restart claude in existing pane (after -p exit)
 /close &lt;role/slug&gt;        kill chat (pane + leaves worktree orphan)
 
 <b>Active chat I/O:</b>
@@ -797,6 +798,33 @@ cmd_end() {
   update_status "$tg_chat"
 }
 
+# /relaunch — re-spawn claude in an existing pane after `claude -p` exited.
+# Different from /new: keeps the pane + worktree, just restarts claude inside.
+cmd_relaunch() {
+  local tg_chat="$1" target="${2:-}"
+  if [ -z "$target" ]; then
+    local f; f=$(active_chat_file "$tg_chat")
+    [ ! -f "$f" ] && { send_tg "❌ ไม่มี active chat — /chat ก่อน หรือ /relaunch &lt;role/slug&gt;"; return; }
+    target=$(cat "$f")
+  fi
+  # Resolve alias if user passed one
+  local via_alias; via_alias=$(resolve_alias "$target")
+  [ -n "$via_alias" ] && target="$via_alias"
+  local pane; pane=$(resolve_chat "$target" | cut -d'|' -f1)
+  [ -z "$pane" ] && { send_tg "❌ chat <code>$target</code> ไม่เจอ pane (ตายแล้ว?) — ใช้ /new ถ้าจะสร้างใหม่"; return; }
+  local pane_cmd
+  pane_cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null)
+  if is_claude "$pane_cmd"; then
+    send_tg "✓ claude รันอยู่แล้วใน <code>$target</code> (cmd=<code>$pane_cmd</code>) — ไม่ต้อง relaunch"
+    return
+  fi
+  audit "/relaunch $target pane=$pane prev_cmd=$pane_cmd"
+  tmux send-keys -t "$pane" -- "claude --dangerously-skip-permissions" 2>/dev/null
+  sleep 0.3
+  tmux send-keys -t "$pane" Enter 2>/dev/null
+  send_tg "🔄 relaunch claude ใน <code>$target</code> (was <code>${pane_cmd:-?}</code>) — รอสักครู่ให้ขึ้น แล้วลองส่งข้อความใหม่"
+}
+
 cmd_watch() {
   local sub="${1:-list}" target="${2:-}"
   case "$sub" in
@@ -1125,7 +1153,7 @@ cmd_send_to_chat() {
   pane_cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null)
   if ! is_claude "$pane_cmd"; then
     send_tg "❌ claude ไม่ได้รันใน <code>$target</code> (pane cmd=<code>${pane_cmd:-?}</code>) — ข้อความจะตกใน shell, ไม่ส่งให้
-รีเริ่ม claude ก่อน: ใน pane พิมพ์ <code>claude --dangerously-skip-permissions</code> หรือใช้ <code>/new $target</code>"
+รีเริ่ม: <code>/relaunch</code> (active chat) หรือ <code>/relaunch $target</code>"
     return
   fi
   # Mark "user just sent" so the watcher's quiet-window kicks in (avoids
@@ -1161,6 +1189,7 @@ dispatch() {
     /chat)        cmd_chat "$chat_id" "${2:-}" ;;
     /alias)       cmd_alias "$chat_id" "${2:-}" "${3:-}" ;;
     /new)         cmd_new "$chat_id" "${2:-}" "${3:-}" ;;
+    /relaunch)    cmd_relaunch "$chat_id" "${2:-}" ;;
     /close)       cmd_close "${2:-}" ;;
     /look)        cmd_look "$chat_id" "${2:-25}" ;;
     /end)         cmd_end "$chat_id" ;;
