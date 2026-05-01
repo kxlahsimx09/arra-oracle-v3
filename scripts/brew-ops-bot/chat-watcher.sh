@@ -12,7 +12,11 @@
 #   $2 — chat id (logical, e.g. pg-writer/practical-euclid)
 #
 # Tuning (env override):
-#   POLL_INTERVAL          (default 2s) — how often we check JSONL for new lines
+#   POLL_INTERVAL          (default 2s)   — how often we check JSONL for new lines
+#   JSONL_WAIT_SECONDS     (default 180s) — how long to wait for claude's first
+#                          JSONL write before bailing. Bumped from 30s after
+#                          chats with large CLAUDE.md kept missing the window
+#                          and never recovered (no auto-respawn).
 #
 # State files:
 #   $STATE_DIR/watch.<chat>.pid       — watcher pid
@@ -41,6 +45,7 @@ PID_FILE=$STATE_DIR/watch.$SAFE.pid
 LINE_STATE_FILE=$STATE_DIR/last-line.$SAFE
 
 POLL_INTERVAL=${POLL_INTERVAL:-2}
+JSONL_WAIT_SECONDS=${JSONL_WAIT_SECONDS:-180}
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$CHAT_ID/$$] $*" >> "$LOG_FILE"; }
 
@@ -175,13 +180,15 @@ trap 'log "shutting down"; rm -f "$PID_FILE"; exit 0' INT TERM
 
 log "starting (pane=$PANE)"
 
-# Discover JSONL location. Wait up to 30s for it to exist (claude may take
-# a moment to first-write after spawn).
+# Discover JSONL location. Wait up to JSONL_WAIT_SECONDS for it to exist
+# (claude with a large CLAUDE.md can take >30s before its first JSONL write).
 JSONL_DIR=""
-for _ in $(seq 1 15); do
+jsonl_attempts=$(( JSONL_WAIT_SECONDS / POLL_INTERVAL ))
+[ "$jsonl_attempts" -lt 1 ] && jsonl_attempts=1
+for _ in $(seq 1 "$jsonl_attempts"); do
   JSONL_DIR=$(resolve_jsonl_dir)
   [ -n "$JSONL_DIR" ] && [ -d "$JSONL_DIR" ] && break
-  sleep 2
+  sleep "$POLL_INTERVAL"
 done
 
 if [ -z "$JSONL_DIR" ] || [ ! -d "$JSONL_DIR" ]; then
