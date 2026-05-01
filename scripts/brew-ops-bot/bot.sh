@@ -1117,6 +1117,17 @@ cmd_send_to_chat() {
   pane=$(resolve_chat "$target" | cut -d'|' -f1)
   [ -z "$pane" ] && { send_tg "❌ active chat <code>$target</code> ตายแล้ว"; rm -f "$f"; return; }
   audit "→ chat=$target pane=$pane text=$text"
+  # Refuse if claude isn't running in the pane — text would land in zsh and
+  # never reach the agent. Observed 2026-05-01 after pg-tester's `claude -p`
+  # exited and the user typed via brewbot, producing zsh "command not found"
+  # for every Thai message until they noticed.
+  local pane_cmd
+  pane_cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null)
+  if ! is_claude "$pane_cmd"; then
+    send_tg "❌ claude ไม่ได้รันใน <code>$target</code> (pane cmd=<code>${pane_cmd:-?}</code>) — ข้อความจะตกใน shell, ไม่ส่งให้
+รีเริ่ม claude ก่อน: ใน pane พิมพ์ <code>claude --dangerously-skip-permissions</code> หรือใช้ <code>/new $target</code>"
+    return
+  fi
   # Mark "user just sent" so the watcher's quiet-window kicks in (avoids
   # auto-pushing back the user's own message + claude's first ack burst).
   date +%s > "$(user_send_marker "$target")"
