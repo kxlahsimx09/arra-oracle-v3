@@ -267,6 +267,29 @@ cmd_stop() {
 # ── main poller ─────────────────────────────────────────────────────────────
 
 cmd_run() {
+  # Resolve maw binary once at startup, before pid lock + main loop. PATH for
+  # background processes is whatever the launching shell had at start time —
+  # observed 2026-05-01: watcher launched 2026-04-30 13:59 with maw on PATH,
+  # then the user's shell setup drifted (maw left PATH). Every wake from
+  # 04-30 evening through 05-01 morning fired but exited 127 with
+  # "maw: command not found" — last_run never advanced, last_new stayed
+  # armed, and the watcher silent-looped 599 trigger attempts in ~17h while
+  # K's overnight commit burst (5 mobiz + 2 bank-bot trackable commits)
+  # piled up untracked. Resolve now; abort loud if missing.
+  if [ -z "${MAW_BIN:-}" ]; then
+    if command -v maw > /dev/null 2>&1; then
+      MAW_BIN=$(command -v maw)
+    elif [ -x "$HOME/Code/github.com/Soul-Brews-Studio/maw-js/dist/maw" ]; then
+      MAW_BIN="$HOME/Code/github.com/Soul-Brews-Studio/maw-js/dist/maw"
+    else
+      echo "error: maw not on PATH and not at \$HOME/Code/github.com/Soul-Brews-Studio/maw-js/dist/maw — set MAW_BIN env var or build maw-js (cd maw-js && bun run build)" >&2
+      exit 1
+    fi
+  elif [ ! -x "$MAW_BIN" ]; then
+    echo "error: MAW_BIN=$MAW_BIN is not executable" >&2
+    exit 1
+  fi
+
   # single-instance lock
   if [ -f "$PID_FILE" ]; then
     existing=$(cat "$PID_FILE")
@@ -283,6 +306,7 @@ cmd_run() {
   log "w2-watcher starting (pid=$$)"
   log "  POLL_INTERVAL=${POLL_INTERVAL}s  SETTLE_WINDOW=${SETTLE_WINDOW}s  MIN_GAP=${MIN_GAP}s"
   log "  ignoring commits by: ${IGNORE_AUTHORS}"
+  log "  maw binary: ${MAW_BIN}"
 
   while true; do
     for role in "${!REPOS[@]}"; do
@@ -444,7 +468,7 @@ cmd_run() {
             # %52 had a claude session running 4+ days, every new wake hit
             # "session exists" and exited 0 without spawning W2 — backlog of
             # 3 wakes / 5 commits silently dropped).
-            if maw wake "$role" --wt "$wake_ts" --task "$wake_pointer" --fresh >> "$LOG_FILE" 2>&1; then
+            if "$MAW_BIN" wake "$role" --wt "$wake_ts" --task "$wake_pointer" --fresh >> "$LOG_FILE" 2>&1; then
               log "[$role] wake succeeded"
               last_run=$now
               last_new=0
