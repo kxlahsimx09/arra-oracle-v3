@@ -321,13 +321,42 @@ cd "$MOBIZ"
 # routing SCB statements to the KTB bot.
 
 INFRA_LOG="$RUN_DIR/infra.log"
-# up -d --build --no-deps so that containers whose image actually changed
-# get recreated in the same step. A plain `build` leaves old containers
+
+# Tear down stale containers + volumes BEFORE rebuilding. Without this, the
+# named `mongodb_test_data` volume + bank-bot Playwright session/cache +
+# mock-bank in-memory ledger persist across runs. Each accumulated WQ row
+# / settlement / payout makes the dispatcher's OutstandingCountForBank
+# query slower; mock-bank's growing transfer history makes statement
+# scrapes slower; bot's stale Playwright state makes login + claim cycles
+# unpredictable. Cumulatively, tests with multi-step bot orchestration
+# (notably test-mdr-fee-distribution.sh which runs 4 bot operations in
+# sequence — deposit/payout/topup/settlement) hit timing edge cases.
+#
+# 2026-05-01 17:35 evidence: regression run 20260501-172836 failed at
+# test-mdr-fee-distribution.sh Step 8 (settlement, 400s) on accumulated
+# state. After `docker compose down -v && up --build` the same test
+# passed cleanly at 227s in run 20260501-194618 (26/26 PASS).
+#
+# Cost: ~30-60s extra per regression run for fresh container init +
+# mongo seed + bot Playwright cold start. Acceptable trade for
+# determinism — flake debug cycles cost 10x more.
+log "Tearing down stale containers + volumes (state hygiene before rebuild)..."
+docker compose -f integration-tests/docker-compose.yml down -v >> "$INFRA_LOG" 2>&1 || \
+  log "  WARN: docker compose down -v exited non-zero (no containers to remove?) — continuing"
+
+# up -d --build so that containers whose image actually changed get
+# recreated in the same step. A plain `build` leaves old containers
 # running against new images, which was the root cause of regression
-# 20260421-165340 for mock-bank. --no-deps keeps mongodb/redis untouched.
-log "Rebuilding + recreating backend + mock-bank + bank-bot + bank-bot-ktb (docker layer cache will short-circuit if no changes)..."
+# 20260421-165340 for mock-bank.
+#
+# `--no-deps` was previously used to keep mongodb/redis untouched (they
+# were assumed to be persistent across runs). With the `down -v` step
+# above we now explicitly want fresh deps on every run, so `--no-deps`
+# is dropped — `depends_on` in docker-compose.yml will pull mongodb +
+# redis up alongside backend, with healthcheck gating.
+log "Rebuilding + recreating backend + mock-bank + bank-bot + bank-bot-ktb + deps (docker layer cache will short-circuit if no changes)..."
 BUILD_START=$(date +%s)
-if ! docker compose -f integration-tests/docker-compose.yml up -d --build --no-deps \
+if ! docker compose -f integration-tests/docker-compose.yml up -d --build \
     backend mock-bank bank-bot bank-bot-ktb >> "$INFRA_LOG" 2>&1; then
   log "ABORT: docker compose up --build failed — see $INFRA_LOG"
   send_tg "🔴 <b>Regression aborted</b> (run <code>${RUN_ID}</code>)
