@@ -55,6 +55,12 @@ INBOX_POLL_INTERVAL=${INBOX_POLL_INTERVAL:-60}
 T1_DELIVERY_DEADLINE=${T1_DELIVERY_DEADLINE:-60}
 T2_PROCESSING_DEADLINE=${T2_PROCESSING_DEADLINE:-1800}
 INBOX_SCAN_ENABLED=${INBOX_SCAN_ENABLED:-1}
+# Path 2 — auto-clean: when an envelope reaches `completed` AND its thread is
+# `closed` AND every safety gate passes, retire the worktree + claude session
+# that handled it. Default OFF — opt in via env. See safe_to_retire() below.
+INBOX_AUTO_CLEAN=${INBOX_AUTO_CLEAN:-0}
+ORACLE_API=${ORACLE_API:-http://localhost:47778/api}
+MAW_BIN=${MAW_BIN:-bun /Users/dev01/Code/github.com/Soul-Brews-Studio/maw-js/src/cli.ts}
 
 CLAUDE_PROJECTS=${CLAUDE_PROJECTS:-$HOME/.claude/projects}
 
@@ -123,16 +129,68 @@ jsonl_has_prompt() {
   grep -qF "inbox: $fname" "$jsonl" 2>/dev/null
 }
 
+# Path 1 helpers — find a prior wt_path that handled a given thread for an
+# oracle. Reads the most-recent state file for that (oracle, thread) tuple
+# (whether `completed` or terminal-success) — its wt_path is the candidate
+# for --resume reuse.
+find_prior_wt_for_thread() {
+  local oracle=$1 thread_id=$2
+  [ -z "$thread_id" ] && return 1
+  local state_dir="$STATE_DIR/state/$oracle"
+  [ ! -d "$state_dir" ] && return 1
+  # Newest state file first; pick the first one whose thread_id + wt_path match.
+  local latest
+  latest=$(ls -t "$state_dir"/*.state 2>/dev/null | while read -r f; do
+    grep -q "^thread_id=$thread_id$" "$f" 2>/dev/null && echo "$f"
+  done | head -1)
+  [ -z "$latest" ] && return 1
+  grep '^wt_path=' "$latest" 2>/dev/null | tail -1 | cut -d= -f2-
+}
+
+# Reused by Path 2 (maybe_retire_worktree) and Path 1 (fire_wake's resume gate).
+# Returns 0 (true) iff a claude process has wt as its cwd.
+claude_alive_at() {
+  local wt=$1
+  [ -z "$wt" ] && return 1
+  pgrep -f "claude " 2>/dev/null | while read -r pid; do
+    local pcwd
+    pcwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    [ "$pcwd" = "$wt" ] && { echo alive; return; }
+  done | grep -q alive
+}
+
 # ─── State transitions ─────────────────────────────────────────────────────
 
 fire_wake() {
   local oracle=$1 file=$2 fname=$3
   local thread_id wake_ts wt_suffix sf wake_out wt_path
+  local sid_file prior_sid prior_wt resume_sid wt_arg
 
   thread_id=$(grep '^thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
   wake_ts=$(date +%s)
   wt_suffix=inbox-$wake_ts
   sf=$(state_path "$oracle" "$fname")
+
+  # Path 1 — worktree reuse via maw --resume. If we already have a
+  # session-id mapped for this (oracle, thread) AND no claude is currently
+  # alive in the worktree that birthed it, resume that session in the SAME
+  # worktree instead of spawning a fresh one. Drives worktree count toward
+  # (oracle × thread) pairs rather than total wakes. Falls back to --fresh
+  # silently if any precondition is missing.
+  if [ -n "$thread_id" ]; then
+    sid_file="$STATE_DIR/sessions/$oracle/thread-$thread_id.session-id"
+    if [ -f "$sid_file" ]; then
+      prior_sid=$(cat "$sid_file")
+      prior_wt=$(find_prior_wt_for_thread "$oracle" "$thread_id")
+      if [ -n "$prior_sid" ] && [ -n "$prior_wt" ] && [ -d "$prior_wt" ] \
+         && ! claude_alive_at "$prior_wt"; then
+        resume_sid=$prior_sid
+        # Re-use the existing wt_suffix so maw attaches to the same worktree
+        # window. We extract it from the prior wt path: `<repo>.wt-<N>-<suffix>`.
+        wt_suffix=$(basename "$prior_wt" | sed 's/^[^.]*\.wt-[0-9]*-//')
+      fi
+    fi
+  fi
 
   # Write state BEFORE firing — prevents double-fire if next scan races us.
   write_state "$sf" \
@@ -142,20 +200,28 @@ fire_wake() {
     "thread_id=$thread_id" \
     "wt_suffix=$wt_suffix" \
     "status=fired"
+  [ -n "${resume_sid:-}" ] && set_state_field "$sf" resume_sid "$resume_sid"
 
-  log "[$oracle] $fname → fire (thread=$thread_id, suffix=$wt_suffix)"
+  log "[$oracle] $fname → fire (thread=$thread_id, suffix=$wt_suffix${resume_sid:+, RESUME sid=$resume_sid})"
 
   # Capture maw wake output to extract the resolved worktree path.
-  # `maw wake` is synchronous-ish: it returns after spawning, but claude itself
-  # runs async inside the tmux pane. We don't block on claude — verify_delivery
-  # will pick up the JSONL on the next scan tick.
-  wake_out=$($MAW_BIN wake "$oracle" --fresh --wt "$wt_suffix" --no-attach \
-    --task "inbox: $fname" 2>&1) || {
-    set_state_field "$sf" status fire_failed
-    set_state_field "$sf" failed_at "$(date +%s)"
-    alert "[$oracle] maw wake exit nonzero for $fname: $(printf '%s' "$wake_out" | tail -3 | tr '\n' ' ')"
-    return 1
-  }
+  if [ -n "${resume_sid:-}" ]; then
+    wake_out=$($MAW_BIN wake "$oracle" --resume "$resume_sid" --wt "$wt_suffix" --no-attach \
+      --task "inbox: $fname" 2>&1) || {
+      set_state_field "$sf" status fire_failed
+      set_state_field "$sf" failed_at "$(date +%s)"
+      alert "[$oracle] maw wake --resume exit nonzero for $fname: $(printf '%s' "$wake_out" | tail -3 | tr '\n' ' ')"
+      return 1
+    }
+  else
+    wake_out=$($MAW_BIN wake "$oracle" --fresh --wt "$wt_suffix" --no-attach \
+      --task "inbox: $fname" 2>&1) || {
+      set_state_field "$sf" status fire_failed
+      set_state_field "$sf" failed_at "$(date +%s)"
+      alert "[$oracle] maw wake exit nonzero for $fname: $(printf '%s' "$wake_out" | tail -3 | tr '\n' ' ')"
+      return 1
+    }
+  fi
   printf '%s\n' "$wake_out" >>"$LOG_FILE"
 
   # `+ worktree: /path/to/repo.wt-N-suffix (branch)` — extract path.
@@ -215,6 +281,7 @@ verify_processing() {
     set_state_field "$sf" status completed
     set_state_field "$sf" completed_at "$now"
     log "[$oracle] $fname COMPLETED (archived; age=${age}s)"
+    [ "$INBOX_AUTO_CLEAN" = "1" ] && maybe_retire_worktree "$sf"
     return 0
   fi
 
@@ -222,6 +289,93 @@ verify_processing() {
     set_state_field "$sf" status failed_stuck
     set_state_field "$sf" failed_at "$now"
     alert "[$oracle] $fname STUCK — file still in inbox after $((T2_PROCESSING_DEADLINE / 60))min"
+  fi
+}
+
+# ─── Path 2 — auto-clean when thread closes ────────────────────────────────
+
+# Query oracle API for thread status; echoes 'closed'|'active'|'pending'|''.
+thread_status() {
+  local id=$1
+  [ -z "$id" ] && { echo ""; return; }
+  curl -sf -m 3 "$ORACLE_API/forum/thread/$id" 2>/dev/null \
+    | jq -r '.thread.status // empty' 2>/dev/null
+}
+
+# True iff any other active state file (not $sf) references the same wt_path.
+other_state_references_wt() {
+  local sf=$1 wt=$2
+  [ -z "$wt" ] && return 1
+  for other in "$STATE_DIR"/state/*/*.state; do
+    [ -f "$other" ] || continue
+    [ "$other" = "$sf" ] && continue
+    grep -q "^wt_path=$wt$" "$other" && return 0
+  done
+  return 1
+}
+
+# Safety gates for retiring a worktree. Returns reason string on first
+# failure (caller checks $? = 0 means safe). Empty string output means OK.
+safe_to_retire() {
+  local sf=$1
+  read_state "$sf" || { echo "state-unreadable"; return 1; }
+
+  [ -z "${wt_path:-}" ] && { echo "no-wt-path"; return 1; }
+  [ ! -d "$wt_path" ] && { echo "wt-already-gone"; return 1; }
+
+  local ts
+  ts=$(thread_status "${thread_id:-}")
+  [ "$ts" != "closed" ] && { echo "thread-${thread_id:-?}-not-closed-($ts)"; return 1; }
+
+  # git: clean working tree + all commits pushed
+  local dirty
+  dirty=$(git -C "$wt_path" status --short 2>/dev/null | head -1)
+  [ -n "$dirty" ] && { echo "wt-dirty"; return 1; }
+
+  local unpushed
+  unpushed=$(git -C "$wt_path" log '@{u}..' --oneline 2>/dev/null | head -1)
+  [ -n "$unpushed" ] && { echo "wt-has-unpushed-commits"; return 1; }
+
+  claude_alive_at "$wt_path" && { echo "claude-still-alive"; return 1; }
+
+  other_state_references_wt "$sf" "$wt_path" && { echo "wt-shared-by-other-envelope"; return 1; }
+
+  echo ""
+  return 0
+}
+
+# Try to retire the worktree associated with $sf if all gates pass.
+maybe_retire_worktree() {
+  local sf=$1
+  read_state "$sf" || return 0
+
+  local reason
+  reason=$(safe_to_retire "$sf")
+  if [ -n "$reason" ]; then
+    log "[$oracle] $fname retire SKIPPED ($reason)"
+    return 0
+  fi
+
+  # All gates pass — perform the retire.
+  local repo_path branch
+  repo_path=$(git -C "$wt_path" rev-parse --show-toplevel 2>/dev/null)
+  branch=$(git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+  # Best-effort kill the tmux window for this wake (non-fatal if gone).
+  $MAW_BIN ls 2>/dev/null | grep -q "${wt_suffix:-__none__}" && {
+    $MAW_BIN kill "*:*${wt_suffix}*" 2>/dev/null || true
+  }
+
+  # git worktree remove (refuses on dirty by default — safe)
+  if git -C "$wt_path/.." worktree remove "$wt_path" 2>>"$LOG_FILE"; then
+    log "[$oracle] $fname RETIRED worktree $wt_path"
+    # Best-effort branch delete (only succeeds if merged or no unique commits)
+    [ -n "$branch" ] && [ "$branch" != "HEAD" ] && \
+      git -C "$repo_path" branch -d "$branch" 2>/dev/null && \
+      log "[$oracle] retired branch $branch"
+    set_state_field "$sf" retired_at "$(date +%s)"
+  else
+    log "[$oracle] $fname retire FAILED (git worktree remove returned nonzero — keeping)"
   fi
 }
 
