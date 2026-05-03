@@ -228,7 +228,9 @@ verify_processing() {
 # ─── Scan loop ─────────────────────────────────────────────────────────────
 
 scan_inbox() {
-  local oracle_dir oracle file fname sf
+  local oracle_dir oracle file fname sf state_dir
+
+  # Pass 1 — iterate inbox dirs for NEW envelopes + in-progress ones.
   for oracle_dir in "$INBOX_BASE"/for-*/; do
     [ -d "$oracle_dir" ] || continue
     oracle=$(basename "$oracle_dir" | sed 's/^for-//')
@@ -253,6 +255,26 @@ scan_inbox() {
           *)                  alert "[$oracle] $fname unknown status=$status" ;;
         esac
       fi
+    done
+  done
+
+  # Pass 2 — iterate state files for verified envelopes whose backing file
+  # has been archived (moved out of the inbox root). Pass 1 misses these
+  # because it only sees files currently in for-{oracle}/, so a verified
+  # envelope that was archived between two scans never transitions to
+  # `completed` without this pass.
+  for state_dir in "$STATE_DIR"/state/*/; do
+    [ -d "$state_dir" ] || continue
+    oracle=$(basename "$state_dir")
+    [ "$oracle" = "*" ] && continue
+
+    for sf in "$state_dir"*.state; do
+      [ -f "$sf" ] || continue
+      # shellcheck disable=SC1090
+      source "$sf"
+      [ "${status:-}" = "verified" ] || continue
+      file="$INBOX_BASE/for-$oracle/$fname"
+      [ ! -f "$file" ] && verify_processing "$sf" "$file"
     done
   done
 }
