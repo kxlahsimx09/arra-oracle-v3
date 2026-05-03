@@ -129,16 +129,68 @@ jsonl_has_prompt() {
   grep -qF "inbox: $fname" "$jsonl" 2>/dev/null
 }
 
+# Path 1 helpers — find a prior wt_path that handled a given thread for an
+# oracle. Reads the most-recent state file for that (oracle, thread) tuple
+# (whether `completed` or terminal-success) — its wt_path is the candidate
+# for --resume reuse.
+find_prior_wt_for_thread() {
+  local oracle=$1 thread_id=$2
+  [ -z "$thread_id" ] && return 1
+  local state_dir="$STATE_DIR/state/$oracle"
+  [ ! -d "$state_dir" ] && return 1
+  # Newest state file first; pick the first one whose thread_id + wt_path match.
+  local latest
+  latest=$(ls -t "$state_dir"/*.state 2>/dev/null | while read -r f; do
+    grep -q "^thread_id=$thread_id$" "$f" 2>/dev/null && echo "$f"
+  done | head -1)
+  [ -z "$latest" ] && return 1
+  grep '^wt_path=' "$latest" 2>/dev/null | tail -1 | cut -d= -f2-
+}
+
+# Reused by Path 2 (maybe_retire_worktree) and Path 1 (fire_wake's resume gate).
+# Returns 0 (true) iff a claude process has wt as its cwd.
+claude_alive_at() {
+  local wt=$1
+  [ -z "$wt" ] && return 1
+  pgrep -f "claude " 2>/dev/null | while read -r pid; do
+    local pcwd
+    pcwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    [ "$pcwd" = "$wt" ] && { echo alive; return; }
+  done | grep -q alive
+}
+
 # ─── State transitions ─────────────────────────────────────────────────────
 
 fire_wake() {
   local oracle=$1 file=$2 fname=$3
   local thread_id wake_ts wt_suffix sf wake_out wt_path
+  local sid_file prior_sid prior_wt resume_sid wt_arg
 
   thread_id=$(grep '^thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
   wake_ts=$(date +%s)
   wt_suffix=inbox-$wake_ts
   sf=$(state_path "$oracle" "$fname")
+
+  # Path 1 — worktree reuse via maw --resume. If we already have a
+  # session-id mapped for this (oracle, thread) AND no claude is currently
+  # alive in the worktree that birthed it, resume that session in the SAME
+  # worktree instead of spawning a fresh one. Drives worktree count toward
+  # (oracle × thread) pairs rather than total wakes. Falls back to --fresh
+  # silently if any precondition is missing.
+  if [ -n "$thread_id" ]; then
+    sid_file="$STATE_DIR/sessions/$oracle/thread-$thread_id.session-id"
+    if [ -f "$sid_file" ]; then
+      prior_sid=$(cat "$sid_file")
+      prior_wt=$(find_prior_wt_for_thread "$oracle" "$thread_id")
+      if [ -n "$prior_sid" ] && [ -n "$prior_wt" ] && [ -d "$prior_wt" ] \
+         && ! claude_alive_at "$prior_wt"; then
+        resume_sid=$prior_sid
+        # Re-use the existing wt_suffix so maw attaches to the same worktree
+        # window. We extract it from the prior wt path: `<repo>.wt-<N>-<suffix>`.
+        wt_suffix=$(basename "$prior_wt" | sed 's/^[^.]*\.wt-[0-9]*-//')
+      fi
+    fi
+  fi
 
   # Write state BEFORE firing — prevents double-fire if next scan races us.
   write_state "$sf" \
@@ -148,20 +200,28 @@ fire_wake() {
     "thread_id=$thread_id" \
     "wt_suffix=$wt_suffix" \
     "status=fired"
+  [ -n "${resume_sid:-}" ] && set_state_field "$sf" resume_sid "$resume_sid"
 
-  log "[$oracle] $fname → fire (thread=$thread_id, suffix=$wt_suffix)"
+  log "[$oracle] $fname → fire (thread=$thread_id, suffix=$wt_suffix${resume_sid:+, RESUME sid=$resume_sid})"
 
   # Capture maw wake output to extract the resolved worktree path.
-  # `maw wake` is synchronous-ish: it returns after spawning, but claude itself
-  # runs async inside the tmux pane. We don't block on claude — verify_delivery
-  # will pick up the JSONL on the next scan tick.
-  wake_out=$($MAW_BIN wake "$oracle" --fresh --wt "$wt_suffix" --no-attach \
-    --task "inbox: $fname" 2>&1) || {
-    set_state_field "$sf" status fire_failed
-    set_state_field "$sf" failed_at "$(date +%s)"
-    alert "[$oracle] maw wake exit nonzero for $fname: $(printf '%s' "$wake_out" | tail -3 | tr '\n' ' ')"
-    return 1
-  }
+  if [ -n "${resume_sid:-}" ]; then
+    wake_out=$($MAW_BIN wake "$oracle" --resume "$resume_sid" --wt "$wt_suffix" --no-attach \
+      --task "inbox: $fname" 2>&1) || {
+      set_state_field "$sf" status fire_failed
+      set_state_field "$sf" failed_at "$(date +%s)"
+      alert "[$oracle] maw wake --resume exit nonzero for $fname: $(printf '%s' "$wake_out" | tail -3 | tr '\n' ' ')"
+      return 1
+    }
+  else
+    wake_out=$($MAW_BIN wake "$oracle" --fresh --wt "$wt_suffix" --no-attach \
+      --task "inbox: $fname" 2>&1) || {
+      set_state_field "$sf" status fire_failed
+      set_state_field "$sf" failed_at "$(date +%s)"
+      alert "[$oracle] maw wake exit nonzero for $fname: $(printf '%s' "$wake_out" | tail -3 | tr '\n' ' ')"
+      return 1
+    }
+  fi
   printf '%s\n' "$wake_out" >>"$LOG_FILE"
 
   # `+ worktree: /path/to/repo.wt-N-suffix (branch)` — extract path.
@@ -252,17 +312,6 @@ other_state_references_wt() {
     grep -q "^wt_path=$wt$" "$other" && return 0
   done
   return 1
-}
-
-# True iff any claude process is currently running with $wt_path as its cwd.
-claude_alive_at() {
-  local wt=$1
-  [ -z "$wt" ] && return 1
-  pgrep -f "claude " 2>/dev/null | while read -r pid; do
-    local pcwd
-    pcwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
-    [ "$pcwd" = "$wt" ] && { echo alive; return; }
-  done | grep -q alive
 }
 
 # Safety gates for retiring a worktree. Returns reason string on first
