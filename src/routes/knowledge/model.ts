@@ -10,5 +10,7 @@ export const HandoffBody = t.Any();
 export const InboxQuery = t.Object({
   limit: t.Optional(t.String()),
   offset: t.Optional(t.String()),
-  type: t.Optional(t.String()),
+  type: t.Optional(t.String()), // 'all' | 'handoff' | 'directed'
+  oracle: t.Optional(t.String()), // filter directed to specific oracle (matches for-{oracle}/)
+  include_archived: t.Optional(t.String()), // '1' to also list handled/ subdirs
 });
