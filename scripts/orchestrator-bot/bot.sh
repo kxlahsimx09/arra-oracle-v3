@@ -140,6 +140,7 @@ cmd_help() {
 <code>/cancel N</code> — request orchestrator to cancel sub-thread #N
 <code>/status</code> — active + pending sub-threads + watcher alerts
 <code>/escalations</code> — unresolved escalations across fleet
+<code>/cleanup</code> — one-tap fleet cleanup audit (orchestrator → brew-ops)
 
 Plain text → continues active thread, or starts fresh.
 EOF
@@ -270,6 +271,42 @@ cmd_escalations() {
 <pre>$body</pre>"
 }
 
+# /cleanup — shortcut: dispatch to orchestrator → brew-ops to audit + propose
+# fleet cleanup (stale claude sessions + worktrees). Mirrors what user typed
+# manually as the first orchestrator dogfood; here it's a one-tap command.
+cmd_cleanup() {
+  local ts=$(date '+%Y-%m-%d_%H-%M')
+  local path="$INBOX_DIR/${ts}_from-user_request.md"
+  {
+    echo "---"
+    echo "from: user"
+    echo "from_role: human"
+    echo "to: orchestrator"
+    echo "to_role: orchestrator"
+    echo "type: consult"
+    echo "subject: cleanup: audit + retire stale claude sessions and worktrees"
+    echo "needs_response: true"
+    echo "priority: normal"
+    echo "created: $(date -Iseconds)"
+    echo "source: telegram-chat-$CHAT"
+    echo "user_action: cleanup-shortcut"
+    echo "---"
+    echo
+    echo "# /cleanup shortcut"
+    echo
+    echo "Telegram one-tap fleet cleanup. Dispatch to brew-ops via the same shape the orchestrator already uses for fleet audits:"
+    echo
+    echo "1. Audit all worktrees + claude sessions (per repo) for stale candidates"
+    echo "2. Classify into auto-safe / needs-review / lost-work groups"
+    echo "3. brew-ops produces commands only — no execution"
+    echo "4. Wait for /approve <group-id> per group"
+    echo
+    echo "Honor P-001 + AGENTS.md §9: never destructive without explicit user approval per group. brew-ops's worktree-janitor.sh dry-run output is a useful starting point."
+  } > "$path"
+  log "wrote /cleanup envelope"
+  send_tg "🧹 cleanup audit dispatched. Orchestrator will fan out to brew-ops; expect a per-group proposal in ~2-3 min."
+}
+
 # ── update dispatcher ──────────────────────────────────────────────────────
 
 handle_update() {
@@ -296,6 +333,7 @@ handle_update() {
     /cancel\ *)               cmd_cancel "${text#/cancel }" ;;
     /status)                  cmd_status ;;
     /escalations)             cmd_escalations ;;
+    /cleanup)                 cmd_cleanup ;;
     /*)                       send_tg "❓ unknown command. /help" ;;
     *)
       local active=$(get_active_thread)
