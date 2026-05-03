@@ -55,6 +55,12 @@ INBOX_POLL_INTERVAL=${INBOX_POLL_INTERVAL:-60}
 T1_DELIVERY_DEADLINE=${T1_DELIVERY_DEADLINE:-60}
 T2_PROCESSING_DEADLINE=${T2_PROCESSING_DEADLINE:-1800}
 INBOX_SCAN_ENABLED=${INBOX_SCAN_ENABLED:-1}
+# Path 2 — auto-clean: when an envelope reaches `completed` AND its thread is
+# `closed` AND every safety gate passes, retire the worktree + claude session
+# that handled it. Default OFF — opt in via env. See safe_to_retire() below.
+INBOX_AUTO_CLEAN=${INBOX_AUTO_CLEAN:-0}
+ORACLE_API=${ORACLE_API:-http://localhost:47778/api}
+MAW_BIN=${MAW_BIN:-bun /Users/dev01/Code/github.com/Soul-Brews-Studio/maw-js/src/cli.ts}
 
 CLAUDE_PROJECTS=${CLAUDE_PROJECTS:-$HOME/.claude/projects}
 
@@ -215,6 +221,7 @@ verify_processing() {
     set_state_field "$sf" status completed
     set_state_field "$sf" completed_at "$now"
     log "[$oracle] $fname COMPLETED (archived; age=${age}s)"
+    [ "$INBOX_AUTO_CLEAN" = "1" ] && maybe_retire_worktree "$sf"
     return 0
   fi
 
@@ -222,6 +229,104 @@ verify_processing() {
     set_state_field "$sf" status failed_stuck
     set_state_field "$sf" failed_at "$now"
     alert "[$oracle] $fname STUCK — file still in inbox after $((T2_PROCESSING_DEADLINE / 60))min"
+  fi
+}
+
+# ─── Path 2 — auto-clean when thread closes ────────────────────────────────
+
+# Query oracle API for thread status; echoes 'closed'|'active'|'pending'|''.
+thread_status() {
+  local id=$1
+  [ -z "$id" ] && { echo ""; return; }
+  curl -sf -m 3 "$ORACLE_API/forum/thread/$id" 2>/dev/null \
+    | jq -r '.thread.status // empty' 2>/dev/null
+}
+
+# True iff any other active state file (not $sf) references the same wt_path.
+other_state_references_wt() {
+  local sf=$1 wt=$2
+  [ -z "$wt" ] && return 1
+  for other in "$STATE_DIR"/state/*/*.state; do
+    [ -f "$other" ] || continue
+    [ "$other" = "$sf" ] && continue
+    grep -q "^wt_path=$wt$" "$other" && return 0
+  done
+  return 1
+}
+
+# True iff any claude process is currently running with $wt_path as its cwd.
+claude_alive_at() {
+  local wt=$1
+  [ -z "$wt" ] && return 1
+  pgrep -f "claude " 2>/dev/null | while read -r pid; do
+    local pcwd
+    pcwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    [ "$pcwd" = "$wt" ] && { echo alive; return; }
+  done | grep -q alive
+}
+
+# Safety gates for retiring a worktree. Returns reason string on first
+# failure (caller checks $? = 0 means safe). Empty string output means OK.
+safe_to_retire() {
+  local sf=$1
+  read_state "$sf" || { echo "state-unreadable"; return 1; }
+
+  [ -z "${wt_path:-}" ] && { echo "no-wt-path"; return 1; }
+  [ ! -d "$wt_path" ] && { echo "wt-already-gone"; return 1; }
+
+  local ts
+  ts=$(thread_status "${thread_id:-}")
+  [ "$ts" != "closed" ] && { echo "thread-${thread_id:-?}-not-closed-($ts)"; return 1; }
+
+  # git: clean working tree + all commits pushed
+  local dirty
+  dirty=$(git -C "$wt_path" status --short 2>/dev/null | head -1)
+  [ -n "$dirty" ] && { echo "wt-dirty"; return 1; }
+
+  local unpushed
+  unpushed=$(git -C "$wt_path" log '@{u}..' --oneline 2>/dev/null | head -1)
+  [ -n "$unpushed" ] && { echo "wt-has-unpushed-commits"; return 1; }
+
+  claude_alive_at "$wt_path" && { echo "claude-still-alive"; return 1; }
+
+  other_state_references_wt "$sf" "$wt_path" && { echo "wt-shared-by-other-envelope"; return 1; }
+
+  echo ""
+  return 0
+}
+
+# Try to retire the worktree associated with $sf if all gates pass.
+maybe_retire_worktree() {
+  local sf=$1
+  read_state "$sf" || return 0
+
+  local reason
+  reason=$(safe_to_retire "$sf")
+  if [ -n "$reason" ]; then
+    log "[$oracle] $fname retire SKIPPED ($reason)"
+    return 0
+  fi
+
+  # All gates pass — perform the retire.
+  local repo_path branch
+  repo_path=$(git -C "$wt_path" rev-parse --show-toplevel 2>/dev/null)
+  branch=$(git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+  # Best-effort kill the tmux window for this wake (non-fatal if gone).
+  $MAW_BIN ls 2>/dev/null | grep -q "${wt_suffix:-__none__}" && {
+    $MAW_BIN kill "*:*${wt_suffix}*" 2>/dev/null || true
+  }
+
+  # git worktree remove (refuses on dirty by default — safe)
+  if git -C "$wt_path/.." worktree remove "$wt_path" 2>>"$LOG_FILE"; then
+    log "[$oracle] $fname RETIRED worktree $wt_path"
+    # Best-effort branch delete (only succeeds if merged or no unique commits)
+    [ -n "$branch" ] && [ "$branch" != "HEAD" ] && \
+      git -C "$repo_path" branch -d "$branch" 2>/dev/null && \
+      log "[$oracle] retired branch $branch"
+    set_state_field "$sf" retired_at "$(date +%s)"
+  else
+    log "[$oracle] $fname retire FAILED (git worktree remove returned nonzero — keeping)"
   fi
 }
 
