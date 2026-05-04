@@ -420,6 +420,7 @@ cmd_help() {
 /new &lt;role&gt; [slug]        spawn new chat (uses maw wake)
 /relaunch [role/slug]     restart claude in existing pane (after -p exit)
 /close &lt;role/slug&gt;        kill chat (pane + leaves worktree orphan)
+/close all [auto]         audit + close safe chats; sweep orphan wt/aliases
 
 <b>Active chat I/O:</b>
 &lt;plain msg&gt;               → send to current chat
@@ -727,8 +728,132 @@ status:
   update_status "$tg_chat"
 }
 
+# Audit a single chat for /close all. Echoes "OK" if safe to close, else
+# "KEEP: <reason>". Skips oracle baselines outright.
+audit_chat_for_close() {
+  local pane="$1" slug="$2"
+  case "$slug" in oracle|main) echo "KEEP: oracle baseline"; return ;; esac
+  local cwd
+  cwd=$(tmux display-message -p -t "$pane" "#{pane_current_path}" 2>/dev/null)
+  [ -z "$cwd" ] || [ ! -d "$cwd" ] && { echo "OK"; return; }
+  git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1 || { echo "OK"; return; }
+  local dirty; dirty=$(git -C "$cwd" status --porcelain 2>/dev/null | head -1)
+  [ -n "$dirty" ] && { echo "KEEP: dirty ($cwd)"; return; }
+  local head; head=$(git -C "$cwd" rev-parse HEAD 2>/dev/null)
+  if [ -n "$head" ]; then
+    local on_remote; on_remote=$(git -C "$cwd" branch -r --contains "$head" 2>/dev/null | head -1)
+    [ -z "$on_remote" ] && { echo "KEEP: unpushed (HEAD ${head:0:7} not on any remote)"; return; }
+  fi
+  echo "OK"
+}
+
+# Remove all alias entries pointing to a given role/slug
+remove_aliases_for_chat() {
+  local chat="$1" f; f=$(alias_file)
+  [ -f "$f" ] || return
+  local tmp; tmp=$(mktemp)
+  awk -F= -v c="$chat" 'NF>=2 { v=substr($0, index($0,"=")+1); if (v != c) print }' "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+# Safe worktree remove (no -f). No-op for the main repo dir or missing path.
+remove_worktree_for_chat() {
+  local cwd="$1" repo="$2"
+  [ -z "$cwd" ] || [ -z "$repo" ] || [ "$cwd" = "$repo" ] && return 0
+  [ -d "$cwd" ] || return 0
+  git -C "$repo" worktree remove "$cwd" 2>/dev/null
+}
+
+# Sweep orphan worktrees: clean + pushed + no live tmux pane
+sweep_orphan_worktrees() {
+  local r wt_path h on_remote in_use pane_path
+  local panes; panes=$(tmux list-panes -a -F "#{pane_current_path}" 2>/dev/null)
+  for r in "${REPOS[@]}"; do
+    [ -e "$r/.git" ] || continue
+    while IFS= read -r wt_path; do
+      [ -z "$wt_path" ] || [ "$wt_path" = "$r" ] && continue
+      [ -d "$wt_path" ] || continue
+      in_use="no"
+      while IFS= read -r pane_path; do
+        [ "$pane_path" = "$wt_path" ] && in_use="yes" && break
+      done <<< "$panes"
+      [ "$in_use" = "yes" ] && continue
+      [ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null | head -1)" ] && continue
+      h=$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)
+      if [ -n "$h" ]; then
+        on_remote=$(git -C "$wt_path" branch -r --contains "$h" 2>/dev/null | head -1)
+        [ -z "$on_remote" ] && continue
+      fi
+      git -C "$r" worktree remove "$wt_path" 2>/dev/null && audit "/close all → swept orphan $wt_path"
+    done < <(git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
+    git -C "$r" worktree prune 2>/dev/null
+  done
+}
+
+# Sweep alias entries pointing to non-existent chats
+sweep_orphan_aliases() {
+  local f; f=$(alias_file)
+  [ -f "$f" ] && [ -s "$f" ] || return
+  local tmp; tmp=$(mktemp)
+  local aname aval
+  while IFS='=' read -r aname aval; do
+    [ -z "$aname" ] && continue
+    if [ -n "$(resolve_chat "$aval")" ]; then
+      echo "${aname}=${aval}" >> "$tmp"
+    else
+      audit "/close all → swept orphan alias $aname → $aval"
+    fi
+  done < "$f"
+  mv "$tmp" "$f"
+}
+
+# /close all [auto] — audit every chat, close safe ones, then sweep orphan
+# worktrees + aliases. "auto" mode is currently identical to plain "all";
+# reserved for future "wrap-up-and-close finishable" behaviour.
+cmd_close_all() {
+  local mode="${1:-}"
+  local closed=0 kept=""
+  local role pane sess win cmd slug chat verdict cwd repo
+  while IFS= read -r role; do
+    [ -z "$role" ] && continue
+    while IFS='|' read -r pane sess win cmd slug; do
+      [ -z "$pane" ] && continue
+      chat="$role/$slug"
+      verdict=$(audit_chat_for_close "$pane" "$slug")
+      if [ "$verdict" = "OK" ]; then
+        cwd=$(tmux display-message -p -t "$pane" "#{pane_current_path}" 2>/dev/null)
+        repo=$(role_repo "$role")
+        stop_watcher_for "$chat"
+        tmux kill-pane -t "$pane" 2>/dev/null
+        remove_aliases_for_chat "$chat"
+        remove_worktree_for_chat "$cwd" "$repo"
+        local af; af=$(active_chat_file "$CHAT")
+        [ -s "$af" ] && [ "$(cat "$af" 2>/dev/null)" = "$chat" ] && rm -f "$af"
+        audit "/close all → closed $chat ($pane)"
+        closed=$((closed + 1))
+      else
+        kept+="
+  • <code>$chat</code> — ${verdict#KEEP: }"
+        audit "/close all → kept $chat: $verdict"
+      fi
+    done <<< "$(chats_for_role "$role")"
+  done <<< "$(all_roles)"
+
+  sweep_orphan_worktrees
+  sweep_orphan_aliases
+
+  local summary="✅ <b>/close all${mode:+ $mode}</b> — closed: <b>$closed</b>"
+  [ -n "$kept" ] && summary+="
+🛡 kept alive:$kept"
+  send_tg "$summary"
+  update_status "$CHAT"
+}
+
 cmd_close() {
-  local target="$1"
+  local target="$1" mode="${2:-}"
+  if [ "$target" = "all" ]; then
+    cmd_close_all "$mode"
+    return
+  fi
   if [ -z "$target" ]; then
     local kb; kb=$(build_chat_keyboard "close")
     local has_chats
@@ -1190,7 +1315,7 @@ dispatch() {
     /alias)       cmd_alias "$chat_id" "${2:-}" "${3:-}" ;;
     /new)         cmd_new "$chat_id" "${2:-}" "${3:-}" ;;
     /relaunch)    cmd_relaunch "$chat_id" "${2:-}" ;;
-    /close)       cmd_close "${2:-}" ;;
+    /close)       cmd_close "${2:-}" "${3:-}" ;;
     /look)        cmd_look "$chat_id" "${2:-25}" ;;
     /end)         cmd_end "$chat_id" ;;
     /watch)       cmd_watch "${2:-list}" "${3:-}" ;;
