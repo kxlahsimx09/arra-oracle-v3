@@ -688,8 +688,9 @@ case ${1:-loop} in
     run_loop
     ;;
   stop)
+    # `local` is invalid outside a function and aborts under `set -u`; drop it.
     if [ -f "$PID_FILE" ]; then
-      local p=$(cat "$PID_FILE")
+      p=$(cat "$PID_FILE")
       kill -TERM "$p" 2>/dev/null && echo "stopped pid=$p" || echo "kill failed"
       rm -f "$PID_FILE"
     else

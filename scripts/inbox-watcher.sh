@@ -630,6 +630,8 @@ case ${1:-loop} in
       exit 0
     fi
     [ -f "$PID_FILE" ] && others="$others $(cat "$PID_FILE" 2>/dev/null)"
+    # Dedupe: PID_FILE pid is usually already in find_other_daemons output.
+    others=$(printf '%s\n' $others | awk 'NF && !seen[$0]++' | tr '\n' ' ')
     for p in $others; do
       [ -z "$p" ] && continue
       if kill -TERM "$p" 2>/dev/null; then
