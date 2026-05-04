@@ -279,11 +279,21 @@ cmd_read() {
   title=$(echo "$resp" | jq -r '.thread.title // empty')
   status=$(echo "$resp" | jq -r '.thread.status // empty')
   count=$(echo "$resp" | jq -r '.thread.message_count // 0')
-  # Build markdown body — header + each message as h2 + content
+  # Build markdown body — header + each message as h2 + content. Cap each
+  # message at TELEGRAPH_MAX_MSG_CHARS (default 6000) to stay under Telegraph's
+  # ~64KB createPage limit. A 12-msg thread × 6KB = 72KB headroom — generous.
+  # Oversized messages get a "[…truncated]" tail pointing to oracle UI.
+  local max_chars=${TELEGRAPH_MAX_MSG_CHARS:-6000}
   local body
-  body=$(echo "$resp" | jq -r '
+  body=$(echo "$resp" | jq -r --argjson cap "$max_chars" --arg tid "$n" '
     .messages[]
-    | "## msg #\(.id) — \(.author) — \(.timestamp)\n\n\(.content)\n\n---"
+    | (.content
+        | if length > $cap
+          then .[0:($cap - 120)] + "\n\n[…truncated at \($cap) chars — open oracle UI at http://localhost:47778/thread/\($tid) for the full message]"
+          else .
+          end
+      ) as $c
+    | "## msg #\(.id) — \(.author) — \(.timestamp)\n\n\($c)\n\n---"
   ')
   local header
   header="# Thread #$n: $title
