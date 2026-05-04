@@ -578,28 +578,67 @@ run_loop() {
 
 # ─── CLI ───────────────────────────────────────────────────────────────────
 
+# Find OTHER live daemon instances of this script (excluding $$).
+# PID_FILE alone is insufficient — if removed manually (or by a crash that
+# didn't trap) `start` would spawn a second instance alongside the first.
+# Two watchers race on per-envelope state writes and can double-fire
+# `maw wake`. Verified live 2026-05-04: PIDs 6687 + 66345 both running
+# with no PID_FILE present.
+#
+# Match shape: cmdline starts with `bash` (or absolute bash) AND contains
+# the script's basename. Skips transient `sh -c …basename…` children spawned
+# by the very pipeline we're running here (their cmdline begins with `sh`).
+find_other_daemons() {
+  local base=$(basename "$0")
+  local p cmd out=""
+  for p in $(pgrep -f "$base" 2>/dev/null); do
+    [ "$p" = "$$" ] && continue
+    cmd=$(ps -p "$p" -o command= 2>/dev/null)
+    case "$cmd" in
+      bash" "*"$base"*|*/bash" "*"$base"*) out="$out $p" ;;
+    esac
+  done
+  echo "${out# }"
+}
+
 case ${1:-loop} in
   loop|start)
+    others=$(find_other_daemons)
+    if [ -n "$others" ]; then
+      echo "another $(basename "$0") is already running (pid=$others)" >&2
+      echo "stop it first: $0 stop  (or: kill $others)" >&2
+      exit 1
+    fi
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
       echo "already running: $(cat "$PID_FILE")" >&2
       exit 1
     fi
     printf '%d\n' "$$" >"$PID_FILE"
+    # EXIT trap covers `set -e` aborts and clean exits; the explicit `exit 0`
+    # for INT/TERM is preserved so a Ctrl-C unwinds without surfacing as error.
+    trap 'rm -f "$PID_FILE"' EXIT
     trap 'rm -f "$PID_FILE"; exit 0' INT TERM
     run_loop
     ;;
   stop)
-    if [ -f "$PID_FILE" ]; then
-      p=$(cat "$PID_FILE")
+    # TERM all instances — PID_FILE may have drifted; we want a clean
+    # teardown regardless. Best-effort.
+    others=$(find_other_daemons)
+    if [ -z "$others" ] && { [ ! -f "$PID_FILE" ] || ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; }; then
+      echo "not running"
+      rm -f "$PID_FILE"
+      exit 0
+    fi
+    [ -f "$PID_FILE" ] && others="$others $(cat "$PID_FILE" 2>/dev/null)"
+    for p in $others; do
+      [ -z "$p" ] && continue
       if kill -TERM "$p" 2>/dev/null; then
         echo "stopped pid=$p"
       else
-        echo "kill failed (process gone?)" >&2
+        echo "kill $p failed (process gone?)" >&2
       fi
-      rm -f "$PID_FILE"
-    else
-      echo "not running"
-    fi
+    done
+    rm -f "$PID_FILE"
     ;;
   status)
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
