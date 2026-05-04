@@ -17,6 +17,8 @@
 #   /cancel <N>        — write a cancellation envelope for thread #N
 #   /status            — active thread, pending sub-threads, watcher alerts
 #   /escalations       — list unresolved [ESCALATE_TO_HUMAN:*] markers
+#   /retry             — clear failed_stuck / failed_no_prompt state files
+#                        so the inbox-watcher re-fires on its next pass
 #   <plain text>       — append to active thread, OR start fresh request
 #
 # State at ~/.cache/orchestrator-bot/.
@@ -145,7 +147,10 @@ pick_smart_active_thread() {
 # watcher can match thread-N session-id mapping for Path 1 worktree-reuse.
 write_envelope() {
   local text="$1" thread="$2"
-  local ts=$(date '+%Y-%m-%d_%H-%M')
+  # Per-second granularity: per-minute granularity caused silent overwrite
+  # when two user messages landed within the same minute (the second clobbered
+  # the first, losing the user input).
+  local ts=$(date '+%Y-%m-%d_%H-%M-%S')
   local fname="${ts}_from-user_request"
   [ -n "$thread" ] && fname="${ts}_from-user_thread-${thread}_continuation"
   fname="${fname}.md"
@@ -189,6 +194,7 @@ cmd_help() {
 <code>/cancel N</code> — request orchestrator to cancel #N
 <code>/status</code> — active + pending sub-threads + watcher alerts
 <code>/escalations</code> — unresolved escalations across fleet
+<code>/retry</code> — clear stuck/failed watcher states; re-fire on next pass
 <code>/cleanup</code> — one-tap fleet cleanup audit (orchestrator → brew-ops)
 
 Plain text → continues active thread, or starts fresh.
@@ -454,7 +460,7 @@ cmd_close() {
   local n="$1"
   if ! [[ "$n" =~ ^[0-9]+$ ]]; then send_tg "❌ <code>/close &lt;N&gt;</code> needs a thread id"; return; fi
   # Write a "close" envelope — orchestrator finalizes + posts closing message + status=closed
-  local ts=$(date '+%Y-%m-%d_%H-%M')
+  local ts=$(date '+%Y-%m-%d_%H-%M-%S')
   local path="$INBOX_DIR/${ts}_from-user_thread-${n}_close.md"
   {
     echo "---"
@@ -479,7 +485,7 @@ cmd_close() {
 cmd_cancel() {
   local n="$1"
   if ! [[ "$n" =~ ^[0-9]+$ ]]; then send_tg "❌ <code>/cancel &lt;N&gt;</code> needs a thread id"; return; fi
-  local ts=$(date '+%Y-%m-%d_%H-%M')
+  local ts=$(date '+%Y-%m-%d_%H-%M-%S')
   local path="$INBOX_DIR/${ts}_from-user_thread-${n}_cancel.md"
   {
     echo "---"
@@ -521,11 +527,50 @@ cmd_escalations() {
 <pre>$body</pre>"
 }
 
+# /retry — clear `failed_stuck` / `failed_no_prompt` state files for the
+# orchestrator so the watcher's next pass re-fires the envelope. If the
+# envelope was already archived (file gone from for-orchestrator/ root)
+# the state is just cleared (no re-fire possible — work is already done
+# or moot). Operator escape hatch from terminal failure states.
+cmd_retry() {
+  local state_dir="$HOME/.cache/inbox-watcher/state/orchestrator"
+  if [ ! -d "$state_dir" ]; then send_tg "<i>No state dir at $state_dir.</i>"; return; fi
+
+  local refire=0 cleared=0 report=""
+  for sf in "$state_dir"/*.state; do
+    [ -f "$sf" ] || continue
+    local st=$(grep '^status=' "$sf" | tail -1 | cut -d= -f2)
+    case "$st" in failed_stuck|failed_no_prompt|fire_failed) ;; *) continue ;; esac
+    local fname=$(basename "$sf" .state)
+    local file="$INBOX_DIR/$fname"
+    if [ -f "$file" ]; then
+      rm -f "$sf"
+      report="${report}♻ ${fname}"$'\n'
+      refire=$((refire + 1))
+    else
+      rm -f "$sf"
+      report="${report}× ${fname} (envelope gone)"$'\n'
+      cleared=$((cleared + 1))
+    fi
+  done
+
+  if [ $((refire + cleared)) -eq 0 ]; then
+    send_tg "✓ no stuck envelopes for orchestrator"
+    return
+  fi
+  local body=$(echo "$report" | head -c 1500 | html_escape)
+  send_tg "🔁 <b>retry</b> — re-fire: $refire, cleared-stale: $cleared
+Watcher will re-fire within 60s.
+
+<pre>$body</pre>"
+  log "retry: re-fire=$refire, cleared=$cleared"
+}
+
 # /cleanup — shortcut: dispatch to orchestrator → brew-ops to audit + propose
 # fleet cleanup (stale claude sessions + worktrees). Mirrors what user typed
 # manually as the first orchestrator dogfood; here it's a one-tap command.
 cmd_cleanup() {
-  local ts=$(date '+%Y-%m-%d_%H-%M')
+  local ts=$(date '+%Y-%m-%d_%H-%M-%S')
   local path="$INBOX_DIR/${ts}_from-user_request.md"
   {
     echo "---"
@@ -583,6 +628,7 @@ handle_update() {
     /cancel\ *)               cmd_cancel "${text#/cancel }" ;;
     /status)                  cmd_status ;;
     /escalations)             cmd_escalations ;;
+    /retry)                   cmd_retry ;;
     /cleanup)                 cmd_cleanup ;;
     /read\ *)                 cmd_read "${text#/read }" ;;
     /*)                       send_tg "❓ unknown command. /help" ;;
