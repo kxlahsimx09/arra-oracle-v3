@@ -36,6 +36,13 @@ PID_FILE=${PID_FILE:-$STATE_DIR/chat-watcher.pid}
 CLAUDE_PROJECTS=${CLAUDE_PROJECTS:-$HOME/.claude/projects}
 POLL_INTERVAL=${POLL_INTERVAL:-3}     # tail every 3s for low-latency Telegram echo
 RECENT_WINDOW_MIN=${RECENT_WINDOW_MIN:-30}
+# Suppress very short assistant turns from reaching Telegram. Default 0
+# preserves the previous "every text turn → user" behavior. Raise to ~30
+# to drop short status pings ("checking…", "ok", emoji-only) that the
+# orchestrator emits between tool calls and that clutter the Telegram chat
+# without adding info the user couldn't infer from the next substantive
+# message. The threshold counts characters of the trimmed message.
+PUSH_MIN_CHARS=${PUSH_MIN_CHARS:-0}
 
 # Orchestrator JSONLs live under project dirs that match this pattern
 # (worktree path encoded by claude). Adjust if orchestrator deployment
@@ -112,7 +119,12 @@ process_jsonl() {
     trimmed=$(printf '%s' "$texts" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     [ -z "$trimmed" ] && continue
 
-    log "[$sid] push text ($(echo "$trimmed" | wc -c | tr -d ' ') chars)"
+    local nchars=$(printf '%s' "$trimmed" | wc -c | tr -d ' ')
+    if [ "$PUSH_MIN_CHARS" -gt 0 ] && [ "$nchars" -lt "$PUSH_MIN_CHARS" ]; then
+      log "[$sid] skip text ($nchars chars < PUSH_MIN_CHARS=$PUSH_MIN_CHARS)"
+      continue
+    fi
+    log "[$sid] push text ($nchars chars)"
 
     local escaped
     escaped=$(printf '%s' "$trimmed" | html_escape)
