@@ -288,12 +288,17 @@ cmd_threads() {
     title_short=$(echo "$title" | head -c 50 | html_escape)
     body="${body}${marker} #${id}  ${title_short}"$'\n'
     count=$((count + 1))
-    # Find sub-threads referenced in this parent's last_message (orchestrator's
-    # "📨 dispatched ... sub-thread #N" pattern). For each, indent under parent.
-    local last_msg
-    last_msg=$(echo "$resp" | jq -r ".threads[] | select(.id == $id) | .last_message // empty" 2>/dev/null)
-    local sub_ids
-    sub_ids=$(echo "$last_msg" | grep -oE '#[0-9]+' | tr -d '#' | sort -un)
+    # Find sub-threads referenced ANYWHERE in this parent's messages. Earlier
+    # versions only scanned `last_message` and missed older subs (e.g. #64
+    # opened by msg 130 was hidden once msg 144 dispatched #65 and became
+    # the new last_message). Now we fetch the full thread once per parent
+    # and grep every message for "sub-thread #N", "sub #N", or "thread #N".
+    local thread_full sub_ids
+    thread_full=$(curl -sf "$ORACLE_API/thread/$id" 2>/dev/null)
+    sub_ids=$(echo "$thread_full" | jq -r '.messages[]?.content // empty' 2>/dev/null \
+      | grep -oE '(sub-?thread|sub|thread) #[0-9]+' \
+      | grep -oE '[0-9]+' \
+      | sort -un)
     for sid in $sub_ids; do
       [ "$sid" = "$id" ] && continue
       [ "$count" -ge 14 ] && break
