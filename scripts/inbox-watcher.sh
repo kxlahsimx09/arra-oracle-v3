@@ -61,6 +61,13 @@ INBOX_SCAN_ENABLED=${INBOX_SCAN_ENABLED:-1}
 INBOX_AUTO_CLEAN=${INBOX_AUTO_CLEAN:-0}
 ORACLE_API=${ORACLE_API:-http://localhost:47778/api}
 MAW_BIN=${MAW_BIN:-bun /Users/dev01/Code/github.com/Soul-Brews-Studio/maw-js/src/cli.ts}
+# Phase 6 — claude_alive_at heuristic. A claude process is "active" only if
+# its cwd matches the worktree AND its JSONL has been written within this
+# many seconds. Older = "stuck" (likely zombie subshell from a prior wake
+# whose `claude --resume -p` parent exited but children remain), so Path 1
+# can safely resume past it. Tune up if false-positive resumes hit busy
+# claudes that pause >5min between tool calls.
+CLAUDE_STUCK_TIMEOUT=${CLAUDE_STUCK_TIMEOUT:-300}
 
 CLAUDE_PROJECTS=${CLAUDE_PROJECTS:-$HOME/.claude/projects}
 
@@ -148,15 +155,63 @@ find_prior_wt_for_thread() {
 }
 
 # Reused by Path 2 (maybe_retire_worktree) and Path 1 (fire_wake's resume gate).
-# Returns 0 (true) iff a claude process has wt as its cwd.
+# Returns 0 (true) iff a claude process is **actively** working in `wt` —
+# distinguishing three states:
+#
+#   active  process alive AT cwd=wt AND JSONL written within
+#           CLAUDE_STUCK_TIMEOUT seconds → block reuse (parallel work case)
+#   stuck   process alive AT cwd=wt BUT JSONL idle > timeout → allow reuse
+#           (zombie subshell pattern: `claude --resume -p` parent exits but
+#            child shell scripts linger holding the cwd open; happens with
+#            bash tool-call subshells. Treating stuck as "alive" was the
+#            Phase 5 bug that made Path 1 spawn wt-15 instead of resuming
+#            wt-12 on 2026-05-03 20:49.)
+#   dead    no claude process at cwd=wt → allow reuse
+#
+# Returns 0 only for `active`. `stuck` and `dead` both return 1.
 claude_alive_at() {
   local wt=$1
   [ -z "$wt" ] && return 1
-  pgrep -f "claude " 2>/dev/null | while read -r pid; do
+
+  # Step 1 — find candidate pids whose cwd matches wt.
+  local found_pid=""
+  while read -r pid; do
     local pcwd
     pcwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
-    [ "$pcwd" = "$wt" ] && { echo alive; return; }
-  done | grep -q alive
+    if [ "$pcwd" = "$wt" ]; then
+      found_pid=$pid
+      break
+    fi
+  done < <(pgrep -f "claude " 2>/dev/null)
+
+  [ -z "$found_pid" ] && return 1   # dead — no process at cwd
+
+  # Step 2 — process exists; check if any JSONL under the project dir has
+  # been written recently. A genuinely-active claude writes tool_use /
+  # tool_result / text turns continuously; a stuck zombie does not.
+  local proj_dir="$CLAUDE_PROJECTS/$(encode_cwd "$wt")"
+  if [ ! -d "$proj_dir" ]; then
+    # Process alive but no project dir — anomalous. Treat as stuck.
+    log "claude_alive_at($wt) → pid=$found_pid alive but no project dir; STUCK"
+    return 1
+  fi
+
+  local newest_mtime now age
+  newest_mtime=$(stat -f %m "$proj_dir"/*.jsonl 2>/dev/null | sort -nr | head -1)
+  if [ -z "$newest_mtime" ]; then
+    log "claude_alive_at($wt) → pid=$found_pid alive but no JSONL; STUCK"
+    return 1
+  fi
+  now=$(date +%s)
+  age=$((now - newest_mtime))
+
+  if [ "$age" -gt "$CLAUDE_STUCK_TIMEOUT" ]; then
+    log "claude_alive_at($wt) → pid=$found_pid alive but JSONL idle ${age}s > ${CLAUDE_STUCK_TIMEOUT}s; STUCK (resume OK)"
+    return 1
+  fi
+
+  # active
+  return 0
 }
 
 # ─── State transitions ─────────────────────────────────────────────────────
