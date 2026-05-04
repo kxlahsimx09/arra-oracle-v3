@@ -65,9 +65,14 @@ MAW_BIN=${MAW_BIN:-bun /Users/dev01/Code/github.com/Soul-Brews-Studio/maw-js/src
 # its cwd matches the worktree AND its JSONL has been written within this
 # many seconds. Older = "stuck" (likely zombie subshell from a prior wake
 # whose `claude --resume -p` parent exited but children remain), so Path 1
-# can safely resume past it. Tune up if false-positive resumes hit busy
-# claudes that pause >5min between tool calls.
-CLAUDE_STUCK_TIMEOUT=${CLAUDE_STUCK_TIMEOUT:-300}
+# can safely resume past it.
+#
+# Default 600s (10 min). Earlier 300s default tripped false positives on
+# legitimate slow sessions: a claude waiting for a long `bun test` or a
+# multi-step search can easily go 5-10 min between JSONL writes. 600s is
+# more conservative; tune lower only if the operator actively wants to
+# steal worktrees from slow-but-legitimate sessions.
+CLAUDE_STUCK_TIMEOUT=${CLAUDE_STUCK_TIMEOUT:-600}
 
 CLAUDE_PROJECTS=${CLAUDE_PROJECTS:-$HOME/.claude/projects}
 
@@ -161,8 +166,15 @@ claude_pids_at() {
 
 # Phase 7 — pre-empt all claude processes at wt (used when a cancel
 # envelope races with an active wake on the same thread). TERM first,
-# then KILL stragglers after a brief grace period. Logs each kill so an
-# operator can see what was reaped.
+# then KILL stragglers after a grace period long enough for a single
+# tool call (Write / git commit / curl) to finish. Logs each kill so
+# an operator can see what was reaped.
+#
+# Tunable via PREEMPT_GRACE_SEC (default 10). Original 2s was too short
+# — a Write tool mid-flush would lose the file; a git commit mid-write
+# would leave the index in a bad state. 10s gives single tool calls
+# room to land while still bounding the cancel latency.
+PREEMPT_GRACE_SEC=${PREEMPT_GRACE_SEC:-10}
 preempt_claude_at() {
   local wt=$1
   [ -z "$wt" ] && return 0
@@ -170,15 +182,26 @@ preempt_claude_at() {
   pids=$(claude_pids_at "$wt")
   [ -z "$pids" ] && return 0
 
+  # Diagnostic: log JSONL recency so an operator can tell whether the
+  # claude was actively writing when we pre-empted.
+  local proj_dir="$CLAUDE_PROJECTS/$(encode_cwd "$wt")"
+  if [ -d "$proj_dir" ]; then
+    local newest=$(stat -f %m "$proj_dir"/*.jsonl 2>/dev/null | sort -nr | head -1)
+    if [ -n "$newest" ]; then
+      local age=$(( $(date +%s) - newest ))
+      log "  pre-empt context: JSONL idle ${age}s (>= grace = active mid-tool risk)"
+    fi
+  fi
+
   for pid in $pids; do
     if kill -TERM "$pid" 2>/dev/null; then
-      log "  TERM pid=$pid (cwd=$wt)"
+      log "  TERM pid=$pid (cwd=$wt) — grace ${PREEMPT_GRACE_SEC}s"
     fi
   done
-  sleep 2
+  sleep "$PREEMPT_GRACE_SEC"
   for pid in $pids; do
     if kill -0 "$pid" 2>/dev/null; then
-      kill -9 "$pid" 2>/dev/null && log "  KILL pid=$pid (still alive after TERM)"
+      kill -9 "$pid" 2>/dev/null && log "  KILL pid=$pid (still alive after ${PREEMPT_GRACE_SEC}s grace)"
     fi
   done
 }

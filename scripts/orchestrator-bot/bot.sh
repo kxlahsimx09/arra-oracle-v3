@@ -88,14 +88,21 @@ add_known_thread() {
   mv "$KNOWN_THREADS_FILE.tmp" "$KNOWN_THREADS_FILE"
 }
 
-# Refresh known-threads with live status from oracle API (best effort)
+# Refresh known-threads with live status from oracle API. Single /threads
+# call (capped) instead of N+1 /thread/<id> lookups — cuts /status latency
+# from ~Nx network round-trips to one regardless of cache size.
 refresh_known_threads() {
   [ ! -s "$KNOWN_THREADS_FILE" ] && return
+  local all_resp
+  all_resp=$(curl -sf -m 5 "$ORACLE_API/threads?limit=200" 2>/dev/null)
   local tmp="$KNOWN_THREADS_FILE.refresh"
   : > "$tmp"
   while IFS='|' read -r id title old_status opened; do
     [ -z "$id" ] && continue
-    local cur=$(curl -sf "$ORACLE_API/thread/$id" 2>/dev/null | jq -r '.thread.status // empty' 2>/dev/null)
+    local cur=""
+    if [ -n "$all_resp" ]; then
+      cur=$(echo "$all_resp" | jq -r ".threads[] | select(.id == $id) | .status // empty" 2>/dev/null)
+    fi
     [ -z "$cur" ] && cur="$old_status"
     printf '%s|%s|%s|%s\n' "$id" "$title" "$cur" "$opened" >> "$tmp"
   done < "$KNOWN_THREADS_FILE"
@@ -115,9 +122,14 @@ refresh_known_threads() {
 # tracks threads the user touches via /use or /threads commands. Cost is
 # 1 list call + N detail calls per dispatch (N = pending-parent count).
 SMART_THREAD_WINDOW_SEC=${SMART_THREAD_WINDOW_SEC:-1800}
+# Hard cap on per-thread detail fetches per smart-pick. The /threads list
+# call gives us enough to filter to pending parents; we still need a
+# /thread/<id> call to read messages[-1].role and timestamp. Bounding the
+# work keeps the bot's long-poll responsive when many parents are open.
+SMART_THREAD_MAX_PROBE=${SMART_THREAD_MAX_PROBE:-5}
 pick_smart_active_thread() {
   local resp
-  resp=$(curl -sf -m 5 "$ORACLE_API/threads?limit=30" 2>/dev/null) || return
+  resp=$(curl -sf -m 5 "$ORACLE_API/threads?limit=10" 2>/dev/null) || return
   echo "$resp" | jq -e '.threads' >/dev/null 2>&1 || return
   local now=$(date +%s)
   local cutoff=$((now - SMART_THREAD_WINDOW_SEC))
@@ -126,7 +138,7 @@ pick_smart_active_thread() {
     .threads[]
     | select(.status == "pending")
     | select(.title | startswith("[from ") | not)
-    | .id')
+    | .id' | head -n "$SMART_THREAD_MAX_PROBE")
   local candidates=()
   local tid thread_full last_role last_ts ts_clean last_epoch
   for tid in $pending_parents; do
@@ -584,8 +596,14 @@ cmd_cancel() {
 
 cmd_status() {
   local active=$(get_active_thread)
-  refresh_known_threads
-  local open_count=$(grep -v '|closed|' "$KNOWN_THREADS_FILE" 2>/dev/null | grep -c '^[0-9]' || echo 0)
+  # Live count from API (single call) — known-threads cache is rarely
+  # populated and was the only reason refresh_known_threads existed in
+  # this path. Counts non-closed parent threads (skip "[from " sub titles).
+  local resp open_count="?"
+  resp=$(curl -sf -m 5 "$ORACLE_API/threads?limit=200" 2>/dev/null)
+  if echo "$resp" | jq -e '.threads' >/dev/null 2>&1; then
+    open_count=$(echo "$resp" | jq '[.threads[] | select(.status != "closed") | select(.title | startswith("[from ") | not)] | length')
+  fi
   local stuck=$(grep -l 'failed_stuck\|failed_no_prompt' ~/.cache/inbox-watcher/state/*/*.state 2>/dev/null | wc -l | tr -d ' ')
   send_tg "<b>Status</b>
 Active thread: ${active:-<i>none</i>}
