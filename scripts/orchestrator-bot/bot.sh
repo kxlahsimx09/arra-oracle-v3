@@ -93,6 +93,52 @@ refresh_known_threads() {
   mv "$tmp" "$KNOWN_THREADS_FILE"
 }
 
+# Smart-default: when no active thread is set, find a single pending parent
+# thread the user is plausibly responding to. Heuristic: thread is pending,
+# is a parent (title doesn't start with "[from "), and its most recent
+# message is from `claude` within the last SMART_THREAD_WINDOW_SEC. When
+# exactly one such thread exists, return its id so plain text attaches as
+# a continuation. Returns empty when 0 or >1 candidates (caller falls back
+# to a fresh request — no auto-attach when ambiguous).
+#
+# Uses the live oracle API (not known-threads cache) because threads opened
+# by the orchestrator agent itself never enter the cache — the cache only
+# tracks threads the user touches via /use or /threads commands. Cost is
+# 1 list call + N detail calls per dispatch (N = pending-parent count).
+SMART_THREAD_WINDOW_SEC=${SMART_THREAD_WINDOW_SEC:-1800}
+pick_smart_active_thread() {
+  local resp
+  resp=$(curl -sf -m 5 "$ORACLE_API/threads?limit=30" 2>/dev/null) || return
+  echo "$resp" | jq -e '.threads' >/dev/null 2>&1 || return
+  local now=$(date +%s)
+  local cutoff=$((now - SMART_THREAD_WINDOW_SEC))
+  local pending_parents
+  pending_parents=$(echo "$resp" | jq -r '
+    .threads[]
+    | select(.status == "pending")
+    | select(.title | startswith("[from ") | not)
+    | .id')
+  local candidates=()
+  local tid thread_full last_role last_ts ts_clean last_epoch
+  for tid in $pending_parents; do
+    thread_full=$(curl -sf -m 5 "$ORACLE_API/thread/$tid" 2>/dev/null) || continue
+    last_role=$(echo "$thread_full" | jq -r '.messages[-1].role // empty' 2>/dev/null)
+    # REST API uses created_at; MCP shape uses timestamp. Try both.
+    last_ts=$(echo "$thread_full" | jq -r '.messages[-1] | (.created_at // .timestamp // empty)' 2>/dev/null)
+    [ "$last_role" = "claude" ] || continue
+    [ -n "$last_ts" ] || continue
+    # API timestamps are UTC (e.g. 2026-05-04T05:44:08.517Z). BSD `date -j -f`
+    # without -u parses as local time, misreading UTC inputs by tz offset.
+    # Strip fractional seconds + trailing Z, parse with -u for UTC.
+    ts_clean="${last_ts%%.*}"
+    ts_clean="${ts_clean%Z}"
+    last_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "$ts_clean" "+%s" 2>/dev/null) || continue
+    [ "$last_epoch" -ge "$cutoff" ] || continue
+    candidates+=("$tid")
+  done
+  [ "${#candidates[@]}" -eq 1 ] && echo "${candidates[0]}"
+}
+
 # Write a request envelope (plain-text dispatch from user).
 # When `thread` is set (active-thread sticky after /use N), the user's message
 # is ON that thread (not a parent of it) — write `thread: N` so the inbox-
@@ -505,11 +551,18 @@ handle_update() {
     /*)                       send_tg "❓ unknown command. /help" ;;
     *)
       local active=$(get_active_thread)
-      local path=$(write_envelope "$text" "$active")
+      local smart=""
+      if [ -z "$active" ]; then
+        smart=$(pick_smart_active_thread)
+      fi
+      local target="${active:-$smart}"
+      local path=$(write_envelope "$text" "$target")
       if [ -n "$active" ]; then
         send_tg "📨 continuation → thread #$active (orchestrator wakes within 60s)"
+      elif [ -n "$smart" ]; then
+        send_tg "📨 continuation → thread #$smart (smart-default: only recent pending parent; <code>/new</code> to override, <code>/use N</code> to switch)"
       else
-        send_tg "📨 new request received (orchestrator will open a parent thread)"
+        send_tg "📨 dispatched (orchestrator will read context and decide: new thread vs continue)"
       fi
       ;;
   esac
