@@ -27,11 +27,11 @@ AUDIT_FILE=$STATE_DIR/audit.log
 LAST_UPDATE_ID_FILE=$STATE_DIR/last-update-id
 ACTIVE_CHAT_FILE_PREFIX=$STATE_DIR/active-chat
 
-REPOS=(
-  "$HOME/Code/github.com/kokarat/mobiz-payment-gateway"
-  "$HOME/Code/github.com/kokarat/bank-bot"
-  "$HOME/Code/github.com/Soul-Brews-Studio/arra-oracle-v3"
-)
+# Repos in scope for blockers/pending markers + orphan-worktree sweep.
+# Populated at boot by load_roles from fleet configs — every repo with at
+# least one fleet-registered role becomes scope-eligible. Adding a fleet
+# json (user-level or .agent/fleet/) auto-extends scope; no code change.
+REPOS=()
 ORACLE_DB=$HOME/.arra-oracle-v2/oracle.db
 SQLITE=$(command -v sqlite3 || echo /usr/bin/sqlite3)
 RETRO_ROOT=$HOME/.arra-oracle-v2/ψ/memory/retrospectives
@@ -74,7 +74,16 @@ load_roles() {
       ROLES+=("${role}|${session}|${repo_path}")
     done < <(jq -r '.windows[].name // empty' "$f" 2>/dev/null)
   done
-  log "loaded ${#ROLES[@]} roles: $(echo "${ROLES[@]}" | tr ' ' '\n' | cut -d'|' -f1 | tr '\n' ' ')"
+  REPOS=()
+  local seen_repo="" rp
+  for line in "${ROLES[@]}"; do
+    rp=$(echo "$line" | cut -d'|' -f3)
+    [ -z "$rp" ] && continue
+    case "|$seen_repo|" in *"|$rp|"*) continue ;; esac
+    seen_repo+="|$rp"
+    REPOS+=("$rp")
+  done
+  log "loaded ${#ROLES[@]} roles across ${#REPOS[@]} repos: $(echo "${ROLES[@]}" | tr ' ' '\n' | cut -d'|' -f1 | tr '\n' ' ')"
 }
 load_roles
 
