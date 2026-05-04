@@ -314,16 +314,24 @@ cmd_threads() {
     send_tg "<i>Oracle API unreachable at $ORACLE_API. Try <code>/status</code>.</i>"
     return
   fi
-  # Build sub→parent map from title convention. Orchestrator opens sub-threads
-  # with titles like "...(sub of #66)" — that's the canonical signal, more
-  # reliable than scanning prose for "sub-thread #N" mentions (the unified-
-  # proposal style aggregates with bare "#67" which the old regex missed).
+  # Build sub→parent map from title convention. Orchestrator has used two
+  # variants for tagging sub threads, both supported here:
+  #   "...(sub of #66)"       — original convention (#67, #68 era)
+  #   "...[for parent #69]"   — newer convention (#70, #71 era)
+  # Title-only because body-scan creates false positives: a sub's body often
+  # references its *parent* (e.g. "sibling to #66" or "parent #69"), and the
+  # body-scan regex can't distinguish parent-references from child-references,
+  # which previously rendered the parent as a "sub" of its own child.
   # Map shape: each line is "sub_id|parent_id".
   local sub_parent_map
   sub_parent_map=$(echo "$resp" | jq -r '
+    def parent_id:
+      (try (capture("\\(sub of #(?<p>[0-9]+)\\)") | .p) catch null)
+      // (try (capture("\\[for parent #(?<p>[0-9]+)\\]") | .p) catch null);
     .threads[]
     | . as $t
-    | (.title | capture("\\(sub of #(?<p>[0-9]+)\\)") | .p) as $parent
+    | ($t.title | parent_id) as $parent
+    | select($parent != null)
     | "\($t.id)|\($parent)"
   ' 2>/dev/null)
   # Resolve "is this id a sub" — used to skip subs in the top-level iteration.
@@ -358,18 +366,12 @@ cmd_threads() {
     title_short=$(echo "$title" | head -c 50 | html_escape)
     body="${body}${marker} #${id}  ${title_short}"$'\n'
     count=$((count + 1))
-    # Subs from the title-derived map (primary signal — "(sub of #N)").
+    # Subs from the title-derived map. Body-scan fallback removed in 2026-05-04
+    # fix: it produced false positives where a sub's body referenced its parent
+    # (the regex couldn't tell which direction the relationship went, and
+    # would render the parent as a sub of its own child).
     local sub_ids
     sub_ids=$(subs_of "$id")
-    # Body-scan fallback for older convention threads where orchestrator wrote
-    # "sub-thread #N" / "sub #N" / "thread #N" in prose without the title tag.
-    # Merge with the title-map result and dedupe.
-    local body_ids
-    body_ids=$(curl -sf "$ORACLE_API/thread/$id" 2>/dev/null \
-      | jq -r '.messages[]?.content // empty' 2>/dev/null \
-      | grep -oE '(sub-?thread|sub|thread) #[0-9]+' \
-      | grep -oE '[0-9]+')
-    sub_ids=$(printf '%s\n%s\n' "$sub_ids" "$body_ids" | grep -E '^[0-9]+$' | sort -un)
     for sid in $sub_ids; do
       [ "$sid" = "$id" ] && continue
       [ "$count" -ge 14 ] && break
