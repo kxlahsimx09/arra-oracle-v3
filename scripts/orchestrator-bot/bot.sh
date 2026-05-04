@@ -134,12 +134,13 @@ cmd_help() {
   send_tg "$(cat <<EOF
 <b>Orchestrator commands</b>
 
-<code>/threads</code> — list open parent threads (✓ = active)
+<code>/threads</code> — list open + closed threads (parent → sub hierarchy)
 <code>/use N</code>  — switch active thread to #N
 <code>/new</code>    — clear active, next message starts fresh request
 <code>/peek N</code> — preview last 3 messages of #N (no switch)
+<code>/read N</code> — publish full thread #N to Telegraph + send link
 <code>/close N</code> — mark #N closed
-<code>/cancel N</code> — request orchestrator to cancel sub-thread #N
+<code>/cancel N</code> — request orchestrator to cancel #N
 <code>/status</code> — active + pending sub-threads + watcher alerts
 <code>/escalations</code> — unresolved escalations across fleet
 <code>/cleanup</code> — one-tap fleet cleanup audit (orchestrator → brew-ops)
@@ -149,40 +150,199 @@ EOF
 )"
 }
 
+# Telegraph helper — get-or-create an access token, cached in env file.
+ensure_telegraph_token() {
+  if [ -n "${TELEGRAPH_TOKEN:-}" ]; then
+    echo "$TELEGRAPH_TOKEN"
+    return 0
+  fi
+  local resp
+  resp=$(curl -sf "https://api.telegra.ph/createAccount?short_name=orchestrator&author_name=orchestrator-bot&author_url=" 2>&1)
+  local token
+  token=$(echo "$resp" | jq -r '.result.access_token // empty' 2>/dev/null)
+  if [ -z "$token" ]; then
+    log "telegraph createAccount failed: $(echo "$resp" | head -c 200)"
+    return 1
+  fi
+  # Persist for next invocation
+  printf '\nTELEGRAPH_TOKEN=%s\n' "$token" >> "$ENV_FILE"
+  TELEGRAPH_TOKEN=$token
+  echo "$token"
+}
+
+# Publish $2 (markdown body) under $1 (title) to Telegraph; echo the URL.
+# Returns 1 on failure (caller should send_tg an error). Markdown is converted
+# to a flat list of paragraphs / headings / code blocks — Telegraph's DOM is
+# simpler than markdown so we lose nuance (no nested lists, no inline links
+# from raw URLs etc), but the result is readable for thread content review.
+publish_telegraph() {
+  local title="$1" body_md="$2"
+  local token
+  token=$(ensure_telegraph_token) || return 1
+  # Convert markdown body to Telegraph node array via jq.
+  # Strategy: split on blank lines (paragraph boundaries), then per chunk:
+  #   - starts with `# ` / `## ` / `### ` → h3 (Telegraph only supports h3/h4)
+  #   - starts with ```` ``` ```` → pre
+  #   - else → p
+  local nodes
+  nodes=$(printf '%s' "$body_md" | jq -Rs '
+    split("\n\n")
+    | map(
+        if startswith("```") then
+          { tag: "pre", children: [ ltrimstr("```") | rtrimstr("```") | ltrimstr("\n") | rtrimstr("\n") ] }
+        elif startswith("### ") then
+          { tag: "h4", children: [ ltrimstr("### ") ] }
+        elif startswith("## ") then
+          { tag: "h3", children: [ ltrimstr("## ") ] }
+        elif startswith("# ") then
+          { tag: "h3", children: [ ltrimstr("# ") ] }
+        elif . == "" or . == "\n" then empty
+        else
+          { tag: "p", children: [ . ] }
+        end
+      )
+  ')
+  local resp
+  resp=$(curl -sf -X POST "https://api.telegra.ph/createPage" \
+    --data-urlencode "access_token=$token" \
+    --data-urlencode "title=$(echo "$title" | head -c 200)" \
+    --data-urlencode "author_name=orchestrator" \
+    --data-urlencode "content=$nodes" 2>&1)
+  local url
+  url=$(echo "$resp" | jq -r '.result.url // empty' 2>/dev/null)
+  if [ -z "$url" ]; then
+    log "telegraph createPage failed: $(echo "$resp" | head -c 300)"
+    return 1
+  fi
+  echo "$url"
+}
+
+cmd_read() {
+  local n="$1"
+  if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+    send_tg "❌ <code>/read &lt;N&gt;</code> needs a thread id"
+    return
+  fi
+  local resp
+  resp=$(curl -sf "$ORACLE_API/forum/thread/$n" 2>/dev/null)
+  if ! echo "$resp" | jq -e '.thread' >/dev/null 2>&1; then
+    send_tg "❌ thread #$n not found"
+    return
+  fi
+  local title status count
+  title=$(echo "$resp" | jq -r '.thread.title // empty')
+  status=$(echo "$resp" | jq -r '.thread.status // empty')
+  count=$(echo "$resp" | jq -r '.thread.message_count // 0')
+  # Build markdown body — header + each message as h2 + content
+  local body
+  body=$(echo "$resp" | jq -r '
+    .messages[]
+    | "## msg #\(.id) — \(.author) — \(.timestamp)\n\n\(.content)\n\n---"
+  ')
+  local header
+  header="# Thread #$n: $title
+
+Status: **$status** · Messages: $count
+
+---
+
+"
+  local url
+  url=$(publish_telegraph "Thread #$n: $title" "$header$body") || {
+    send_tg "❌ telegraph publish failed (check $LOG_FILE for details)"
+    return
+  }
+  send_tg "📖 <b>Thread #$n</b> — $(echo "$title" | head -c 80 | html_escape)
+status: $status · $count message(s)
+🔗 $url"
+}
+
 cmd_threads() {
-  refresh_known_threads
   local active=$(get_active_thread)
-  if [ ! -s "$KNOWN_THREADS_FILE" ]; then
-    send_tg "<i>No threads yet. Send a request to start one.</i>"
+  # Query API directly so sub-threads (opened by orchestrator session, not
+  # via this bot) and closed threads both surface. The local known-threads
+  # cache is a fallback that only sees parents from this chat.
+  local resp
+  resp=$(curl -sf "$ORACLE_API/forum/threads?limit=30" 2>/dev/null)
+  if ! echo "$resp" | jq -e '.threads' >/dev/null 2>&1; then
+    send_tg "<i>Oracle API unreachable at $ORACLE_API. Try <code>/status</code>.</i>"
     return
   fi
-  local lines=()
-  while IFS='|' read -r id title status opened; do
-    [ -z "$id" ] && continue
-    [ "$status" = "closed" ] && continue
-    local marker="[ ]"
-    [ "$id" = "$active" ] && marker="[✓]"
-    local age=$(node -e "const o=new Date('$opened');const m=Math.floor((Date.now()-o)/60000);console.log(m<60?m+'m':m<1440?Math.floor(m/60)+'h':Math.floor(m/1440)+'d')" 2>/dev/null || echo "?")
-    lines+=("$(printf '%s #%-4s %-50s %s ago' "$marker" "$id" "$(echo "$title" | head -c 48 | html_escape)" "$age")")
-  done < "$KNOWN_THREADS_FILE"
-  if [ ${#lines[@]} -eq 0 ]; then
-    send_tg "<i>No open parent threads.</i>"
-    return
-  fi
+  # Two-pass display: parents first (titles not starting with "[from "),
+  # subs indented under each parent if the parent's last_message references
+  # the sub by id. Cap total output at 14 entries (Telegram message limits).
   local body=""
-  for l in "${lines[@]}"; do body="$body$l"$'\n'; done
-  send_tg "<b>Open parent threads:</b>
+  local count=0
+  while IFS='|' read -r id status title; do
+    [ -z "$id" ] && continue
+    [ "$count" -ge 14 ] && break
+    local marker
+    case "$status" in
+      closed)         marker="[×]" ;;
+      pending|active) marker="[ ]" ;;
+      answered)       marker="[~]" ;;
+      *)              marker="[?]" ;;
+    esac
+    [ "$id" = "$active" ] && marker="[✓]"
+    local title_short
+    title_short=$(echo "$title" | head -c 50 | html_escape)
+    body="${body}${marker} #${id}  ${title_short}"$'\n'
+    count=$((count + 1))
+    # Find sub-threads referenced in this parent's last_message (orchestrator's
+    # "📨 dispatched ... sub-thread #N" pattern). For each, indent under parent.
+    local last_msg
+    last_msg=$(echo "$resp" | jq -r ".threads[] | select(.id == $id) | .last_message // empty" 2>/dev/null)
+    local sub_ids
+    sub_ids=$(echo "$last_msg" | grep -oE '#[0-9]+' | tr -d '#' | sort -un)
+    for sid in $sub_ids; do
+      [ "$sid" = "$id" ] && continue
+      [ "$count" -ge 14 ] && break
+      local sub_status sub_title
+      sub_status=$(echo "$resp" | jq -r ".threads[] | select(.id == $sid) | .status // empty")
+      sub_title=$(echo "$resp" | jq -r ".threads[] | select(.id == $sid) | .title // empty" | head -c 50 | html_escape)
+      [ -z "$sub_status" ] && continue
+      local sub_marker
+      case "$sub_status" in
+        closed)         sub_marker="[×]" ;;
+        pending|active) sub_marker="[ ]" ;;
+        answered)       sub_marker="[~]" ;;
+        *)              sub_marker="[?]" ;;
+      esac
+      [ "$sid" = "$active" ] && sub_marker="[✓]"
+      body="${body}    └─ ${sub_marker} #${sid}  ${sub_title}"$'\n'
+      count=$((count + 1))
+    done
+  done < <(echo "$resp" | jq -r '
+    .threads[]
+    | select(.title | startswith("[from ") | not)
+    | "\(.id)|\(.status)|\(.title)"
+  ')
+  if [ -z "$body" ]; then
+    send_tg "<i>No threads found.</i>"
+    return
+  fi
+  send_tg "<b>Threads (recent):</b>
 <pre>$body</pre>
-Plain text continues the active thread. <code>/use N</code> to switch."
+[✓]=active  [ ]=open  [×]=closed  [~]=answered
+<code>/use N</code> switch · <code>/peek N</code> preview · <code>/read N</code> full · <code>/cancel N</code> close"
 }
 
 cmd_use() {
   local n="$1"
   if ! [[ "$n" =~ ^[0-9]+$ ]]; then send_tg "❌ <code>/use &lt;N&gt;</code> needs a thread id"; return; fi
-  if ! grep -q "^${n}|" "$KNOWN_THREADS_FILE"; then send_tg "❌ thread #$n not in known-threads. <code>/threads</code> to list."; return; fi
+  # Verify via API — local cache misses sub threads, want to allow /use any.
+  local resp title status
+  resp=$(curl -sf "$ORACLE_API/forum/thread/$n" 2>/dev/null)
+  title=$(echo "$resp" | jq -r '.thread.title // empty' 2>/dev/null)
+  status=$(echo "$resp" | jq -r '.thread.status // empty' 2>/dev/null)
+  if [ -z "$title" ]; then
+    send_tg "❌ thread #$n not found via API. <code>/threads</code> to list."
+    return
+  fi
   set_active_thread "$n"
-  local title=$(grep "^${n}|" "$KNOWN_THREADS_FILE" | head -1 | cut -d'|' -f2 | html_escape)
-  send_tg "✓ active → #$n ($title)"
+  local extra=""
+  [ "$status" = "closed" ] && extra=" — <i>note: thread is closed; messages may be ignored</i>"
+  send_tg "✓ active → #$n ($(echo "$title" | head -c 60 | html_escape))$extra"
 }
 
 cmd_new() {
@@ -336,6 +496,7 @@ handle_update() {
     /status)                  cmd_status ;;
     /escalations)             cmd_escalations ;;
     /cleanup)                 cmd_cleanup ;;
+    /read\ *)                 cmd_read "${text#/read }" ;;
     /*)                       send_tg "❓ unknown command. /help" ;;
     *)
       local active=$(get_active_thread)
