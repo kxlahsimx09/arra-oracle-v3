@@ -564,6 +564,11 @@ scan_inbox() {
       [ ! -f "$file" ] && verify_processing "$sf" "$file"
     done
   done
+
+  # Return clean — without this, the function inherits the exit code of the
+  # last test inside the inner loops and the run_loop's `|| log` branch fires
+  # every minute even when the scan succeeded.
+  return 0
 }
 
 run_loop() {

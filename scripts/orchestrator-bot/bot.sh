@@ -53,6 +53,13 @@ log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"; }
 
 html_escape() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
 
+# UTF-8-safe byte truncate. `head -c N` cuts at byte N which may land in the
+# middle of a multi-byte UTF-8 sequence; downstream tools (notably `tr` on
+# macOS BSD) then abort with "Illegal byte sequence" and the surrounding
+# command substitution returns garbage. Piping through `iconv -c` drops the
+# trailing partial sequence so the output is always valid UTF-8.
+utf8_head() { head -c "$1" | iconv -c -f UTF-8 -t UTF-8; }
+
 send_tg() {
   local text="$1"
   if [ ${#text} -gt 3900 ]; then text="${text:0:3850}
@@ -164,7 +171,7 @@ write_envelope() {
     echo "to_role: orchestrator"
     echo "type: consult"
     [ -n "$thread" ] && echo "thread: $thread"
-    echo "subject: $(echo "$text" | head -c 100 | tr '\n' ' ')"
+    echo "subject: $(echo "$text" | utf8_head 100 | tr '\n' ' ')"
     echo "needs_response: true"
     echo "priority: normal"
     echo "created: $(date -Iseconds)"
@@ -257,7 +264,7 @@ publish_telegraph() {
   local resp
   resp=$(curl -sf -X POST "https://api.telegra.ph/createPage" \
     --data-urlencode "access_token=$token" \
-    --data-urlencode "title=$(echo "$title" | head -c 200)" \
+    --data-urlencode "title=$(echo "$title" | utf8_head 200)" \
     --data-urlencode "author_name=orchestrator" \
     --data-urlencode "content=$nodes" 2>&1)
   local url
@@ -285,11 +292,10 @@ cmd_read() {
   title=$(echo "$resp" | jq -r '.thread.title // empty')
   status=$(echo "$resp" | jq -r '.thread.status // empty')
   count=$(echo "$resp" | jq -r '.thread.message_count // 0')
-  # Build markdown body — header + each message as h2 + content. Cap each
-  # message at TELEGRAPH_MAX_MSG_CHARS (default 6000) to stay under Telegraph's
-  # ~64KB createPage limit. A 12-msg thread × 6KB = 72KB headroom — generous.
-  # Oversized messages get a "[…truncated]" tail pointing to oracle UI.
+  # Per-message cap (drops mega-messages); page budget (Telegraph hard limit
+  # ~64KB → keep ≤ 50KB to leave headroom for HTML envelope + headers).
   local max_chars=${TELEGRAPH_MAX_MSG_CHARS:-6000}
+  local page_budget=${TELEGRAPH_PAGE_BUDGET:-50000}
   local body
   body=$(echo "$resp" | jq -r --argjson cap "$max_chars" --arg tid "$n" '
     .messages[]
@@ -299,24 +305,79 @@ cmd_read() {
           else .
           end
       ) as $c
-    | "## msg #\(.id) — \(.author) — \(.timestamp)\n\n\($c)\n\n---"
+    | "## msg #\(.id) — \(.author) — \(.timestamp)\n\n\($c)\n\n---\n"
   ')
-  local header
-  header="# Thread #$n: $title
+
+  # Chunk the body into pages at `## msg` boundaries. Each page accumulates
+  # blocks until adding the next one would exceed page_budget bytes, then
+  # flushes. Emits a sentinel between pages so bash can split them.
+  local chunked
+  chunked=$(printf '%s' "$body" | awk -v budget="$page_budget" '
+    /^## msg / {
+      if (length(buf) > 0 && length(buf) + length($0) > budget) {
+        printf "%s", buf
+        print "<<__PAGE_SPLIT__>>"
+        buf = ""
+      }
+    }
+    { buf = buf $0 "\n" }
+    END { if (length(buf) > 0) printf "%s", buf }
+  ')
+
+  local pages=() cur=""
+  while IFS= read -r line; do
+    if [ "$line" = "<<__PAGE_SPLIT__>>" ]; then
+      pages+=("$cur")
+      cur=""
+    else
+      cur="$cur$line"$'\n'
+    fi
+  done <<< "$chunked"
+  [ -n "$cur" ] && pages+=("$cur")
+
+  local total=${#pages[@]}
+  [ "$total" -eq 0 ] && { send_tg "❌ thread #$n has no readable content"; return; }
+
+  local urls=() k part_num part_title part_body url
+  for k in $(seq 0 $((total - 1))); do
+    part_num=$((k + 1))
+    if [ "$total" -gt 1 ]; then
+      part_title="Thread #$n — Part $part_num/$total: $title"
+      part_body="# Thread #$n — Part $part_num of $total
+
+$([ "$k" -eq 0 ] && printf '%s' "Status: **$status** · Messages: $count
+
+---
+")
+${pages[$k]}"
+    else
+      part_title="Thread #$n: $title"
+      part_body="# Thread #$n: $title
 
 Status: **$status** · Messages: $count
 
 ---
 
-"
-  local url
-  url=$(publish_telegraph "Thread #$n: $title" "$header$body") || {
-    send_tg "❌ telegraph publish failed (check $LOG_FILE for details)"
-    return
-  }
-  send_tg "📖 <b>Thread #$n</b> — $(echo "$title" | head -c 80 | html_escape)
-status: $status · $count message(s)
-🔗 $url"
+${pages[$k]}"
+    fi
+    url=$(publish_telegraph "$part_title" "$part_body") || {
+      send_tg "❌ telegraph publish failed at part $part_num/$total (check $LOG_FILE)"
+      return
+    }
+    urls+=("$url")
+  done
+
+  local links="" k_link
+  if [ "$total" -eq 1 ]; then
+    links="🔗 ${urls[0]}"
+  else
+    for k_link in $(seq 0 $((total - 1))); do
+      links="${links}🔗 Part $((k_link + 1))/$total: ${urls[$k_link]}"$'\n'
+    done
+  fi
+  send_tg "📖 <b>Thread #$n</b> — $(echo "$title" | utf8_head 80 | html_escape)
+status: $status · $count message(s) · $total page(s)
+$links"
 }
 
 cmd_threads() {
@@ -379,7 +440,7 @@ cmd_threads() {
     esac
     [ "$id" = "$active" ] && marker="[✓]"
     local title_short
-    title_short=$(echo "$title" | head -c 50 | html_escape)
+    title_short=$(echo "$title" | utf8_head 50 | html_escape)
     body="${body}${marker} #${id}  ${title_short}"$'\n'
     count=$((count + 1))
     # Subs from the title-derived map. Body-scan fallback removed in 2026-05-04
@@ -393,7 +454,7 @@ cmd_threads() {
       [ "$count" -ge 14 ] && break
       local sub_status sub_title
       sub_status=$(echo "$resp" | jq -r ".threads[] | select(.id == $sid) | .status // empty")
-      sub_title=$(echo "$resp" | jq -r ".threads[] | select(.id == $sid) | .title // empty" | head -c 50 | html_escape)
+      sub_title=$(echo "$resp" | jq -r ".threads[] | select(.id == $sid) | .title // empty" | utf8_head 50 | html_escape)
       [ -z "$sub_status" ] && continue
       local sub_marker
       case "$sub_status" in
@@ -436,7 +497,7 @@ cmd_use() {
   set_active_thread "$n"
   local extra=""
   [ "$status" = "closed" ] && extra=" — <i>note: thread is closed; messages may be ignored</i>"
-  send_tg "✓ active → #$n ($(echo "$title" | head -c 60 | html_escape))$extra"
+  send_tg "✓ active → #$n ($(echo "$title" | utf8_head 60 | html_escape))$extra"
 }
 
 cmd_new() {
@@ -459,7 +520,16 @@ cmd_peek() {
 cmd_close() {
   local n="$1"
   if ! [[ "$n" =~ ^[0-9]+$ ]]; then send_tg "❌ <code>/close &lt;N&gt;</code> needs a thread id"; return; fi
-  # Write a "close" envelope — orchestrator finalizes + posts closing message + status=closed
+  # Mark the thread closed via the API immediately, so /close has effect even
+  # when the orchestrator agent is down or stuck. The envelope below is then
+  # advisory: a healthy orchestrator wakes and posts the closing summary; an
+  # unhealthy one no-ops on a closed thread per Step 0 closed-thread guard.
+  local api_resp api_status
+  api_resp=$(curl -s -m 5 -X PATCH "$ORACLE_API/thread/$n/status" \
+    -H 'Content-Type: application/json' \
+    -d '{"status":"closed"}' 2>&1)
+  api_status=$(echo "$api_resp" | jq -r '.status // empty' 2>/dev/null)
+
   local ts=$(date '+%Y-%m-%d_%H-%M-%S')
   local path="$INBOX_DIR/${ts}_from-user_thread-${n}_close.md"
   {
@@ -478,8 +548,13 @@ cmd_close() {
     echo
     echo "User ratified close of thread #$n via Telegram."
   } > "$path"
-  log "wrote close envelope for thread $n"
-  send_tg "📨 close request sent for #$n. Orchestrator will post a closing summary + mark closed."
+  log "close: api_status=$api_status; wrote envelope for thread $n"
+
+  if [ "$api_status" = "closed" ]; then
+    send_tg "✓ thread #$n marked <b>closed</b> (API). Orchestrator will post a closing summary on next wake."
+  else
+    send_tg "⚠ thread #$n close: API call did not confirm (got: $(echo "$api_resp" | head -c 120 | html_escape)). Envelope still written; orchestrator will retry."
+  fi
 }
 
 cmd_cancel() {
