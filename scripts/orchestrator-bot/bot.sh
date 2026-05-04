@@ -86,7 +86,7 @@ refresh_known_threads() {
   : > "$tmp"
   while IFS='|' read -r id title old_status opened; do
     [ -z "$id" ] && continue
-    local cur=$(curl -sf "$ORACLE_API/forum/thread/$id" 2>/dev/null | jq -r '.thread.status // empty' 2>/dev/null)
+    local cur=$(curl -sf "$ORACLE_API/thread/$id" 2>/dev/null | jq -r '.thread.status // empty' 2>/dev/null)
     [ -z "$cur" ] && cur="$old_status"
     printf '%s|%s|%s|%s\n' "$id" "$title" "$cur" "$opened" >> "$tmp"
   done < "$KNOWN_THREADS_FILE"
@@ -224,7 +224,7 @@ cmd_read() {
     return
   fi
   local resp
-  resp=$(curl -sf "$ORACLE_API/forum/thread/$n" 2>/dev/null)
+  resp=$(curl -sf "$ORACLE_API/thread/$n" 2>/dev/null)
   if ! echo "$resp" | jq -e '.thread' >/dev/null 2>&1; then
     send_tg "❌ thread #$n not found"
     return
@@ -263,7 +263,7 @@ cmd_threads() {
   # via this bot) and closed threads both surface. The local known-threads
   # cache is a fallback that only sees parents from this chat.
   local resp
-  resp=$(curl -sf "$ORACLE_API/forum/threads?limit=30" 2>/dev/null)
+  resp=$(curl -sf "$ORACLE_API/threads?limit=30" 2>/dev/null)
   if ! echo "$resp" | jq -e '.threads' >/dev/null 2>&1; then
     send_tg "<i>Oracle API unreachable at $ORACLE_API. Try <code>/status</code>.</i>"
     return
@@ -332,7 +332,7 @@ cmd_use() {
   if ! [[ "$n" =~ ^[0-9]+$ ]]; then send_tg "❌ <code>/use &lt;N&gt;</code> needs a thread id"; return; fi
   # Verify via API — local cache misses sub threads, want to allow /use any.
   local resp title status
-  resp=$(curl -sf "$ORACLE_API/forum/thread/$n" 2>/dev/null)
+  resp=$(curl -sf "$ORACLE_API/thread/$n" 2>/dev/null)
   title=$(echo "$resp" | jq -r '.thread.title // empty' 2>/dev/null)
   status=$(echo "$resp" | jq -r '.thread.status // empty' 2>/dev/null)
   if [ -z "$title" ]; then
@@ -353,7 +353,7 @@ cmd_new() {
 cmd_peek() {
   local n="$1"
   if ! [[ "$n" =~ ^[0-9]+$ ]]; then send_tg "❌ <code>/peek &lt;N&gt;</code> needs a thread id"; return; fi
-  local resp=$(curl -sf "$ORACLE_API/forum/thread/$n" 2>/dev/null)
+  local resp=$(curl -sf "$ORACLE_API/thread/$n" 2>/dev/null)
   local count=$(echo "$resp" | jq -r '.thread.message_count // 0' 2>/dev/null)
   [ "$count" = "0" ] && { send_tg "❌ thread #$n empty or not found"; return; }
   local title=$(echo "$resp" | jq -r '.thread.title' 2>/dev/null | html_escape)
