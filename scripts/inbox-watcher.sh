@@ -136,6 +136,53 @@ jsonl_has_prompt() {
   grep -qF "inbox: $fname" "$jsonl" 2>/dev/null
 }
 
+# Phase 7 — cancel envelope detection. A cancel envelope is one whose
+# filename ends in `_cancel.md` OR whose frontmatter sets `user_action:
+# cancel`. The bot's /cancel command produces both signals. Cancel
+# envelopes get priority handling in fire_wake — see preempt_claude_at.
+is_cancel_envelope() {
+  local file=$1
+  [[ "$(basename "$file")" == *_cancel.md ]] && return 0
+  grep -q '^user_action: *cancel' "$file" 2>/dev/null && return 0
+  return 1
+}
+
+# Phase 7 — list claude pids whose cwd matches wt. Used by claude_alive_at
+# (single-pid lookup) and preempt_claude_at (kill all).
+claude_pids_at() {
+  local wt=$1
+  [ -z "$wt" ] && return
+  pgrep -f "claude " 2>/dev/null | while read -r pid; do
+    local pcwd
+    pcwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    [ "$pcwd" = "$wt" ] && echo "$pid"
+  done
+}
+
+# Phase 7 — pre-empt all claude processes at wt (used when a cancel
+# envelope races with an active wake on the same thread). TERM first,
+# then KILL stragglers after a brief grace period. Logs each kill so an
+# operator can see what was reaped.
+preempt_claude_at() {
+  local wt=$1
+  [ -z "$wt" ] && return 0
+  local pids
+  pids=$(claude_pids_at "$wt")
+  [ -z "$pids" ] && return 0
+
+  for pid in $pids; do
+    if kill -TERM "$pid" 2>/dev/null; then
+      log "  TERM pid=$pid (cwd=$wt)"
+    fi
+  done
+  sleep 2
+  for pid in $pids; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null && log "  KILL pid=$pid (still alive after TERM)"
+    fi
+  done
+}
+
 # Path 1 helpers — find a prior wt_path that handled a given thread for an
 # oracle. Reads the most-recent state file for that (oracle, thread) tuple
 # (whether `completed` or terminal-success) — its wt_path is the candidate
@@ -226,13 +273,44 @@ fire_wake() {
   wt_suffix=inbox-$wake_ts
   sf=$(state_path "$oracle" "$fname")
 
+  # Phase 7 — cancel pre-emption. Cancel envelopes are priority-1: if
+  # there's an active claude in a prior worktree for the same thread, kill
+  # it before firing the cancel handler. Without this, the cancel races
+  # against the work being cancelled, and the active wake can complete a
+  # destructive dispatch (e.g. write envelope to brew-ops) seconds before
+  # the cancel handler even reads its own envelope. Observed live
+  # 2026-05-04 10:48: continuation envelope for thread #63 fired into
+  # wt-8, dispatched sub-thread #65 to brew-ops, then user cancel arrived
+  # — by the time wt-16 (cancel handler) closed #63, the dispatch envelope
+  # for brew-ops had already been picked up by the inbox-watcher and was
+  # processed in wt-17. Pre-empting wt-8 the moment the cancel envelope
+  # lands prevents the dispatch from going out in the first place.
+  #
+  # Cancel envelopes deliberately do NOT take the Path 1 --resume route
+  # below: the cancel handler runs on a fresh wake (no prior context
+  # needed — it just closes the thread and archives) so the prior session
+  # being killed here doesn't matter.
+  if [ -n "$thread_id" ] && is_cancel_envelope "$file"; then
+    local cancel_prior_wt
+    cancel_prior_wt=$(find_prior_wt_for_thread "$oracle" "$thread_id")
+    if [ -n "$cancel_prior_wt" ] && [ -d "$cancel_prior_wt" ] \
+       && [ -n "$(claude_pids_at "$cancel_prior_wt")" ]; then
+      log "[$oracle] CANCEL PRE-EMPT — terminating claude(s) at $cancel_prior_wt for thread $thread_id"
+      preempt_claude_at "$cancel_prior_wt"
+    fi
+  fi
+
   # Path 1 — worktree reuse via maw --resume. If we already have a
   # session-id mapped for this (oracle, thread) AND no claude is currently
   # alive in the worktree that birthed it, resume that session in the SAME
   # worktree instead of spawning a fresh one. Drives worktree count toward
   # (oracle × thread) pairs rather than total wakes. Falls back to --fresh
   # silently if any precondition is missing.
-  if [ -n "$thread_id" ]; then
+  #
+  # Skipped for cancel envelopes (handled above): cancel handler runs on
+  # a fresh wake; prior session was just killed so resume would fail
+  # anyway and the cancel doesn't need that context.
+  if [ -n "$thread_id" ] && ! is_cancel_envelope "$file"; then
     sid_file="$STATE_DIR/sessions/$oracle/thread-$thread_id.session-id"
     if [ -f "$sid_file" ]; then
       prior_sid=$(cat "$sid_file")
