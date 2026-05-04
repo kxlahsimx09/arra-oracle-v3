@@ -770,24 +770,24 @@ run_loop() {
   done
 }
 
-# Same shape as inbox-watcher's find_other_daemons. PID_FILE alone is
-# insufficient: if INT/TERM handler removed it but the process didn't
-# actually exit (e.g. signal arrived during a long curl getUpdates and
-# the trap fired before bash could unwind the loop), the next `start`
-# spawned a duplicate. Two bots compete for Telegram getUpdates offsets
-# and lose messages.
+# PID_FILE alone is insufficient: INT/TERM handler can remove the file
+# before bash actually unwinds the loop (signal during long curl
+# getUpdates), leaving an orphan whose next `start` spawns a duplicate.
+# Two bots compete for Telegram getUpdates offsets and lose messages.
+#
+# Match key is "<parent-dir-basename>/<script-basename>" — e.g.
+# "orchestrator-bot/bot.sh" — NOT just "bot.sh", because brew-ops-bot/
+# uses the same filenames and a basename-only match would cross-kill
+# brew-ops daemons during this script's stop.
 find_other_daemons() {
-  local base=$(basename "$0")
-  local p cmd out=""
-  for p in $(pgrep -f "$base" 2>/dev/null); do
+  local key=$(basename "$(dirname "$0")")/$(basename "$0")
+  local p cmd ppid out=""
+  for p in $(pgrep -f "$key" 2>/dev/null); do
     [ "$p" = "$$" ] && continue
-    # Skip subshell children of THIS process (curl in run_loop spawns one).
-    local ppid=$(ps -p "$p" -o ppid= 2>/dev/null | tr -d ' ')
+    ppid=$(ps -p "$p" -o ppid= 2>/dev/null | tr -d ' ')
     [ "$ppid" = "$$" ] && continue
     cmd=$(ps -p "$p" -o command= 2>/dev/null)
-    case "$cmd" in
-      bash" "*"$base"*|*/bash" "*"$base"*) out="$out $p" ;;
-    esac
+    case "$cmd" in *"$key"*) out="$out $p" ;; esac
   done
   echo "${out# }"
 }
