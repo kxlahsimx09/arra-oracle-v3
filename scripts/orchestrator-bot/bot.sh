@@ -93,12 +93,15 @@ refresh_known_threads() {
   mv "$tmp" "$KNOWN_THREADS_FILE"
 }
 
-# Write a request envelope (plain-text dispatch from user)
+# Write a request envelope (plain-text dispatch from user).
+# When `thread` is set (active-thread sticky after /use N), the user's message
+# is ON that thread (not a parent of it) — write `thread: N` so the inbox-
+# watcher can match thread-N session-id mapping for Path 1 worktree-reuse.
 write_envelope() {
-  local text="$1" parent_thread="$2"
+  local text="$1" thread="$2"
   local ts=$(date '+%Y-%m-%d_%H-%M')
   local fname="${ts}_from-user_request"
-  [ -n "$parent_thread" ] && fname="${ts}_from-user_thread-${parent_thread}_continuation"
+  [ -n "$thread" ] && fname="${ts}_from-user_thread-${thread}_continuation"
   fname="${fname}.md"
   local path="$INBOX_DIR/$fname"
 
@@ -109,8 +112,7 @@ write_envelope() {
     echo "to: orchestrator"
     echo "to_role: orchestrator"
     echo "type: consult"
-    [ -n "$parent_thread" ] && echo "parent_thread: $parent_thread"
-    [ -n "$parent_thread" ] && echo "parent_oracle: orchestrator"
+    [ -n "$thread" ] && echo "thread: $thread"
     echo "subject: $(echo "$text" | head -c 100 | tr '\n' ' ')"
     echo "needs_response: true"
     echo "priority: normal"
@@ -122,7 +124,7 @@ write_envelope() {
     echo
     echo "$text"
   } > "$path"
-  log "wrote envelope: $fname (parent=${parent_thread:-none})"
+  log "wrote envelope: $fname (thread=${thread:-none})"
   echo "$path"
 }
 
