@@ -149,24 +149,58 @@ run_loop() {
   done
 }
 
+# Same shape as bot.sh / inbox-watcher: defend against orphan instances
+# whose pidfile got cleaned but whose process is still tailing JSONLs.
+# Two chat-watchers would push every assistant turn to Telegram twice.
+find_other_daemons() {
+  local base=$(basename "$0")
+  local p cmd ppid out=""
+  for p in $(pgrep -f "$base" 2>/dev/null); do
+    [ "$p" = "$$" ] && continue
+    ppid=$(ps -p "$p" -o ppid= 2>/dev/null | tr -d ' ')
+    [ "$ppid" = "$$" ] && continue
+    cmd=$(ps -p "$p" -o command= 2>/dev/null)
+    case "$cmd" in
+      bash" "*"$base"*|*/bash" "*"$base"*) out="$out $p" ;;
+    esac
+  done
+  echo "${out# }"
+}
+
 case ${1:-loop} in
   loop|start)
+    others=$(find_other_daemons)
+    if [ -n "$others" ]; then
+      echo "another $(basename "$0") is already running (pid=$others)" >&2
+      exit 1
+    fi
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
       echo "already running: $(cat "$PID_FILE")" >&2
       exit 1
     fi
     echo $$ > "$PID_FILE"
+    trap 'rm -f "$PID_FILE"' EXIT
     trap 'rm -f "$PID_FILE"; exit 0' INT TERM
     run_loop
     ;;
   stop)
-    if [ -f "$PID_FILE" ]; then
-      p=$(cat "$PID_FILE")
-      kill -TERM "$p" 2>/dev/null && echo "stopped pid=$p" || echo "kill failed"
-      rm -f "$PID_FILE"
-    else
+    others=$(find_other_daemons)
+    [ -f "$PID_FILE" ] && others="$others $(cat "$PID_FILE" 2>/dev/null)"
+    others=$(printf '%s\n' $others | awk 'NF && !seen[$0]++' | tr '\n' ' ')
+    if [ -z "${others// /}" ]; then
       echo "not running"
+      rm -f "$PID_FILE"
+      exit 0
     fi
+    for p in $others; do
+      [ -z "$p" ] && continue
+      if kill -TERM "$p" 2>/dev/null; then
+        echo "stopped pid=$p"
+      else
+        echo "kill $p failed (process gone?)" >&2
+      fi
+    done
+    rm -f "$PID_FILE"
     ;;
   status)
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then

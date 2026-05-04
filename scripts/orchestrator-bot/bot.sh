@@ -770,25 +770,64 @@ run_loop() {
   done
 }
 
+# Same shape as inbox-watcher's find_other_daemons. PID_FILE alone is
+# insufficient: if INT/TERM handler removed it but the process didn't
+# actually exit (e.g. signal arrived during a long curl getUpdates and
+# the trap fired before bash could unwind the loop), the next `start`
+# spawned a duplicate. Two bots compete for Telegram getUpdates offsets
+# and lose messages.
+find_other_daemons() {
+  local base=$(basename "$0")
+  local p cmd out=""
+  for p in $(pgrep -f "$base" 2>/dev/null); do
+    [ "$p" = "$$" ] && continue
+    # Skip subshell children of THIS process (curl in run_loop spawns one).
+    local ppid=$(ps -p "$p" -o ppid= 2>/dev/null | tr -d ' ')
+    [ "$ppid" = "$$" ] && continue
+    cmd=$(ps -p "$p" -o command= 2>/dev/null)
+    case "$cmd" in
+      bash" "*"$base"*|*/bash" "*"$base"*) out="$out $p" ;;
+    esac
+  done
+  echo "${out# }"
+}
+
 case ${1:-loop} in
   loop|start)
+    others=$(find_other_daemons)
+    if [ -n "$others" ]; then
+      echo "another $(basename "$0") is already running (pid=$others)" >&2
+      echo "stop it first: $0 stop  (or: kill $others)" >&2
+      exit 1
+    fi
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
       echo "already running: $(cat "$PID_FILE")" >&2
       exit 1
     fi
     echo $$ > "$PID_FILE"
+    trap 'rm -f "$PID_FILE"' EXIT
     trap 'rm -f "$PID_FILE"; exit 0' INT TERM
     run_loop
     ;;
   stop)
     # `local` is invalid outside a function and aborts under `set -u`; drop it.
-    if [ -f "$PID_FILE" ]; then
-      p=$(cat "$PID_FILE")
-      kill -TERM "$p" 2>/dev/null && echo "stopped pid=$p" || echo "kill failed"
-      rm -f "$PID_FILE"
-    else
+    others=$(find_other_daemons)
+    [ -f "$PID_FILE" ] && others="$others $(cat "$PID_FILE" 2>/dev/null)"
+    others=$(printf '%s\n' $others | awk 'NF && !seen[$0]++' | tr '\n' ' ')
+    if [ -z "${others// /}" ]; then
       echo "not running"
+      rm -f "$PID_FILE"
+      exit 0
     fi
+    for p in $others; do
+      [ -z "$p" ] && continue
+      if kill -TERM "$p" 2>/dev/null; then
+        echo "stopped pid=$p"
+      else
+        echo "kill $p failed (process gone?)" >&2
+      fi
+    done
+    rm -f "$PID_FILE"
     ;;
   status)
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
