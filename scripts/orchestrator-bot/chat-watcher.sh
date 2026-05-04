@@ -149,20 +149,22 @@ run_loop() {
   done
 }
 
-# Same shape as bot.sh / inbox-watcher: defend against orphan instances
-# whose pidfile got cleaned but whose process is still tailing JSONLs.
-# Two chat-watchers would push every assistant turn to Telegram twice.
+# Defend against orphan instances whose pidfile got cleaned but whose
+# process is still tailing JSONLs. Two chat-watchers would push every
+# assistant turn to Telegram twice.
+#
+# Match key is "<parent-dir-basename>/<script-basename>" — NOT just
+# "chat-watcher.sh", because brew-ops-bot/ has a chat-watcher.sh too
+# and a basename-only match would cross-kill brew-ops daemons.
 find_other_daemons() {
-  local base=$(basename "$0")
+  local key=$(basename "$(dirname "$0")")/$(basename "$0")
   local p cmd ppid out=""
-  for p in $(pgrep -f "$base" 2>/dev/null); do
+  for p in $(pgrep -f "$key" 2>/dev/null); do
     [ "$p" = "$$" ] && continue
     ppid=$(ps -p "$p" -o ppid= 2>/dev/null | tr -d ' ')
     [ "$ppid" = "$$" ] && continue
     cmd=$(ps -p "$p" -o command= 2>/dev/null)
-    case "$cmd" in
-      bash" "*"$base"*|*/bash" "*"$base"*) out="$out $p" ;;
-    esac
+    case "$cmd" in *"$key"*) out="$out $p" ;; esac
   done
   echo "${out# }"
 }
