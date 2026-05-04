@@ -314,14 +314,38 @@ cmd_threads() {
     send_tg "<i>Oracle API unreachable at $ORACLE_API. Try <code>/status</code>.</i>"
     return
   fi
-  # Two-pass display: parents first (titles not starting with "[from "),
-  # subs indented under each parent if the parent's last_message references
-  # the sub by id. Cap total output at 14 entries (Telegram message limits).
+  # Build sub→parent map from title convention. Orchestrator opens sub-threads
+  # with titles like "...(sub of #66)" — that's the canonical signal, more
+  # reliable than scanning prose for "sub-thread #N" mentions (the unified-
+  # proposal style aggregates with bare "#67" which the old regex missed).
+  # Map shape: each line is "sub_id|parent_id".
+  local sub_parent_map
+  sub_parent_map=$(echo "$resp" | jq -r '
+    .threads[]
+    | . as $t
+    | (.title | capture("\\(sub of #(?<p>[0-9]+)\\)") | .p) as $parent
+    | "\($t.id)|\($parent)"
+  ' 2>/dev/null)
+  # Resolve "is this id a sub" — used to skip subs in the top-level iteration.
+  is_sub() {
+    local id="$1"
+    echo "$sub_parent_map" | awk -F'|' -v id="$id" '$1 == id { print; exit }' | grep -q .
+  }
+  # Resolve subs of a parent — used to list children under each parent header.
+  subs_of() {
+    local pid="$1"
+    echo "$sub_parent_map" | awk -F'|' -v pid="$pid" '$2 == pid { print $1 }'
+  }
+
+  # Two-pass display: parents first (titles not starting with "[from " AND
+  # not themselves a sub), subs indented under their parent. Cap total output
+  # at 14 entries (Telegram message limits).
   local body=""
   local count=0
   while IFS='|' read -r id status title; do
     [ -z "$id" ] && continue
     [ "$count" -ge 14 ] && break
+    is_sub "$id" && continue   # subs render under their parent below
     local marker
     case "$status" in
       closed)         marker="[×]" ;;
@@ -334,17 +358,18 @@ cmd_threads() {
     title_short=$(echo "$title" | head -c 50 | html_escape)
     body="${body}${marker} #${id}  ${title_short}"$'\n'
     count=$((count + 1))
-    # Find sub-threads referenced ANYWHERE in this parent's messages. Earlier
-    # versions only scanned `last_message` and missed older subs (e.g. #64
-    # opened by msg 130 was hidden once msg 144 dispatched #65 and became
-    # the new last_message). Now we fetch the full thread once per parent
-    # and grep every message for "sub-thread #N", "sub #N", or "thread #N".
-    local thread_full sub_ids
-    thread_full=$(curl -sf "$ORACLE_API/thread/$id" 2>/dev/null)
-    sub_ids=$(echo "$thread_full" | jq -r '.messages[]?.content // empty' 2>/dev/null \
+    # Subs from the title-derived map (primary signal — "(sub of #N)").
+    local sub_ids
+    sub_ids=$(subs_of "$id")
+    # Body-scan fallback for older convention threads where orchestrator wrote
+    # "sub-thread #N" / "sub #N" / "thread #N" in prose without the title tag.
+    # Merge with the title-map result and dedupe.
+    local body_ids
+    body_ids=$(curl -sf "$ORACLE_API/thread/$id" 2>/dev/null \
+      | jq -r '.messages[]?.content // empty' 2>/dev/null \
       | grep -oE '(sub-?thread|sub|thread) #[0-9]+' \
-      | grep -oE '[0-9]+' \
-      | sort -un)
+      | grep -oE '[0-9]+')
+    sub_ids=$(printf '%s\n%s\n' "$sub_ids" "$body_ids" | grep -E '^[0-9]+$' | sort -un)
     for sid in $sub_ids; do
       [ "$sid" = "$id" ] && continue
       [ "$count" -ge 14 ] && break
