@@ -63,48 +63,26 @@ send_tg() {
     --data-urlencode "text=$text" -o /dev/null 2>/dev/null
 }
 
-# ── Telegraph publishing ───────────────────────────────────────────────────
-# Long messages get a sidecar telegra.ph page so they're readable on mobile
-# (markdown tables, multi-column blocks, long code dumps). Telegram message
-# carries a short preview + link to the full page.
+# ── Gist publishing ────────────────────────────────────────────────────────
+# Long messages get a sidecar secret Gist so markdown tables, code fences,
+# and long code dumps render properly on mobile. Telegram message carries a
+# short preview + link to the gist. Replaces an earlier telegra.ph path that
+# bucketed everything into a single <pre> node — Telegraph's narrow column
+# + pre-wrap squashed wide tables; GitHub renders Markdown tables natively.
 
-TELEGRAPH_TOKEN_FILE=$STATE_DIR/telegraph-token
-TELEGRAPH_THRESHOLD=${TELEGRAPH_THRESHOLD:-1500}
+GIST_THRESHOLD=${GIST_THRESHOLD:-1500}
 
-telegraph_token() {
-  if [ -s "$TELEGRAPH_TOKEN_FILE" ]; then
-    cat "$TELEGRAPH_TOKEN_FILE"
-    return
-  fi
-  local resp tok
-  resp=$(curl -sf "https://api.telegra.ph/createAccount?short_name=brew-ops-bot&author_name=brew-ops" 2>/dev/null)
-  tok=$(echo "$resp" | jq -r '.result.access_token // empty' 2>/dev/null)
-  if [ -n "$tok" ]; then
-    echo "$tok" > "$TELEGRAPH_TOKEN_FILE"
-    chmod 600 "$TELEGRAPH_TOKEN_FILE"
-    echo "$tok"
-  fi
-}
-
-# Publish text as a Telegraph page, echo URL on success, "" on failure.
-# Wraps the content in a <pre> node so whitespace/tables/code are preserved.
-telegraph_publish() {
+# Publish text as a secret Gist; echo URL on success, "" on failure.
+# Saved as .md so GitHub renders tables, fenced code, headings, etc.
+gist_publish() {
   local title="$1" text="$2"
-  local tok; tok=$(telegraph_token)
-  [ -z "$tok" ] && return 1
-  # Telegraph content schema: array of nodes. We use one <pre> node holding
-  # the whole text — simple and preserves layout. Could split by \n\n into
-  # <p> nodes for prose flow, but tables/code break under that.
-  local content
-  content=$(jq -nc --arg t "$text" '[{tag: "pre", children: [$t]}]') || return 1
-  local resp
-  resp=$(curl -sf "https://api.telegra.ph/createPage" \
-    --data-urlencode "access_token=$tok" \
-    --data-urlencode "title=$title" \
-    --data-urlencode "author_name=brew-ops-bot" \
-    --data-urlencode "content=$content" \
-    --data-urlencode "return_content=false" 2>/dev/null)
-  echo "$resp" | jq -r '.result.url // empty' 2>/dev/null
+  command -v gh >/dev/null 2>&1 || return 1
+  local safe; safe=$(echo "$title" | tr '/ ' '__' | tr -cd 'A-Za-z0-9._-')
+  [ -z "$safe" ] && safe="brew-ops"
+  local out url
+  out=$(printf '%s' "$text" | gh gist create --filename "${safe}.md" --desc "$title" - 2>/dev/null)
+  url=$(echo "$out" | grep -Eo 'https://gist\.github\.com/[^[:space:]]+' | tail -1)
+  [ -n "$url" ] && echo "$url"
 }
 
 # Reverse-lookup alias for a chat_id (role/slug → alias name)
@@ -117,28 +95,27 @@ chat_alias_label() {
 }
 
 # Push an assistant text turn to Telegram. Decides:
-#   short (< $TELEGRAPH_THRESHOLD chars) → inline <pre> in Telegram
-#   long → telegraph page + Telegram preview with "📖 read full" link
+#   short (< $GIST_THRESHOLD chars) → inline <pre> in Telegram
+#   long → secret gist + Telegram preview with "📖 read full" link
 push_turn() {
   local text="$1" chat_id="$2"
   local alias_label; alias_label=$(chat_alias_label "$chat_id")
   local header="🔔 <b>${chat_id}${alias_label}</b>"
   local len=${#text}
-  if [ "$len" -lt "$TELEGRAPH_THRESHOLD" ]; then
+  if [ "$len" -lt "$GIST_THRESHOLD" ]; then
     send_tg "${header}:
 <pre>$(echo "$text" | html_escape)</pre>"
     return
   fi
-  # Long: try telegraph
   local title="${chat_id}${alias_label} — $(date '+%Y-%m-%d %H:%M')"
   local url
-  url=$(telegraph_publish "$title" "$text")
+  url=$(gist_publish "$title" "$text")
   if [ -n "$url" ]; then
     local preview; preview="${text:0:800}"
     send_tg "${header} (${len} chars):
 <pre>$(echo "$preview" | html_escape)</pre>
 …
-📖 <a href=\"$url\">read full on web</a>"
+📖 <a href=\"$url\">read full on gist</a>"
   else
     send_tg "${header}:
 <pre>$(echo "$text" | html_escape)</pre>"
