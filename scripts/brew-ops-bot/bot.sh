@@ -886,6 +886,13 @@ cmd_close() {
   audit "/close $target ($pane)"
   stop_watcher_for "$target"
   tmux kill-pane -t "$pane" 2>/dev/null
+  # Drop any aliases pointing at the closed chat so they don't dangle.
+  # Derive canonical role/slug: expand alias (if $target was one) for the
+  # role half, take field 5 of the resolved pane line for the slug.
+  local _expanded="$target" _via
+  _via=$(resolve_alias "$target"); [ -n "$_via" ] && _expanded="$_via"
+  local _canon_chat="${_expanded%%/*}/$(echo "$resolved" | cut -d'|' -f5)"
+  remove_aliases_for_chat "$_canon_chat"
   # If we just killed the active chat, clear active state
   # (resolve_chat may have prefix-matched, so compare resolved target)
   local resolved_target="$target"
