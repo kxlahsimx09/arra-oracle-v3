@@ -97,6 +97,9 @@ html_escape() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
 
 send_tg() {
   local text="$1" markup="${2:-}"
+  # Last-resort truncation. Callers wrapping content in HTML tags should
+  # truncate the *inner* text themselves before wrapping (see cmd_look) —
+  # blind cut here may drop the closing tag and Telegram will 400 us.
   if [ ${#text} -gt 3900 ]; then text="${text:0:3850}
 
 […truncated]"; fi
@@ -106,10 +109,15 @@ send_tg() {
     --data-urlencode "text=$text"
   )
   [ -n "$markup" ] && args+=(--data-urlencode "reply_markup=$markup")
-  local resp
-  resp=$(curl -sf "https://api.telegram.org/bot${TOKEN}/sendMessage" "${args[@]}" 2>&1)
-  if [ -z "$resp" ] || ! echo "$resp" | jq -e '.ok' >/dev/null 2>&1; then
-    log "send_tg failed: $(echo "$resp" | head -c 300)"
+  # Drop curl -f so we get the body on HTTP 4xx (used to silently fail).
+  # Append HTTP status via -w so we can log it on failure.
+  local resp http body
+  resp=$(curl -s -w $'\n__TGHTTP__%{http_code}' \
+    "https://api.telegram.org/bot${TOKEN}/sendMessage" "${args[@]}" 2>&1)
+  http="${resp##*__TGHTTP__}"
+  body="${resp%$'\n'__TGHTTP__*}"
+  if [ "$http" != "200" ] || ! echo "$body" | jq -e '.ok' >/dev/null 2>&1; then
+    log "send_tg failed http=$http body=$(echo "$body" | head -c 300)"
   fi
 }
 
@@ -926,10 +934,19 @@ cmd_look() {
     full|all) n=5000 ;;
     *)        n="$arg" ;;
   esac
+  # Capture, escape, then truncate at a line boundary with a byte budget
+  # that leaves headroom under Telegram's 4096-char message cap for the
+  # header + <pre></pre> wrapper. Truncating *after* wrapping (the old
+  # behaviour) could chop the closing </pre> or split a UTF-8 sequence,
+  # producing a 400 from Telegram and a silent send_tg failure.
   local content
-  content=$(tmux capture-pane -t "$pane" -pS "-$n" 2>/dev/null)
+  content=$(tmux capture-pane -t "$pane" -pS "-$n" 2>/dev/null \
+    | html_escape \
+    | awk -v BUDGET=3700 'BEGIN{tot=0}
+        { if (tot + length($0) + 1 > BUDGET) { print "[…truncated]"; exit }
+          tot += length($0) + 1; print }')
   send_tg "👁️ <code>$target</code> ($pane, $n lines):
-<pre>$(echo "$content" | html_escape)</pre>"
+<pre>$content</pre>"
 }
 
 cmd_end() {
