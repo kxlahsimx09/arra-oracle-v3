@@ -63,27 +63,14 @@ send_tg() {
     --data-urlencode "text=$text" -o /dev/null 2>/dev/null
 }
 
-# ── Gist publishing ────────────────────────────────────────────────────────
-# Long messages get a sidecar secret Gist so markdown tables, code fences,
-# and long code dumps render properly on mobile. Telegram message carries a
-# short preview + link to the gist. Replaces an earlier telegra.ph path that
-# bucketed everything into a single <pre> node — Telegraph's narrow column
-# + pre-wrap squashed wide tables; GitHub renders Markdown tables natively.
-
-GIST_THRESHOLD=${GIST_THRESHOLD:-1500}
-
-# Publish text as a secret Gist; echo URL on success, "" on failure.
-# Saved as .md so GitHub renders tables, fenced code, headings, etc.
-gist_publish() {
-  local title="$1" text="$2"
-  command -v gh >/dev/null 2>&1 || return 1
-  local safe; safe=$(echo "$title" | tr '/ ' '__' | tr -cd 'A-Za-z0-9._-')
-  [ -z "$safe" ] && safe="brew-ops"
-  local out url
-  out=$(printf '%s' "$text" | gh gist create --filename "${safe}.md" --desc "$title" - 2>/dev/null)
-  url=$(echo "$out" | grep -Eo 'https://gist\.github\.com/[^[:space:]]+' | tail -1)
-  [ -n "$url" ] && echo "$url"
-}
+# Gist publishing — `gist_publish` + `GIST_THRESHOLD` live in `gist.sh`
+# (sourced below) so bot.sh's cmd_look and this watcher stay in sync.
+# Replaced an earlier telegra.ph path that bucketed everything into one
+# <pre> node — Telegraph's narrow column + pre-wrap squashed wide tables;
+# GitHub renders Markdown tables natively for assistant turns.
+SCRIPT_DIR_WATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./gist.sh
+. "$SCRIPT_DIR_WATCHER/gist.sh"
 
 # Reverse-lookup alias for a chat_id (role/slug → alias name)
 chat_alias_label() {

@@ -87,6 +87,14 @@ load_roles() {
 }
 load_roles
 
+# Shared gist helper — used by cmd_look as a fallback when a tmux capture
+# would otherwise overflow Telegram's 4096-char message cap. Also used by
+# chat-watcher.sh's auto-push, so threshold + publish behaviour live in one
+# file and stay in sync.
+SCRIPT_DIR_BOT_INIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./gist.sh
+. "$SCRIPT_DIR_BOT_INIT/gist.sh"
+
 # ── helpers ────────────────────────────────────────────────────────────────
 
 log()   { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
@@ -934,13 +942,39 @@ cmd_look() {
     full|all) n=5000 ;;
     *)        n="$arg" ;;
   esac
-  # Capture, escape, then truncate at a line boundary with a byte budget
-  # that leaves headroom under Telegram's 4096-char message cap for the
-  # header + <pre></pre> wrapper. Truncating *after* wrapping (the old
-  # behaviour) could chop the closing </pre> or split a UTF-8 sequence,
-  # producing a 400 from Telegram and a silent send_tg failure.
+  # Capture raw, then choose a delivery path:
+  #   long  → publish full capture as a secret Gist (.txt for monospaced
+  #           render — TUI box-drawing chars look right and GitHub doesn't
+  #           try to parse markdown), Telegram preview links to it.
+  #   short → inline <pre>, escaped + line-bounded truncation under a
+  #           3700-char budget so the header + <pre></pre> wrapper stays
+  #           under Telegram's 4096-char message cap. Truncating *after*
+  #           wrapping (the pre-fix behaviour) could chop the closing
+  #           </pre> or split a UTF-8 sequence and silently 400.
+  local raw raw_len
+  raw=$(tmux capture-pane -t "$pane" -pS "-$n" 2>/dev/null)
+  raw_len=${#raw}
+  if [ "$raw_len" -gt "$GIST_THRESHOLD" ]; then
+    local title="/look ${target} (${pane}, ${n} lines) — $(date '+%Y-%m-%d %H:%M')"
+    local url; url=$(gist_publish "$title" "$raw" "txt")
+    if [ -n "$url" ]; then
+      local preview
+      preview=$(printf '%s' "$raw" \
+        | html_escape \
+        | awk -v BUDGET=600 'BEGIN{tot=0}
+            { if (tot + length($0) + 1 > BUDGET) exit
+              tot += length($0) + 1; print }')
+      send_tg "👁️ <code>$target</code> (${pane}, ${n} lines, ${raw_len} chars):
+<pre>$preview</pre>
+…
+📖 <a href=\"$url\">read full on gist</a>"
+      return
+    fi
+    # gist failed → fall through to truncated inline (still useful, just
+    # shorter than full). Logged via send_tg's diagnostics if it 400s.
+  fi
   local content
-  content=$(tmux capture-pane -t "$pane" -pS "-$n" 2>/dev/null \
+  content=$(printf '%s' "$raw" \
     | html_escape \
     | awk -v BUDGET=3700 'BEGIN{tot=0}
         { if (tot + length($0) + 1 > BUDGET) { print "[…truncated]"; exit }
