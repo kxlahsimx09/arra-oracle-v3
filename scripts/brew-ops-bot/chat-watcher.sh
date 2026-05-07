@@ -229,10 +229,10 @@ while true; do
     echo "${current_jsonl}|${last_line_count}" > "$LINE_STATE_FILE"
   elif [ "$idle_notified" = "0" ] && \
        [ $(( $(date +%s) - last_change_ts )) -ge "$IDLE_PROMPT_SECONDS" ]; then
-    # JSONL quiet — detect on visible pane only (no -S) so scrolled-off
-    # `❯ ` cursors don't false-positive; gist gets full scrollback.
+    # JSONL quiet — match only `❯ N.` (numbered menu) on visible pane.
+    # Bare `❯ ` is claude's text-input prefix → false-positive while streaming.
     pane_visible=$(tmux capture-pane -t "$PANE" -p 2>/dev/null)
-    if printf '%s' "$pane_visible" | grep -qE '^[[:space:]]*❯ '; then
+    if printf '%s' "$pane_visible" | grep -qE '^[[:space:]]*❯ [0-9]+\.'; then
       pane_snap=$(tmux capture-pane -t "$PANE" -pS -1000 2>/dev/null)
       url=$(gist_publish "${CHAT_ID} idle TUI prompt — $(date '+%Y-%m-%d %H:%M')" "$pane_snap" "txt")
       body=${url:+"📖 <a href=\"$url\">read full pane on gist</a>"}
