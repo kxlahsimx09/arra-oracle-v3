@@ -115,6 +115,19 @@ declare -A STEP_NAMES=(
   ["pg-tester"]="7b"      # mobiz tester W1 has Step 7b for Telegram (mcp: tester-telegram)
 )
 
+# Per-role branch patterns. The silent-fail detector uses these to scope its
+# PR + commit search so a successful wake by ROLE A (e.g. pg-tester) does not
+# mask a silent-fail by ROLE B (e.g. pg-writer) when both watch the SAME repo.
+# Verified live 2026-05-07: pg-writer wake hit Anthropic API rate-limit on
+# startup → claude exited before reading wake-prompt → 0 work done. Silent-fail
+# detector at +60min would have seen pg-tester's PR #420 (feat/tester-validate-)
+# and counted it as "wake verified" for pg-writer too, hiding the failure.
+declare -A WAKE_BRANCH_PATTERNS=(
+  ["pg-writer"]="docs/track- docs/flow-track-"
+  ["bot-writer"]="docs/track- docs/flow-track-"
+  ["pg-tester"]="feat/tester-validate-"
+)
+
 log() {
   local ts=$(date '+%Y-%m-%d %H:%M:%S')
   echo "[$ts] $*"
@@ -134,20 +147,36 @@ SILENT_FAIL_TG_PROJECT=${SILENT_FAIL_TG_PROJECT:-$HOME/Code/github.com/kokarat/m
 COMMIT_AUTHOR=${COMMIT_AUTHOR:-amadeusmarsexpress}
 
 send_silent_fail_telegram() {
-  local role="$1" repo_slug="$2" wake_ts="$3" elapsed="$4"
+  local role="$1" repo_slug="$2" wake_ts="$3" elapsed="$4" reason="${5:-}"
   local TOKEN CHAT
   TOKEN=$(jq -r --arg p "$SILENT_FAIL_TG_PROJECT" '.projects[$p].mcpServers["tester-telegram"].env.TELEGRAM_BOT_TOKEN // empty' "$HOME/.claude.json" 2>/dev/null)
   CHAT=$(jq -r --arg p "$SILENT_FAIL_TG_PROJECT" '.projects[$p].mcpServers["tester-telegram"].env.TELEGRAM_DEFAULT_CHAT_ID // empty' "$HOME/.claude.json" 2>/dev/null)
   [ -z "$TOKEN" ] || [ -z "$CHAT" ] && return
   local iso=$(date -r "$wake_ts" '+%Y-%m-%d %H:%M GMT+7')
+  local pane_name="${role}-$(date -r "$wake_ts" '+%Y%m%d-%H%M%S')"
+  local body
+  if [ -n "$reason" ]; then
+    # Reason supplied (fast-path: rate-limit / API error captured from pane)
+    local safe_reason=$(echo "$reason" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+    body="⚠️ <b>Wake startup-fail</b> (${role})
+Repo: <code>${repo_slug}</code>
+Wake: <code>${iso}</code> ($((elapsed))s ago)
+Cause (from pane): <code>${safe_reason}</code>
+Pane: <code>${pane_name}</code>
+ลอง wait + manual re-fire เมื่อ rate-limit เคลียร์: <code>maw wake ${role} --task '...'</code>"
+  else
+    # Default: post-WAKE_VERIFY_TIMEOUT silent (no PR / no commit found)
+    body="⚠️ <b>Silent wake fail</b> (${role})
+Repo: <code>${repo_slug}</code>
+Wake: <code>${iso}</code> ($((elapsed/60))min ago)
+ไม่มี PR / commit ตาม pattern ของ role นี้ตั้งแต่ wake — claude ตายเงียบ
+(auth 401 / silent attach / prompt corrupt / API rate-limit ที่หลุด fast-path).
+ตรวจ pane <code>${pane_name}</code> + watcher.log"
+  fi
   curl -sf "https://api.telegram.org/bot${TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${CHAT}" \
     --data-urlencode "parse_mode=HTML" \
-    --data-urlencode "text=⚠️ <b>Silent wake fail</b> (${role})
-Repo: <code>${repo_slug}</code>
-Wake: <code>${iso}</code> ($((elapsed/60))min ago)
-ไม่มี PR ของ @me ใน repo นี้ตั้งแต่ wake — claude ตายเงียบ (auth 401 / silent attach / prompt corrupt).
-ตรวจ pane <code>${role}-$(date -r "$wake_ts" '+%Y%m%d-%H%M%S')</code> + watcher.log" \
+    --data-urlencode "text=$body" \
     -o /dev/null 2>/dev/null
 }
 
@@ -341,30 +370,54 @@ cmd_run() {
           repo_slug=$(echo "$repo" | sed 's|.*/github\.com/||')
           iso_filter=$(date -u -r "$pending_wake_ts" '+%Y-%m-%dT%H:%M:%SZ')
 
-          # Signal 1: NEW PRs by @me (with retry on gh failure)
+          # Build per-role branch filter so a sibling role's success on the
+          # same repo doesn't mask THIS role's silent-fail.
+          patterns="${WAKE_BRANCH_PATTERNS[$role]:-}"
+          pr_search="author:@me created:>=$iso_filter"
+          if [ -n "$patterns" ]; then
+            head_clause=""
+            for p in $patterns; do
+              [ -z "$head_clause" ] && head_clause="head:$p" || head_clause="$head_clause head:$p"
+            done
+            pr_search="$pr_search $head_clause"
+          fi
+
+          # Signal 1: NEW PRs by @me on role's branch shape (with retry on gh failure)
           pr_count=""
           for attempt in 1 2; do
-            pr_count=$(gh pr list --repo "$repo_slug" --search "author:@me created:>=$iso_filter" --json number --jq 'length' 2>/dev/null) && break
+            pr_count=$(gh pr list --repo "$repo_slug" --search "$pr_search" --json number --jq 'length' 2>/dev/null) && break
             sleep 10
           done
           pr_count=${pr_count:-0}
 
-          # Signal 2: commits by COMMIT_AUTHOR on any branch since wake.
-          # Refresh remote refs first so AMEND-path branches (e.g. existing
-          # docs/track-* / docs/flow-track-*) are visible.
+          # Signal 2: commits by COMMIT_AUTHOR on role's branch shape since wake.
+          # Refresh remote refs first so AMEND-path branches are visible.
           git "${GIT_AUTH_FLAGS[@]}" -C "$repo" fetch origin --prune --quiet 2>/dev/null
-          commit_count=$(git -C "$repo" log --all --remotes \
-            --author="$COMMIT_AUTHOR" \
-            --since="@$pending_wake_ts" \
-            --format=%h 2>/dev/null | wc -l | tr -d ' ')
-          commit_count=${commit_count:-0}
+          commit_count=0
+          if [ -n "$patterns" ]; then
+            for p in $patterns; do
+              # `--branches` glob expands `*` against ref names; pattern is a prefix here.
+              c=$(git -C "$repo" log --remotes="origin/${p}*" \
+                --author="$COMMIT_AUTHOR" \
+                --since="@$pending_wake_ts" \
+                --format=%h 2>/dev/null | wc -l | tr -d ' ')
+              commit_count=$((commit_count + ${c:-0}))
+            done
+          else
+            # No pattern (legacy/uncategorized role) — fall back to all-branches.
+            commit_count=$(git -C "$repo" log --all --remotes \
+              --author="$COMMIT_AUTHOR" \
+              --since="@$pending_wake_ts" \
+              --format=%h 2>/dev/null | wc -l | tr -d ' ')
+            commit_count=${commit_count:-0}
+          fi
 
           total_signal=$((pr_count + commit_count))
           if [ "$total_signal" -eq 0 ]; then
-            log "[$role] SILENT-FAIL: 0 PRs + 0 commits in $((pending_elapsed/60))min since wake @ $(date -r "$pending_wake_ts" '+%H:%M') — alerting operator"
+            log "[$role] SILENT-FAIL: 0 PRs + 0 commits matching role pattern in $((pending_elapsed/60))min since wake @ $(date -r "$pending_wake_ts" '+%H:%M') (search: $pr_search) — alerting operator"
             send_silent_fail_telegram "$role" "$repo_slug" "$pending_wake_ts" "$pending_elapsed"
           else
-            log "[$role] wake verified: $pr_count new PR(s) + $commit_count commit(s) in $((pending_elapsed/60))min"
+            log "[$role] wake verified: $pr_count new PR(s) + $commit_count commit(s) matching pattern '$patterns' in $((pending_elapsed/60))min"
           fi
           pending_wake_ts=0
         fi
@@ -491,10 +544,31 @@ cmd_run() {
               wake_target="${wake_session}:${role}-${wake_ts}"
               wake_pane_cmd=$(tmux list-panes -t "$wake_target" -F "#{pane_current_command}" 2>/dev/null | head -1)
               if [ -n "$wake_pane_cmd" ] && echo "$wake_pane_cmd" | grep -qE "^(zsh|bash|sh|fish)$"; then
-                wake_pane_content=$(tmux capture-pane -t "$wake_target" -pS -15 2>/dev/null)
+                wake_pane_content=$(tmux capture-pane -t "$wake_target" -pS -25 2>/dev/null)
                 if echo "$wake_pane_content" | grep -q "No conversation found to continue"; then
                   log "[$role] template fallback didn't fire — sending claude -p directly"
                   tmux send-keys -t "$wake_target" "claude --dangerously-skip-permissions -p '$wake_pointer'" Enter
+                # Detect Anthropic API rate-limit / startup error: claude exits
+                # within seconds and the pane drops back to shell prompt with
+                # the error visible. Without this fast-path, we'd wait
+                # WAKE_VERIFY_TIMEOUT (60min) before silent-fail detector ran —
+                # operator gets no signal until then. Verified live 2026-05-07
+                # 10:34: pg-writer wake hit "API Error: ... Rate limited" and
+                # exited; the silent-fail check at +60min would have been
+                # masked by pg-tester's PR (same repo, basename-only filter).
+                # Fix is twofold: per-role branch filter (above) + this fast
+                # path Telegram alert so the operator knows immediately why
+                # the wake produced nothing.
+                elif echo "$wake_pane_content" | grep -qE "API Error|Rate limited|usage limit"; then
+                  startup_err=$(echo "$wake_pane_content" | grep -E "API Error|Rate limit|usage limit" | head -1 | tr -d '\r')
+                  log "[$role] startup-fail detected within 5s of wake: $startup_err"
+                  # repo_slug isn't guaranteed to be set in this scope (the
+                  # silent-fail block above only computes it when its own
+                  # branch fires). Compute fresh.
+                  fast_repo_slug=$(echo "$repo" | sed 's|.*/github\.com/||')
+                  send_silent_fail_telegram "$role" "$fast_repo_slug" "$pending_wake_ts" 5 "$startup_err"
+                  # Don't clear pending_wake_ts — leave it armed so the +60min
+                  # check still runs (in case of recovery / out-of-band wake).
                 fi
               fi
 
