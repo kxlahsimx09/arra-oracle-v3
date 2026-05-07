@@ -46,6 +46,9 @@ LINE_STATE_FILE=$STATE_DIR/last-line.$SAFE
 
 POLL_INTERVAL=${POLL_INTERVAL:-2}
 JSONL_WAIT_SECONDS=${JSONL_WAIT_SECONDS:-180}
+# Idle-prompt alert: JSONL quiet this long + pane shows claude's TUI
+# selection cursor (`❯ `) → one-time Telegram nudge. Reset on next JSONL line.
+IDLE_PROMPT_SECONDS=${IDLE_PROMPT_SECONDS:-30}
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$CHAT_ID/$$] $*" >> "$LOG_FILE"; }
 
@@ -186,6 +189,9 @@ if [ -n "$current_jsonl" ]; then
   fi
 fi
 
+last_change_ts=$(date +%s)
+idle_notified=0
+
 while true; do
   # bail if pane is gone
   if ! tmux list-panes -a -F "#{pane_id}" 2>/dev/null | grep -q "^${PANE}\$"; then
@@ -217,8 +223,23 @@ while true; do
         log "pushed assistant turn (${#local_text} chars)"
       done
     last_line_count=$cur_count
+    last_change_ts=$(date +%s)
+    idle_notified=0
     # persist position so a bot restart doesn't lose unread turns
     echo "${current_jsonl}|${last_line_count}" > "$LINE_STATE_FILE"
+  elif [ "$idle_notified" = "0" ] && \
+       [ $(( $(date +%s) - last_change_ts )) -ge "$IDLE_PROMPT_SECONDS" ]; then
+    # JSONL quiet — peek the pane for claude's `❯ ` selection cursor.
+    # TUI prompts never emit a JSONL text turn, so the user is otherwise
+    # blind. Push one heads-up per quiet period.
+    pane_snap=$(tmux capture-pane -t "$PANE" -p 2>/dev/null)
+    if printf '%s' "$pane_snap" | grep -qE '^[[:space:]]*❯ '; then
+      preview=$(printf '%s' "$pane_snap" | tail -20 | html_escape)
+      send_tg "🔔 <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> รอคำตอบ (TUI prompt — bot ส่ง keystroke ไม่ได้ ต้องไปตอบใน pane เอง):
+<pre>$preview</pre>"
+      idle_notified=1
+      log "idle TUI prompt detected — pushed alert"
+    fi
   fi
 
   sleep "$POLL_INTERVAL"
