@@ -229,16 +229,17 @@ while true; do
     echo "${current_jsonl}|${last_line_count}" > "$LINE_STATE_FILE"
   elif [ "$idle_notified" = "0" ] && \
        [ $(( $(date +%s) - last_change_ts )) -ge "$IDLE_PROMPT_SECONDS" ]; then
-    # JSONL quiet — peek the pane for claude's `❯ ` selection cursor.
-    # TUI prompts never emit a JSONL text turn, so the user is otherwise
-    # blind. Push one heads-up per quiet period.
-    pane_snap=$(tmux capture-pane -t "$PANE" -p 2>/dev/null)
+    # JSONL quiet — peek pane. Claude TUI prompts emit no JSONL text turn,
+    # so publish the full pane to a secret gist (.txt = monospaced).
+    pane_snap=$(tmux capture-pane -t "$PANE" -pS -1000 2>/dev/null)
     if printf '%s' "$pane_snap" | grep -qE '^[[:space:]]*❯ '; then
-      preview=$(printf '%s' "$pane_snap" | tail -20 | html_escape)
-      send_tg "🔔 <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> รอคำตอบ (TUI prompt — bot ส่ง keystroke ไม่ได้ ต้องไปตอบใน pane เอง):
-<pre>$preview</pre>"
+      url=$(gist_publish "${CHAT_ID} idle TUI prompt — $(date '+%Y-%m-%d %H:%M')" "$pane_snap" "txt")
+      tail_html="<pre>$(printf '%s' "$pane_snap" | tail -20 | html_escape)</pre>"
+      body=${url:+"📖 <a href=\"$url\">read full pane on gist</a>"}
+      send_tg "🔔 <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> รอคำตอบ (TUI prompt — Escape ออก หรือไปตอบใน pane):
+${body:-$tail_html}"
       idle_notified=1
-      log "idle TUI prompt detected — pushed alert"
+      log "idle TUI prompt detected — pushed alert (gist=${url:-fail})"
     fi
   fi
 
