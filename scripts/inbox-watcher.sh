@@ -57,8 +57,10 @@ T2_PROCESSING_DEADLINE=${T2_PROCESSING_DEADLINE:-1800}
 INBOX_SCAN_ENABLED=${INBOX_SCAN_ENABLED:-1}
 # Path 2 — auto-clean: when an envelope reaches `completed` AND its thread is
 # `closed` AND every safety gate passes, retire the worktree + claude session
-# that handled it. Default OFF — opt in via env. See safe_to_retire() below.
-INBOX_AUTO_CLEAN=${INBOX_AUTO_CLEAN:-0}
+# that handled it. Default ON — the safety gates ARE the conservatism (wt
+# clean, pushed, claude dead, no other state references wt, thread closed).
+# Set INBOX_AUTO_CLEAN=0 only if you need to inspect closed worktrees by hand.
+INBOX_AUTO_CLEAN=${INBOX_AUTO_CLEAN:-1}
 ORACLE_API=${ORACLE_API:-http://localhost:47778/api}
 MAW_BIN=${MAW_BIN:-bun /Users/dev01/Code/github.com/Soul-Brews-Studio/maw-js/src/cli.ts}
 # Phase 6 — claude_alive_at heuristic. A claude process is "active" only if
@@ -554,7 +556,22 @@ scan_inbox() {
       sf=$(state_path "$oracle" "$fname")
 
       if [ ! -f "$sf" ]; then
-        fire_wake "$oracle" "$file" "$fname"
+        # Atomic claim before firing. `mkdir` is POSIX-atomic: if two scans
+        # ever interleave on the same envelope (parallel watcher daemons —
+        # see find_other_daemons; or a future change that runs scan_inbox
+        # concurrently), only one wins the lockdir and enters fire_wake.
+        # Observed 2026-05-04 11:39:56: same envelope (thread-67_reply.md)
+        # fired twice in the same second; second attempt collided on
+        # `git branch agents/<wt>` with "ref already exists" → fire_failed.
+        # The lockdir + write_state-before-fire pair makes a duplicate-fire
+        # impossible: loser sees the state file on the next scan tick.
+        mkdir -p "$(dirname "$sf")"
+        if mkdir "$sf.lock" 2>/dev/null; then
+          fire_wake "$oracle" "$file" "$fname"
+          rmdir "$sf.lock" 2>/dev/null
+        else
+          log "[$oracle] $fname — claim contended (lock held); deferring"
+        fi
       else
         # shellcheck disable=SC1090
         source "$sf"
