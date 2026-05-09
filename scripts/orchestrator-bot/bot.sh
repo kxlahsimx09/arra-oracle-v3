@@ -304,12 +304,22 @@ cmd_read() {
   title=$(echo "$resp" | jq -r '.thread.title // empty')
   status=$(echo "$resp" | jq -r '.thread.status // empty')
   count=$(echo "$resp" | jq -r '.thread.message_count // 0')
-  # Per-message cap (drops mega-messages); page budget (Telegraph hard limit
-  # ~64KB → keep ≤ 50KB to leave headroom for HTML envelope + headers).
+  # Telegraph hard limit ~64KB total (HTML node array + envelope). The
+  # per-page budget reserves headroom for the per-page header (~500 B,
+  # title + status block) and HTML expansion (markdown→`<p>`/`<h3>`/`<pre>`
+  # adds ~10% overhead). 48KB is a safer working budget than the previous
+  # 50KB for threads with many short messages where header overhead piles up.
   local max_chars=${TELEGRAPH_MAX_MSG_CHARS:-6000}
-  local page_budget=${TELEGRAPH_PAGE_BUDGET:-50000}
+  local page_budget=${TELEGRAPH_PAGE_BUDGET:-48000}
+  # Defensive ceiling: any single message body bigger than page_budget would
+  # exceed the page budget on its own, so the per-page chunker can never
+  # split it. Cap the per-message chars at min(max_chars, page_budget * 0.7)
+  # so even an aggressive operator-set max_chars can't break the chunker.
+  local effective_cap=$max_chars
+  local hard_ceiling=$((page_budget * 7 / 10))
+  [ "$effective_cap" -gt "$hard_ceiling" ] && effective_cap=$hard_ceiling
   local body
-  body=$(echo "$resp" | jq -r --argjson cap "$max_chars" --arg tid "$n" '
+  body=$(echo "$resp" | jq -r --argjson cap "$effective_cap" --arg tid "$n" '
     .messages[]
     | (.content
         | if length > $cap
