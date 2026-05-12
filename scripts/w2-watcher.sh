@@ -305,13 +305,24 @@ cmd_run() {
   # armed, and the watcher silent-looped 599 trigger attempts in ~17h while
   # K's overnight commit burst (5 mobiz + 2 bank-bot trackable commits)
   # piled up untracked. Resolve now; abort loud if missing.
+  #
+  # 2026-05-12 follow-up: watcher running since 2026-05-09 14:00 silent-failed
+  # 200+ wakes with "unknown command: wake". Root cause: watcher's PATH lacks
+  # ~/.local/bin (where the current `maw` install lives, v26.5.7-alpha.752),
+  # so `command -v maw` missed it and we fell through to the dist/maw build
+  # at $HOME/Code/.../maw-js/dist/maw (v26.4.20-alpha.11 — old enough that
+  # `wake` was still a plugin rather than the top-alias it is today). The
+  # newer build at ~/.local/bin/maw is the canonical install path; prefer
+  # it explicitly so a sparse PATH no longer routes us to a stale dist.
   if [ -z "${MAW_BIN:-}" ]; then
-    if command -v maw > /dev/null 2>&1; then
+    if [ -x "$HOME/.local/bin/maw" ]; then
+      MAW_BIN="$HOME/.local/bin/maw"
+    elif command -v maw > /dev/null 2>&1; then
       MAW_BIN=$(command -v maw)
     elif [ -x "$HOME/Code/github.com/Soul-Brews-Studio/maw-js/dist/maw" ]; then
       MAW_BIN="$HOME/Code/github.com/Soul-Brews-Studio/maw-js/dist/maw"
     else
-      echo "error: maw not on PATH and not at \$HOME/Code/github.com/Soul-Brews-Studio/maw-js/dist/maw — set MAW_BIN env var or build maw-js (cd maw-js && bun run build)" >&2
+      echo "error: maw not at \$HOME/.local/bin/maw, not on PATH, and not at \$HOME/Code/github.com/Soul-Brews-Studio/maw-js/dist/maw — set MAW_BIN env var or build maw-js (cd maw-js && bun run build)" >&2
       exit 1
     fi
   elif [ ! -x "$MAW_BIN" ]; then
