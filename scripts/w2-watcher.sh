@@ -583,6 +583,37 @@ cmd_run() {
                 fi
               fi
 
+              # Send-keys race fast-path (added 2026-05-14 after recurring
+              # silent fails on 2026-05-12 13:01 + 2026-05-14 03:34 — both
+              # pg-writer + pg-tester wakes against the 66.3k-char mobiz
+              # CLAUDE.md): maw wake reports success but the inject-prompt
+              # send-keys lands while claude TUI is still loading
+              # CLAUDE.md, so the keys hit the bracketed-paste buffer
+              # before it's wired up and silently drop. The shell-prompt
+              # block above doesn't catch this — pane is in claude TUI
+              # (not back at shell), just sitting at empty `❯ ` with no
+              # task in flight. Without this gate the +60min silent-fail
+              # detector is the only alarm; operator wastes an hour per
+              # incident and recovers manually via `tmux paste-buffer`.
+              # Detection: 30s post-wake (5s slept above + 25s here), if
+              # pane is in claude TUI and the prompt's Thai "อ่าน"
+              # sentinel is absent from scrollback, the keys never landed
+              # — paste-buffer the saved prompt file + send-keys Enter,
+              # which is the exact recovery we run by hand today.
+              sleep 25
+              race_pane_cmd=$(tmux list-panes -t "$wake_target" -F "#{pane_current_command}" 2>/dev/null | head -1)
+              if [ -n "$race_pane_cmd" ] && ! echo "$race_pane_cmd" | grep -qE "^(zsh|bash|sh|fish)$" && [ -r "$wake_prompt_file" ]; then
+                race_pane_content=$(tmux capture-pane -t "$wake_target" -pS -50 2>/dev/null)
+                if ! echo "$race_pane_content" | grep -q "อ่าน"; then
+                  log "[$role] send-keys race detected — prompt absent from pane after 30s, resending via paste-buffer"
+                  tmux load-buffer -b "wake-resend-${role}" "$wake_prompt_file" 2>/dev/null
+                  tmux paste-buffer -b "wake-resend-${role}" -t "$wake_target" -p 2>/dev/null
+                  sleep 1
+                  tmux send-keys -t "$wake_target" Enter 2>/dev/null
+                  log "[$role] resent prompt via paste-buffer"
+                fi
+              fi
+
               # Chain regression runner in the background after two triggers:
               #   - pg-tester (mobiz W1 validate pass): full-sweep integration
               #     after a mobiz commit burst
