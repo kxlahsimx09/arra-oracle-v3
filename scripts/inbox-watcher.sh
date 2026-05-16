@@ -609,10 +609,14 @@ verify_processing() {
 # ─── Path 2 — auto-clean when thread closes ────────────────────────────────
 
 # Query oracle API for thread status; echoes 'closed'|'active'|'pending'|''.
+# Endpoint is `$ORACLE_API/thread/<id>` → `{"thread":{"status":...},...}`.
+# (Was `forum/thread/<id>` — a 404 that silently returned empty, so
+# safe_to_retire saw every thread as not-closed and the auto-retire never
+# fired. That broken endpoint is why the worktree purge had to be manual.)
 thread_status() {
   local id=$1
   [ -z "$id" ] && { echo ""; return; }
-  curl -sf -m 3 "$ORACLE_API/forum/thread/$id" 2>/dev/null \
+  curl -sf -m 3 "$ORACLE_API/thread/$id" 2>/dev/null \
     | jq -r '.thread.status // empty' 2>/dev/null
 }
 
