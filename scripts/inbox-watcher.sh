@@ -632,6 +632,21 @@ other_state_references_wt() {
   return 1
 }
 
+# Remove the two untracked files maw injects into every worktree: the
+# `.agent` symlink (memory mount) and a stray macOS `.DS_Store`. `git worktree
+# remove` refuses a worktree with ANY untracked file, so without this every
+# retire fails on the `.agent` symlink alone (Bug B, thread #139). Removing a
+# symlink never touches its target — the central `mb_agent_oracle_memory`
+# repo is untouched (P-001-safe) — and the worktree dir is being torn down
+# anyway. `.agent` is removed ONLY when it is a symlink; a real `.agent`
+# directory is left alone.
+strip_worktree_noise() {
+  local wt=$1
+  [ -L "$wt/.agent" ] && rm -f "$wt/.agent"
+  [ -f "$wt/.DS_Store" ] && rm -f "$wt/.DS_Store"
+  return 0
+}
+
 # Safety gates for retiring a worktree. Returns reason string on first
 # failure (caller checks $? = 0 means safe). Empty string output means OK.
 safe_to_retire() {
@@ -645,9 +660,12 @@ safe_to_retire() {
   ts=$(thread_status "${thread_id:-}")
   [ "$ts" != "closed" ] && { echo "thread-${thread_id:-?}-not-closed-($ts)"; return 1; }
 
-  # git: clean working tree + all commits pushed
+  # git: clean working tree + all commits pushed. The maw-injected `.agent`
+  # symlink and a stray `.DS_Store` are not real work — strip_worktree_noise
+  # clears them at retire time — so they don't count as dirt here (Bug B).
   local dirty
-  dirty=$(git -C "$wt_path" status --short 2>/dev/null | head -1)
+  dirty=$(git -C "$wt_path" status --short 2>/dev/null \
+    | grep -vE '^\?\? \.(agent|DS_Store)/?$' | head -1)
   [ -n "$dirty" ] && { echo "wt-dirty"; return 1; }
 
   local unpushed
@@ -684,7 +702,10 @@ maybe_retire_worktree() {
     $MAW_BIN kill "*:*${wt_suffix}*" 2>/dev/null || true
   }
 
-  # git worktree remove (refuses on dirty by default — safe)
+  # git worktree remove (refuses on dirty by default — safe). Strip the
+  # maw-injected `.agent` symlink + `.DS_Store` first so the otherwise-clean
+  # worktree isn't rejected for those alone (Bug B).
+  strip_worktree_noise "$wt_path"
   if git -C "$wt_path/.." worktree remove "$wt_path" 2>>"$LOG_FILE"; then
     log "[$oracle] $fname RETIRED worktree $wt_path"
     # Best-effort branch delete (only succeeds if merged or no unique commits)
@@ -820,12 +841,14 @@ gc_try_prune_worktree() {
   # tmux window still open for this suffix → in use.
   [ -n "$suffix" ] && printf '%s' "$maw_windows" | grep -q "$suffix" && return 0
   claude_alive_at "$wt" && return 0
-  dirty=$(git -C "$wt" status --short 2>/dev/null | head -1)
+  dirty=$(git -C "$wt" status --short 2>/dev/null \
+    | grep -vE '^\?\? \.(agent|DS_Store)/?$' | head -1)
   [ -n "$dirty" ] && { log "gc: keep orphan-candidate $wt (dirty)"; return 0; }
   unpushed=$(git -C "$wt" log '@{u}..' --oneline 2>/dev/null | head -1)
   [ -n "$unpushed" ] && { log "gc: keep orphan-candidate $wt (unpushed commits)"; return 0; }
 
   branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  strip_worktree_noise "$wt"
   if git -C "$repo" worktree remove "$wt" 2>>"$LOG_FILE"; then
     log "gc: pruned orphan worktree $wt"
     [ -n "$branch" ] && [ "$branch" != "HEAD" ] && \
