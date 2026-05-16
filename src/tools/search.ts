@@ -176,14 +176,15 @@ export async function vectorSearch(
 
     return mappedResults;
   } catch (error) {
-    // Re-throw so handleSearch's outer catch surfaces the real error in the
-    // response warning. Swallowing here causes silent degradation: callers
-    // see "returned no results" when the store is actually broken (seen
-    // 2026-04-21 when LanceDB manifest drifted from data fragments for 3
-    // days before an audit caught it).
+    // Do NOT swallow. Returning [] here makes a degraded vector backend
+    // (e.g. LanceDB manifest drift) indistinguishable from a genuine
+    // zero-result query — every search silently falls back to FTS5 and the
+    // failure goes invisible (thread #113 / #110, and the 2026-04-21 drift
+    // that went unnoticed for 3 days). Re-throw so handleSearch surfaces a
+    // real warning + metadata.vectorDegraded.
     const errorMsg = error instanceof Error ? error.stack || error.message : String(error);
-    console.error('[ChromaDB ERROR]', errorMsg);
-    throw error;
+    console.error('[VectorSearch ERROR]', errorMsg);
+    throw error instanceof Error ? error : new Error(String(error));
   }
 }
 
@@ -443,6 +444,7 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
     sources: { fts: number; vector: number; hybrid: number };
     searchTime: number;
     warning?: string;
+    vectorDegraded?: boolean;
   } = {
     mode,
     limit,
@@ -456,6 +458,13 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
 
   if (warning) {
     metadata.warning = warning;
+  }
+
+  // vectorDegraded is the machine-readable signal: the vector backend errored
+  // (not merely empty). Callers and audits can branch on it without parsing
+  // the warning string. Distinct from "returned no results" — see thread #113.
+  if (vectorSearchError) {
+    metadata.vectorDegraded = true;
   }
 
   console.error(`[MCP:SEARCH] "${query}" (${type}, ${mode}, model=${model || 'default'}) → ${results.length} results in ${searchTime}ms`);

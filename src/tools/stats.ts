@@ -59,6 +59,25 @@ export async function handleStats(ctx: ToolContext, _input: OracleStatsInput): P
     }
   }
 
+  // Active vector probe. ctx.vectorStatus is captured once at MCP startup and
+  // only reflects whether the table handle opened. A drifted LanceDB manifest
+  // still answers countRows() but fails search(), so the connect-time status
+  // stays "connected" while every query silently falls back to FTS5 — which is
+  // why thread #110 sat undetected. health() runs a real query; fall back to
+  // the startup status when the adapter does not implement it. See thread #113.
+  let vectorStatus: string = ctx.vectorStatus;
+  let vectorError: string | undefined;
+  if (typeof ctx.vectorStore.health === 'function') {
+    try {
+      const h = await ctx.vectorStore.health();
+      vectorStatus = h.ok ? 'connected' : 'degraded';
+      if (!h.ok) vectorError = h.error;
+    } catch (e) {
+      vectorStatus = 'degraded';
+      vectorError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
   return {
     content: [{
       type: 'text',
@@ -70,7 +89,8 @@ export async function handleStats(ctx: ToolContext, _input: OracleStatsInput): P
         last_indexed: lastIndexed?.lastIndexed
           ? new Date(lastIndexed.lastIndexed).toISOString()
           : null,
-        vector_status: ctx.vectorStatus,
+        vector_status: vectorStatus,
+        ...(vectorError ? { vector_error: vectorError } : {}),
         fts_status: ftsCount.count > 0 ? 'healthy' : 'empty',
         version: ctx.version,
       }, null, 2)
