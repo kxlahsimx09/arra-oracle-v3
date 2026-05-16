@@ -474,10 +474,21 @@ fire_wake() {
 
   log "[$oracle] $fname → fire (thread=$thread_id, suffix=$wt_suffix${resume_sid:+, RESUME sid=$resume_sid})"
 
+  # Build prompt with FULL envelope path embedded. Without the path, fresh
+  # subagents respond to `inbox: <fname>` by running `find / -name <fname>`,
+  # which on macOS aliases to bfs and gets stuck on /System/Volumes/Data
+  # (APFS firmlinks) — each scan holds ~30k FDs and never returns. Observed
+  # 2026-05-16: 6 such bfs orphans consumed 285k FDs systemwide, blocking
+  # github.com access for brew-ops-bot's `maw wake`. Keeping the literal
+  # `inbox: $fname` substring preserves T1 verification (jsonl_has_prompt,
+  # line ~143) which greps for exactly that marker.
+  local envelope_path="$INBOX_BASE/for-$oracle/$fname"
+  local task_prompt="inbox: $fname (envelope path: $envelope_path — read this file directly with the Read tool; do not use \`find\`)"
+
   # Capture maw wake output to extract the resolved worktree path.
   if [ -n "${resume_sid:-}" ]; then
     wake_out=$($MAW_BIN wake "$oracle" --resume "$resume_sid" --wt "$wt_suffix" --no-attach \
-      --task "inbox: $fname" 2>&1) || {
+      --task "$task_prompt" 2>&1) || {
       set_state_field "$sf" status fire_failed
       set_state_field "$sf" failed_at "$(date +%s)"
       alert "[$oracle] maw wake --resume exit nonzero for $fname: $(printf '%s' "$wake_out" | tail -3 | tr '\n' ' ')"
@@ -485,7 +496,7 @@ fire_wake() {
     }
   else
     wake_out=$($MAW_BIN wake "$oracle" --fresh --wt "$wt_suffix" --no-attach \
-      --task "inbox: $fname" 2>&1) || {
+      --task "$task_prompt" 2>&1) || {
       set_state_field "$sf" status fire_failed
       set_state_field "$sf" failed_at "$(date +%s)"
       alert "[$oracle] maw wake exit nonzero for $fname: $(printf '%s' "$wake_out" | tail -3 | tr '\n' ' ')"
