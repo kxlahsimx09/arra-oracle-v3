@@ -22,13 +22,18 @@
 #   verified (T2 deadline elapsed)       → failed_stuck + alert
 #   completed | failed_*                 (terminal — kept for audit)
 #
-# Wake key (§11k orchestrator fan-out dedup): `to: orchestrator` envelopes
-# carrying a `parent_thread:` key the session map + worktree reuse on
-# parent_thread, so every fan-out reply of one campaign converges on ONE
-# orchestrator session instead of `--fresh`-spawning N parallel siblings that
-# each re-dispatch the same follow-up (the 2026-05-16 triple-dispatch
+# Wake key (§11f/§11k campaign session reuse): ANY envelope carrying a
+# `parent_thread:` (a §11k fan-out sub-task envelope) keys the session map +
+# worktree reuse on parent_thread — one session per oracle per campaign, not
+# per sub-thread. For the orchestrator this converges a campaign's fan-out
+# replies on ONE session instead of `--fresh`-spawning N parallel siblings
+# that each re-dispatch the same follow-up (the 2026-05-16 triple-dispatch
 # incident — PR #129/#130/#131 for one task; thread #134 / escalation #348).
-# All other envelopes key on their own `thread:` id (unchanged §11f behaviour).
+# For worker agents (next-impl / next-writer / pg-writer / bot-writer /
+# next-architect) it `--resume`s the agent's campaign session for each new
+# sub-thread of an in-flight campaign rather than spawning a per-sub-thread
+# session. New campaign (new parent_thread) = new session, so context stays
+# campaign-scoped. Envelopes with no parent_thread key on their own `thread:`.
 #
 # Layout:
 #   ~/.cache/inbox-watcher/
@@ -36,8 +41,8 @@
 #   ├── inbox-watcher.pid
 #   ├── state/<oracle>/<fname>.state    (per-envelope state machine)
 #   └── sessions/<oracle>/thread-<K>.session-id  (per-wake-key session capture;
-#                                          K = parent_thread for orchestrator
-#                                          fan-out, else the envelope's thread)
+#                                          K = parent_thread for any fan-out
+#                                          sub-task, else the envelope's thread)
 #
 # Usage:
 #   bash inbox-watcher.sh                 # foreground (interactive log to stdout)
@@ -53,6 +58,9 @@
 #   T1_DELIVERY_DEADLINE        60        (s) deadline for prompt-in-JSONL
 #   T2_PROCESSING_DEADLINE      1800      (s, 30m) deadline for archive
 #   INBOX_SCAN_ENABLED          1         (set 0 to keep daemon alive but no-op)
+#   INBOX_AUTO_CLEAN            1         (retire worktrees/sessions on close)
+#   INBOX_GC_INTERVAL           600       (s) cadence of the campaign GC sweep
+#   SESSION_TTL_DAYS            30        idle-days before a session-id is GC'd
 #   MAW_BIN                     auto-detect (`maw` on PATH, else local cli.ts)
 
 set -u
@@ -75,6 +83,17 @@ INBOX_SCAN_ENABLED=${INBOX_SCAN_ENABLED:-1}
 # clean, pushed, claude dead, no other state references wt, thread closed).
 # Set INBOX_AUTO_CLEAN=0 only if you need to inspect closed worktrees by hand.
 INBOX_AUTO_CLEAN=${INBOX_AUTO_CLEAN:-1}
+# Path 2b — periodic campaign GC sweep. Every INBOX_GC_INTERVAL seconds the
+# watcher mops up what the per-envelope retire misses: completed envelopes
+# whose thread closed AFTER completion, session-id cache files past their TTL,
+# and crash-orphaned worktrees (no tmux window, no live claude, not referenced
+# by any envelope state). This is the manual 47→5 worktree purge made routine.
+# Gated by INBOX_AUTO_CLEAN like the per-envelope retire.
+INBOX_GC_INTERVAL=${INBOX_GC_INTERVAL:-600}
+# A session-id cache file not resumed for this many days is dropped (§11f TTL
+# backstop — assume the campaign is cold). Retire-driven eviction handles the
+# common case; the TTL covers campaigns whose thread never formally closed.
+SESSION_TTL_DAYS=${SESSION_TTL_DAYS:-30}
 ORACLE_API=${ORACLE_API:-http://localhost:47778/api}
 MAW_BIN=${MAW_BIN:-bun /Users/dev01/Code/github.com/Soul-Brews-Studio/maw-js/src/cli.ts}
 # Phase 6 — claude_alive_at heuristic. A claude process is "active" only if
@@ -223,21 +242,31 @@ preempt_claude_at() {
 }
 
 # Wake key — the identity a wake is reused under (§11f session map, §11k
-# fan-out dedup). For `to: orchestrator` envelopes that carry a `parent_thread:`
-# (a §11k fan-out reply) the key is parent_thread, so every reply of one
-# campaign maps to the SAME orchestrator session. Keying on the individual
-# sub-thread instead — the pre-2026-05-16 behaviour — gave each fan-out reply
-# its own session-id and so `--fresh`-spawned a separate orchestrator session
-# per reply; the siblings then each ran Step 0.5 and re-dispatched the same
-# follow-up (triple-dispatch incident #348). Envelopes with no parent_thread,
-# and every non-orchestrator oracle, key on their own `thread:` id (unchanged).
+# campaign session reuse). ANY envelope that carries a `parent_thread:` (a
+# §11k fan-out sub-task envelope) keys on parent_thread, so every sub-thread
+# of one campaign maps to the SAME session for that oracle — one session per
+# oracle per campaign, not per sub-thread.
+#
+#  - orchestrator: a campaign's fan-out replies converge on ONE orchestrator
+#    session. Keying on the individual sub-thread instead — the pre-2026-05-16
+#    behaviour — gave each reply its own session-id and so `--fresh`-spawned a
+#    separate orchestrator session per reply; the siblings then each ran Step
+#    0.5 and re-dispatched the same follow-up (triple-dispatch incident #348).
+#  - worker agents (next-impl / next-writer / pg-writer / bot-writer /
+#    next-architect): a new sub-thread of an in-flight campaign `--resume`s the
+#    agent's campaign session (fire_wake Path 1) instead of `--fresh`-spawning
+#    a per-sub-thread session — the per-thread sprawl source closed here. A new
+#    campaign (new parent_thread) still gets a new session, so context stays
+#    campaign-scoped: no cross-campaign bias bleed, parallelism across
+#    campaigns preserved.
+#
+# Envelopes with no parent_thread (campaign-parent threads, standalone
+# consults) key on their own `thread:` id, unchanged from §11f.
 wake_key() {
-  local oracle=$1 file=$2 thread_id=$3
-  if [ "$oracle" = "orchestrator" ]; then
-    local pt
-    pt=$(grep '^parent_thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
-    [ -n "$pt" ] && { printf '%s' "$pt"; return 0; }
-  fi
+  local file=$1 thread_id=$2
+  local pt
+  pt=$(grep '^parent_thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
+  [ -n "$pt" ] && { printf '%s' "$pt"; return 0; }
   printf '%s' "$thread_id"
 }
 
@@ -401,10 +430,10 @@ fire_wake() {
   local sid_file prior_sid prior_wt resume_sid wt_arg
 
   thread_id=$(grep '^thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
-  # Wake key — parent_thread for orchestrator fan-out replies, else thread.
+  # Wake key — parent_thread for any fan-out sub-task envelope, else thread.
   # Drives the §11f session map + Path 1 worktree reuse so a campaign's
-  # replies converge on one session (§11k dedup).
-  wkey=$(wake_key "$oracle" "$file" "$thread_id")
+  # sub-threads converge on one session per oracle (§11k campaign reuse).
+  wkey=$(wake_key "$file" "$thread_id")
   wake_ts=$(date +%s)
   wt_suffix=inbox-$wake_ts
   sf=$(state_path "$oracle" "$fname")
@@ -437,10 +466,10 @@ fire_wake() {
   fi
 
   # Path 1 — worktree reuse via maw --resume. If we already have a
-  # session-id mapped for this (oracle, thread) AND no claude is currently
+  # session-id mapped for this (oracle, wake-key) AND no claude is currently
   # alive in the worktree that birthed it, resume that session in the SAME
   # worktree instead of spawning a fresh one. Drives worktree count toward
-  # (oracle × thread) pairs rather than total wakes. Falls back to --fresh
+  # (oracle × campaign) pairs rather than total wakes. Falls back to --fresh
   # silently if any precondition is missing.
   #
   # Skipped for cancel envelopes (handled above): cancel handler runs on
@@ -530,9 +559,9 @@ verify_delivery() {
       jsonl=$(ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
       if [ -n "$jsonl" ] && jsonl_has_prompt "$jsonl" "$fname"; then
         sid=$(basename "$jsonl" .jsonl)
-        # Capture the session under the WAKE KEY (parent_thread for
-        # orchestrator fan-out, else thread) so later same-campaign replies
-        # resume this session instead of spawning a sibling (§11k).
+        # Capture the session under the WAKE KEY (parent_thread for any
+        # fan-out sub-task, else thread) so later same-campaign sub-threads
+        # resume this session instead of spawning a sibling (§11f/§11k).
         key=${wake_key:-$thread_id}
         if [ -n "$key" ]; then
           sids_dir=$STATE_DIR/sessions/$oracle
@@ -659,9 +688,177 @@ maybe_retire_worktree() {
       git -C "$repo_path" branch -d "$branch" 2>/dev/null && \
       log "[$oracle] retired branch $branch"
     set_state_field "$sf" retired_at "$(date +%s)"
+    # Drop the campaign session-id cache entry now the worktree is gone (§11f).
+    evict_session_id "$oracle" "${wake_key:-$thread_id}" "$sf"
   else
     log "[$oracle] $fname retire FAILED (git worktree remove returned nonzero — keeping)"
   fi
+}
+
+# Drop the session-id cache file for a wake key once its campaign retires
+# (§11f eviction). Guarded: if another non-terminal envelope still shares the
+# wake key — a sibling sub-thread of the same campaign is mid-flight — the
+# session is still needed for its --resume, so keep it.
+evict_session_id() {
+  local oracle=$1 key=$2 self_sf=$3
+  [ -z "$key" ] && return 0
+  local other st
+  for other in "$STATE_DIR"/state/"$oracle"/*.state; do
+    [ -f "$other" ] || continue
+    [ "$other" = "$self_sf" ] && continue
+    grep -q "^wake_key=$key$" "$other" 2>/dev/null || continue
+    st=$(grep '^status=' "$other" | tail -1 | cut -d= -f2)
+    case "$st" in
+      fired|verified|deferred) return 0 ;;  # campaign sibling still live
+    esac
+  done
+  local sid_file="$STATE_DIR/sessions/$oracle/thread-$key.session-id"
+  if [ -f "$sid_file" ]; then
+    rm -f "$sid_file"
+    log "[$oracle] evicted session-id thread-$key (campaign retired)"
+  fi
+}
+
+# ─── Path 2b — periodic campaign GC sweep ─────────────────────────────────
+#
+# maybe_retire_worktree only fires the instant an envelope reaches
+# `completed`. Three things slip past it, so a periodic sweep mops up:
+#
+#   (1) An envelope that completed while its thread was still open had its
+#       retire SKIPPED (thread-not-closed gate) and the thread closing later
+#       triggers nothing. gc_retire_completed re-runs the retire gate on every
+#       completed-but-not-retired envelope.
+#   (2) session-id cache files accumulate. Retire-driven eviction
+#       (evict_session_id) handles closed campaigns; gc_evict_stale_sessions
+#       is the 30-day TTL backstop for campaigns whose thread never closed.
+#   (3) Worktrees orphaned by crashes / manual tmux kills sit on disk forever
+#       — no tmux window, no live claude, not referenced by any envelope
+#       state. gc_prune_orphan_worktrees removes them under the same
+#       git-clean + no-unpushed gate as the #116 per-envelope retire. This is
+#       the manual 47→5 worktree purge made routine.
+#
+# Not in scope: pruning `.agent.bak-*` directories. Those can hold pre-symlink
+# `.agent/` memory content; deleting them risks a P-001 ("Nothing is Deleted")
+# violation and AGENTS.md §3a explicitly says to leave them. Surfacing this
+# rather than auto-deleting — see the thread-139 reply envelope.
+
+# Distinct product-repo roots inferred from recorded wt_paths. A worktree
+# path is `<repo>.wt-<N>-<suffix>`, so stripping `.wt-*` yields the repo.
+# Multiple repos appear because different oracles wake in different repos
+# (orchestrator/brew-ops → arra-oracle-v3, next-* → mb-next-payment-gateway…).
+discover_repos() {
+  local sf wt
+  for sf in "$STATE_DIR"/state/*/*.state; do
+    [ -f "$sf" ] || continue
+    wt=$(grep '^wt_path=' "$sf" 2>/dev/null | tail -1 | cut -d= -f2-)
+    case "$wt" in *.wt-*) echo "${wt%.wt-*}" ;; esac
+  done | sort -u
+}
+
+# (1) Re-run the retire gate on completed-but-not-retired envelopes. A retire
+# SKIPPED earlier for `thread-not-closed` succeeds here once the thread closes.
+gc_retire_completed() {
+  local sf
+  for sf in "$STATE_DIR"/state/*/*.state; do
+    [ -f "$sf" ] || continue
+    unset status retired_at
+    # shellcheck disable=SC1090
+    source "$sf"
+    [ "${status:-}" = "completed" ] || continue
+    [ -n "${retired_at:-}" ] && continue
+    maybe_retire_worktree "$sf"
+  done
+}
+
+# (2) Drop session-id cache files idle longer than the TTL.
+gc_evict_stale_sessions() {
+  local now sid_file mtime age_days
+  now=$(date +%s)
+  for sid_file in "$STATE_DIR"/sessions/*/thread-*.session-id; do
+    [ -f "$sid_file" ] || continue
+    mtime=$(stat -f %m "$sid_file" 2>/dev/null) || continue
+    age_days=$(( (now - mtime) / 86400 ))
+    if [ "$age_days" -ge "$SESSION_TTL_DAYS" ]; then
+      rm -f "$sid_file"
+      log "gc: evicted stale session-id ${sid_file#"$STATE_DIR/sessions/"} (idle ${age_days}d ≥ ${SESSION_TTL_DAYS}d TTL)"
+    fi
+  done
+}
+
+# True iff any envelope state file references a worktree with the same
+# basename as $wt. Basename match (not full path) is deliberate: git's
+# `worktree list` and the maw-captured wt_path can differ by a path prefix
+# (/tmp vs /private/tmp symlink resolution, trailing slash), and a missed
+# match here would prune a worktree an active envelope still owns. Worktree
+# basenames carry a unique timestamp suffix, so basename collisions can't
+# happen; erring toward "referenced" (keep) is the safe direction.
+any_state_references_wt() {
+  local wt=$1 bn other
+  bn=$(basename "$wt")
+  for other in "$STATE_DIR"/state/*/*.state; do
+    [ -f "$other" ] || continue
+    grep -q "^wt_path=.*/$bn\$" "$other" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# (3a) Remove one worktree iff it is a genuine orphan: no tmux window for its
+# suffix, no live claude, git-clean + no-unpushed, not referenced by any
+# envelope state. Same safety floor as safe_to_retire (#116 gate). Skips with
+# a logged reason on any failure — never forces.
+gc_try_prune_worktree() {
+  local repo=$1 wt=$2 maw_windows=$3
+  local suffix dirty unpushed branch
+  suffix=$(basename "$wt" | sed 's/^[^.]*\.wt-[0-9]*-//')
+
+  # Referenced by an envelope state file → that envelope owns the retire.
+  any_state_references_wt "$wt" && return 0
+  # tmux window still open for this suffix → in use.
+  [ -n "$suffix" ] && printf '%s' "$maw_windows" | grep -q "$suffix" && return 0
+  claude_alive_at "$wt" && return 0
+  dirty=$(git -C "$wt" status --short 2>/dev/null | head -1)
+  [ -n "$dirty" ] && { log "gc: keep orphan-candidate $wt (dirty)"; return 0; }
+  unpushed=$(git -C "$wt" log '@{u}..' --oneline 2>/dev/null | head -1)
+  [ -n "$unpushed" ] && { log "gc: keep orphan-candidate $wt (unpushed commits)"; return 0; }
+
+  branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  if git -C "$repo" worktree remove "$wt" 2>>"$LOG_FILE"; then
+    log "gc: pruned orphan worktree $wt"
+    [ -n "$branch" ] && [ "$branch" != "HEAD" ] && \
+      git -C "$repo" branch -d "$branch" 2>/dev/null && \
+      log "gc: pruned merged branch $branch"
+  else
+    log "gc: orphan-prune FAILED for $wt (git worktree remove nonzero — keeping)"
+  fi
+}
+
+# (3) Sweep every discovered repo for orphan worktrees.
+gc_prune_orphan_worktrees() {
+  local repo wt maw_windows
+  maw_windows=$($MAW_BIN ls 2>/dev/null)
+  while read -r repo; do
+    [ -z "$repo" ] && continue
+    [ -d "$repo/.git" ] || [ -e "$repo/.git" ] || continue
+    git -C "$repo" worktree list --porcelain 2>/dev/null \
+      | sed -n 's/^worktree //p' | while read -r wt; do
+      [ "$wt" = "$repo" ] && continue          # never the main worktree
+      case "$wt" in *.wt-*) ;; *) continue ;; esac
+      [ -d "$wt" ] || continue
+      gc_try_prune_worktree "$repo" "$wt" "$maw_windows"
+    done
+  done < <(discover_repos)
+}
+
+# Periodic GC entry point — called from run_loop on the INBOX_GC_INTERVAL
+# cadence. Gated by INBOX_AUTO_CLEAN like the per-envelope retire.
+gc_sweep() {
+  [ "$INBOX_AUTO_CLEAN" = "1" ] || return 0
+  log "gc-sweep start"
+  gc_retire_completed
+  gc_evict_stale_sessions
+  gc_prune_orphan_worktrees
+  log "gc-sweep done"
+  return 0
 }
 
 # ─── Fire-or-defer dispatch (§11k orchestrator fan-out dedup) ──────────────
@@ -677,7 +874,7 @@ maybe_fire_or_defer() {
 
   if [ "$oracle" = "orchestrator" ] && ! is_cancel_envelope "$file"; then
     thread_id=$(grep '^thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
-    wkey=$(wake_key "$oracle" "$file" "$thread_id")
+    wkey=$(wake_key "$file" "$thread_id")
     if [ -n "$wkey" ] && parent_session_busy "$oracle" "$wkey" "$sf"; then
       write_state "$sf" \
         "oracle=$oracle" \
@@ -807,10 +1004,16 @@ scan_inbox() {
 }
 
 run_loop() {
-  log "inbox-watcher start (interval=${INBOX_POLL_INTERVAL}s, T1=${T1_DELIVERY_DEADLINE}s, T2=${T2_PROCESSING_DEADLINE}s, enabled=$INBOX_SCAN_ENABLED)"
+  log "inbox-watcher start (interval=${INBOX_POLL_INTERVAL}s, T1=${T1_DELIVERY_DEADLINE}s, T2=${T2_PROCESSING_DEADLINE}s, gc=${INBOX_GC_INTERVAL}s, enabled=$INBOX_SCAN_ENABLED)"
+  local last_gc=0 now
   while true; do
     if [ "$INBOX_SCAN_ENABLED" = "1" ]; then
       scan_inbox || log "scan_inbox returned nonzero (continuing)"
+      now=$(date +%s)
+      if [ $((now - last_gc)) -ge "$INBOX_GC_INTERVAL" ]; then
+        gc_sweep || log "gc_sweep returned nonzero (continuing)"
+        last_gc=$now
+      fi
     fi
     sleep "$INBOX_POLL_INTERVAL"
   done
@@ -908,16 +1111,22 @@ case ${1:-loop} in
     log "scan-once (single pass)"
     scan_inbox
     ;;
+  gc-once)
+    log "gc-once (single GC sweep)"
+    INBOX_AUTO_CLEAN=1 gc_sweep
+    ;;
   *)
     cat <<USAGE >&2
-usage: $0 {loop|start|stop|status|scan-once}
+usage: $0 {loop|start|stop|status|scan-once|gc-once}
   loop / start  run the watcher daemon (foreground)
   stop          kill a running daemon by pid file
   status        show pid + per-envelope state + session-id mappings
   scan-once     single scan pass (no loop) — for tests
+  gc-once       single campaign GC sweep (no loop) — for tests
 env overrides: INBOX_BASE, STATE_DIR, LOG_FILE, INBOX_POLL_INTERVAL,
                T1_DELIVERY_DEADLINE, T2_PROCESSING_DEADLINE,
-               INBOX_SCAN_ENABLED, MAW_BIN, CLAUDE_PROJECTS
+               INBOX_SCAN_ENABLED, INBOX_AUTO_CLEAN, INBOX_GC_INTERVAL,
+               SESSION_TTL_DAYS, MAW_BIN, CLAUDE_PROJECTS
 USAGE
     exit 2
     ;;
