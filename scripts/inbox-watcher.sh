@@ -12,18 +12,32 @@
 # State machine per envelope (§11i in AGENTS.md):
 #
 #   NEW (no state file)                  → fire_wake → fired
+#   NEW (orchestrator envelope whose      → deferred  (queued behind the live
+#        parent campaign already has a               orchestrator session;
+#        live/in-flight session)                     no sibling spawned)
+#   deferred (parent campaign idle)      → fire_wake → fired
 #   fired (T1: claude/JSONL has prompt)  → verified  (capture session-id)
 #   fired (T1 deadline elapsed)          → failed_no_prompt + alert
 #   verified (T2: file moved out of root)→ completed
 #   verified (T2 deadline elapsed)       → failed_stuck + alert
 #   completed | failed_*                 (terminal — kept for audit)
 #
+# Wake key (§11k orchestrator fan-out dedup): `to: orchestrator` envelopes
+# carrying a `parent_thread:` key the session map + worktree reuse on
+# parent_thread, so every fan-out reply of one campaign converges on ONE
+# orchestrator session instead of `--fresh`-spawning N parallel siblings that
+# each re-dispatch the same follow-up (the 2026-05-16 triple-dispatch
+# incident — PR #129/#130/#131 for one task; thread #134 / escalation #348).
+# All other envelopes key on their own `thread:` id (unchanged §11f behaviour).
+#
 # Layout:
 #   ~/.cache/inbox-watcher/
 #   ├── inbox-watcher.log              (rotating-by-restart log)
 #   ├── inbox-watcher.pid
 #   ├── state/<oracle>/<fname>.state    (per-envelope state machine)
-#   └── sessions/<oracle>/thread-<N>.session-id  (per-thread session capture)
+#   └── sessions/<oracle>/thread-<K>.session-id  (per-wake-key session capture;
+#                                          K = parent_thread for orchestrator
+#                                          fan-out, else the envelope's thread)
 #
 # Usage:
 #   bash inbox-watcher.sh                 # foreground (interactive log to stdout)
@@ -208,19 +222,38 @@ preempt_claude_at() {
   done
 }
 
-# Path 1 helpers — find a prior wt_path that handled a given thread for an
-# oracle. Reads the most-recent state file for that (oracle, thread) tuple
-# (whether `completed` or terminal-success) — its wt_path is the candidate
-# for --resume reuse.
-find_prior_wt_for_thread() {
-  local oracle=$1 thread_id=$2
-  [ -z "$thread_id" ] && return 1
+# Wake key — the identity a wake is reused under (§11f session map, §11k
+# fan-out dedup). For `to: orchestrator` envelopes that carry a `parent_thread:`
+# (a §11k fan-out reply) the key is parent_thread, so every reply of one
+# campaign maps to the SAME orchestrator session. Keying on the individual
+# sub-thread instead — the pre-2026-05-16 behaviour — gave each fan-out reply
+# its own session-id and so `--fresh`-spawned a separate orchestrator session
+# per reply; the siblings then each ran Step 0.5 and re-dispatched the same
+# follow-up (triple-dispatch incident #348). Envelopes with no parent_thread,
+# and every non-orchestrator oracle, key on their own `thread:` id (unchanged).
+wake_key() {
+  local oracle=$1 file=$2 thread_id=$3
+  if [ "$oracle" = "orchestrator" ]; then
+    local pt
+    pt=$(grep '^parent_thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
+    [ -n "$pt" ] && { printf '%s' "$pt"; return 0; }
+  fi
+  printf '%s' "$thread_id"
+}
+
+# Path 1 helpers — find a prior wt_path that handled a given wake key for an
+# oracle. Reads the most-recent state file matching that (oracle, wake_key)
+# tuple (whether `completed` or terminal-success) — its wt_path is the
+# candidate for --resume reuse.
+find_prior_wt_for_key() {
+  local oracle=$1 key=$2
+  [ -z "$key" ] && return 1
   local state_dir="$STATE_DIR/state/$oracle"
   [ ! -d "$state_dir" ] && return 1
-  # Newest state file first; pick the first one whose thread_id + wt_path match.
+  # Newest state file first; pick the first one whose wake_key + wt_path match.
   local latest
   latest=$(ls -t "$state_dir"/*.state 2>/dev/null | while read -r f; do
-    grep -q "^thread_id=$thread_id$" "$f" 2>/dev/null && echo "$f"
+    grep -q "^wake_key=$key$" "$f" 2>/dev/null && echo "$f"
   done | head -1)
   [ -z "$latest" ] && return 1
   grep '^wt_path=' "$latest" 2>/dev/null | tail -1 | cut -d= -f2-
@@ -286,14 +319,92 @@ claude_alive_at() {
   return 0
 }
 
+# ─── Orchestrator fan-out dedup (§11k) ─────────────────────────────────────
+#
+# True (0) iff a NEW envelope for wake key `key` must DEFER rather than fire,
+# because the campaign already has work in progress. "Busy" means either:
+#   (a) another non-terminal state file (fired|verified|deferred) shares the
+#       wake_key — a wake for this campaign is already mid-flight or queued; OR
+#   (b) a session-id is mapped for the key AND its worktree still has an
+#       actively-working claude (claude_alive_at).
+# When neither holds the campaign is idle: firing now produces exactly ONE
+# session — a fresh spawn (no prior) or a --resume into the idle worktree.
+parent_session_busy() {
+  local oracle=$1 key=$2 self_sf=$3
+  [ -z "$key" ] && return 1
+
+  local other st
+  for other in "$STATE_DIR"/state/"$oracle"/*.state; do
+    [ -f "$other" ] || continue
+    [ "$other" = "$self_sf" ] && continue
+    grep -q "^wake_key=$key$" "$other" 2>/dev/null || continue
+    st=$(grep '^status=' "$other" | tail -1 | cut -d= -f2)
+    case "$st" in
+      fired|verified|deferred) return 0 ;;
+    esac
+  done
+
+  local sid_file="$STATE_DIR/sessions/$oracle/thread-$key.session-id"
+  if [ -f "$sid_file" ]; then
+    local prior_wt
+    prior_wt=$(find_prior_wt_for_key "$oracle" "$key")
+    [ -n "$prior_wt" ] && [ -d "$prior_wt" ] && claude_alive_at "$prior_wt" && return 0
+  fi
+  return 1
+}
+
+# For a DEFERRED envelope: true (0) iff it should fire now. The campaign must
+# be idle (no fired/verified sibling, no live prior claude) AND this envelope
+# must be the highest-priority deferred one for the key — oldest deferred_since,
+# filename tie-break. Exactly one deferred envelope wins per idle window; once
+# it fires (status=fired) the rest see a fired sibling and keep waiting. This
+# winner-election is what stops two deferred siblings from each treating the
+# other as "busy" forever (mutual-defer deadlock).
+deferred_ready_to_fire() {
+  local oracle=$1 key=$2 self_sf=$3 self_since=$4
+  [ -z "$key" ] && return 1
+  local other st osince
+  for other in "$STATE_DIR"/state/"$oracle"/*.state; do
+    [ -f "$other" ] || continue
+    [ "$other" = "$self_sf" ] && continue
+    grep -q "^wake_key=$key$" "$other" 2>/dev/null || continue
+    st=$(grep '^status=' "$other" | tail -1 | cut -d= -f2)
+    case "$st" in
+      fired|verified) return 1 ;;   # a live wake already owns the key
+      deferred)
+        osince=$(grep '^deferred_since=' "$other" | tail -1 | cut -d= -f2)
+        osince=${osince:-0}
+        if [ "$osince" -lt "$self_since" ] 2>/dev/null; then
+          return 1                  # older deferred sibling outranks us
+        elif [ "$osince" -eq "$self_since" ] 2>/dev/null \
+             && [ "$(basename "$other")" \< "$(basename "$self_sf")" ]; then
+          return 1                  # same age — lexically-first filename wins
+        fi
+        ;;
+    esac
+  done
+  # No blocking sibling — last gate: any prior claude must be idle/dead.
+  local sid_file="$STATE_DIR/sessions/$oracle/thread-$key.session-id"
+  if [ -f "$sid_file" ]; then
+    local prior_wt
+    prior_wt=$(find_prior_wt_for_key "$oracle" "$key")
+    [ -n "$prior_wt" ] && [ -d "$prior_wt" ] && claude_alive_at "$prior_wt" && return 1
+  fi
+  return 0
+}
+
 # ─── State transitions ─────────────────────────────────────────────────────
 
 fire_wake() {
   local oracle=$1 file=$2 fname=$3
-  local thread_id wake_ts wt_suffix sf wake_out wt_path
+  local thread_id wkey wake_ts wt_suffix sf wake_out wt_path
   local sid_file prior_sid prior_wt resume_sid wt_arg
 
   thread_id=$(grep '^thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
+  # Wake key — parent_thread for orchestrator fan-out replies, else thread.
+  # Drives the §11f session map + Path 1 worktree reuse so a campaign's
+  # replies converge on one session (§11k dedup).
+  wkey=$(wake_key "$oracle" "$file" "$thread_id")
   wake_ts=$(date +%s)
   wt_suffix=inbox-$wake_ts
   sf=$(state_path "$oracle" "$fname")
@@ -317,7 +428,7 @@ fire_wake() {
   # being killed here doesn't matter.
   if [ -n "$thread_id" ] && is_cancel_envelope "$file"; then
     local cancel_prior_wt
-    cancel_prior_wt=$(find_prior_wt_for_thread "$oracle" "$thread_id")
+    cancel_prior_wt=$(find_prior_wt_for_key "$oracle" "$wkey")
     if [ -n "$cancel_prior_wt" ] && [ -d "$cancel_prior_wt" ] \
        && [ -n "$(claude_pids_at "$cancel_prior_wt")" ]; then
       log "[$oracle] CANCEL PRE-EMPT — terminating claude(s) at $cancel_prior_wt for thread $thread_id"
@@ -335,11 +446,11 @@ fire_wake() {
   # Skipped for cancel envelopes (handled above): cancel handler runs on
   # a fresh wake; prior session was just killed so resume would fail
   # anyway and the cancel doesn't need that context.
-  if [ -n "$thread_id" ] && ! is_cancel_envelope "$file"; then
-    sid_file="$STATE_DIR/sessions/$oracle/thread-$thread_id.session-id"
+  if [ -n "$wkey" ] && ! is_cancel_envelope "$file"; then
+    sid_file="$STATE_DIR/sessions/$oracle/thread-$wkey.session-id"
     if [ -f "$sid_file" ]; then
       prior_sid=$(cat "$sid_file")
-      prior_wt=$(find_prior_wt_for_thread "$oracle" "$thread_id")
+      prior_wt=$(find_prior_wt_for_key "$oracle" "$wkey")
       if [ -n "$prior_sid" ] && [ -n "$prior_wt" ] && [ -d "$prior_wt" ] \
          && ! claude_alive_at "$prior_wt"; then
         resume_sid=$prior_sid
@@ -356,6 +467,7 @@ fire_wake() {
     "oracle=$oracle" \
     "fname=$fname" \
     "thread_id=$thread_id" \
+    "wake_key=$wkey" \
     "wt_suffix=$wt_suffix" \
     "status=fired"
   [ -n "${resume_sid:-}" ] && set_state_field "$sf" resume_sid "$resume_sid"
@@ -397,7 +509,7 @@ fire_wake() {
 verify_delivery() {
   local sf=$1
   read_state "$sf" || return 0
-  local now age proj_dir jsonl sid sids_dir
+  local now age proj_dir jsonl sid sids_dir key
   now=$(date +%s)
   age=$((now - fired_at))
 
@@ -407,10 +519,14 @@ verify_delivery() {
       jsonl=$(ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
       if [ -n "$jsonl" ] && jsonl_has_prompt "$jsonl" "$fname"; then
         sid=$(basename "$jsonl" .jsonl)
-        if [ -n "${thread_id:-}" ] && [ "$thread_id" != "" ]; then
+        # Capture the session under the WAKE KEY (parent_thread for
+        # orchestrator fan-out, else thread) so later same-campaign replies
+        # resume this session instead of spawning a sibling (§11k).
+        key=${wake_key:-$thread_id}
+        if [ -n "$key" ]; then
           sids_dir=$STATE_DIR/sessions/$oracle
           mkdir -p "$sids_dir"
-          printf '%s\n' "$sid" >"$sids_dir/thread-$thread_id.session-id"
+          printf '%s\n' "$sid" >"$sids_dir/thread-$key.session-id"
         fi
         set_state_field "$sf" status verified
         set_state_field "$sf" verified_at "$now"
@@ -537,6 +653,69 @@ maybe_retire_worktree() {
   fi
 }
 
+# ─── Fire-or-defer dispatch (§11k orchestrator fan-out dedup) ──────────────
+
+# Entry point for a NEW envelope. Orchestrator fan-out replies whose parent
+# campaign already has a live/in-flight session are DEFERRED (status=deferred)
+# so the campaign is processed by ONE orchestrator session, serially — see
+# parent_session_busy. Cancel envelopes (priority-1) and all non-orchestrator
+# traffic always fire immediately.
+maybe_fire_or_defer() {
+  local oracle=$1 file=$2 fname=$3 sf=$4
+  local thread_id wkey
+
+  if [ "$oracle" = "orchestrator" ] && ! is_cancel_envelope "$file"; then
+    thread_id=$(grep '^thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
+    wkey=$(wake_key "$oracle" "$file" "$thread_id")
+    if [ -n "$wkey" ] && parent_session_busy "$oracle" "$wkey" "$sf"; then
+      write_state "$sf" \
+        "oracle=$oracle" \
+        "fname=$fname" \
+        "thread_id=$thread_id" \
+        "wake_key=$wkey" \
+        "deferred_since=$(date +%s)" \
+        "status=deferred"
+      log "[$oracle] $fname → DEFER (parent campaign $wkey already has a live session; queued, will --resume into it when idle)"
+      return 0
+    fi
+  fi
+  fire_wake "$oracle" "$file" "$fname"
+}
+
+# A deferred envelope re-evaluates every scan. Once the parent campaign goes
+# idle this envelope (if it wins the deferred-sibling election) fires — and
+# fire_wake's Path 1 --resumes the campaign's worktree, so no sibling session
+# is ever spawned. If the campaign stays busy past T2 the envelope is NOT
+# lost — it stays queued and an alert surfaces the backlog.
+reconsider_deferred() {
+  local sf=$1 file=$2
+  read_state "$sf" || return 0
+  local key=${wake_key:-$thread_id} now age
+
+  if [ ! -f "$file" ]; then
+    # Envelope archived out-of-band while deferred — close it out.
+    set_state_field "$sf" status completed
+    set_state_field "$sf" completed_at "$(date +%s)"
+    log "[$oracle] $fname COMPLETED (archived while deferred)"
+    return 0
+  fi
+
+  if deferred_ready_to_fire "$oracle" "$key" "$sf" "${deferred_since:-0}"; then
+    log "[$oracle] $fname → un-defer (parent campaign $key now idle; resuming into it)"
+    if mkdir "$sf.lock" 2>/dev/null; then
+      fire_wake "$oracle" "$file" "$fname"
+      rmdir "$sf.lock" 2>/dev/null
+    fi
+    return 0
+  fi
+
+  now=$(date +%s)
+  age=$((now - ${deferred_since:-now}))
+  if [ "$age" -ge "$T2_PROCESSING_DEADLINE" ]; then
+    alert "[$oracle] $fname DEFERRED ${age}s — parent campaign $key still busy past T2; still queued (not dropped)"
+  fi
+}
+
 # ─── Scan loop ─────────────────────────────────────────────────────────────
 
 scan_inbox() {
@@ -567,7 +746,7 @@ scan_inbox() {
         # impossible: loser sees the state file on the next scan tick.
         mkdir -p "$(dirname "$sf")"
         if mkdir "$sf.lock" 2>/dev/null; then
-          fire_wake "$oracle" "$file" "$fname"
+          maybe_fire_or_defer "$oracle" "$file" "$fname" "$sf"
           rmdir "$sf.lock" 2>/dev/null
         else
           log "[$oracle] $fname — claim contended (lock held); deferring"
@@ -578,6 +757,7 @@ scan_inbox() {
         case "${status:-unknown}" in
           fired)              verify_delivery "$sf" ;;
           verified)           verify_processing "$sf" "$file" ;;
+          deferred)           reconsider_deferred "$sf" "$file" ;;
           completed|failed_*|fire_failed) : ;;  # terminal
           *)                  alert "[$oracle] $fname unknown status=$status" ;;
         esac
@@ -585,11 +765,10 @@ scan_inbox() {
     done
   done
 
-  # Pass 2 — iterate state files for verified envelopes whose backing file
-  # has been archived (moved out of the inbox root). Pass 1 misses these
-  # because it only sees files currently in for-{oracle}/, so a verified
-  # envelope that was archived between two scans never transitions to
-  # `completed` without this pass.
+  # Pass 2 — iterate state files for verified (or deferred) envelopes whose
+  # backing file has been archived (moved out of the inbox root). Pass 1
+  # misses these because it only sees files currently in for-{oracle}/, so an
+  # envelope archived between two scans never reaches `completed` without it.
   for state_dir in "$STATE_DIR"/state/*/; do
     [ -d "$state_dir" ] || continue
     oracle=$(basename "$state_dir")
@@ -599,9 +778,14 @@ scan_inbox() {
       [ -f "$sf" ] || continue
       # shellcheck disable=SC1090
       source "$sf"
-      [ "${status:-}" = "verified" ] || continue
       file="$INBOX_BASE/for-$oracle/$fname"
-      [ ! -f "$file" ] && verify_processing "$sf" "$file"
+      case "${status:-}" in
+        verified)  [ ! -f "$file" ] && verify_processing "$sf" "$file" ;;
+        # A deferred envelope whose file was archived out-of-band: Pass 1
+        # never sees it (it iterates files still in for-{oracle}/), so finalize
+        # it here.
+        deferred)  [ ! -f "$file" ] && reconsider_deferred "$sf" "$file" ;;
+      esac
     done
   done
 
