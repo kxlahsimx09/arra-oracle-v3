@@ -124,16 +124,20 @@ test("replies under DIFFERENT parent_thread are distinct campaigns → both fire
   expect(Object.values(states("orchestrator")).sort()).toEqual(["fired", "fired"]);
 });
 
-test("non-orchestrator envelopes are never deferred (no fan-out dedup)", () => {
-  // Two envelopes to brew-ops, different threads — both must fire.
+test("worker envelopes sharing a parent_thread also dedup (§153)", () => {
+  // §153 reversed the 2026-05-16 "workers don't dedup" carve-out. Two
+  // dispatches to brew-ops sharing one campaign (parent 700) must NOT each
+  // --fresh-spawn a worker session: the 2nd serializes onto the 1st (the
+  // wt-43/wt-46 sibling-spawn incident). See inbox-watcher-dispatch-dedup
+  // for the full dispatch-side matrix.
   envelope("brew-ops", "2026-05-16_19-01_from-next-impl_thread-701_reply.md", { thread: 701, parentThread: 700 });
   envelope("brew-ops", "2026-05-16_19-02_from-next-impl_thread-702_reply.md", { thread: 702, parentThread: 700 });
 
   const r = scanOnce();
   expect(r.status).toBe(0);
 
-  expect(fireCount()).toBe(2);
-  expect(Object.values(states("brew-ops")).sort()).toEqual(["fired", "fired"]);
+  expect(fireCount()).toBe(1);
+  expect(Object.values(states("brew-ops")).sort()).toEqual(["deferred", "fired"]);
 });
 
 test("orchestrator envelope without parent_thread keys on its own thread → fires", () => {
