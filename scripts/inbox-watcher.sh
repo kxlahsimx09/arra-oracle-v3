@@ -125,7 +125,21 @@ mkdir -p "$STATE_DIR/state" "$STATE_DIR/sessions"
 # ─── Helpers ───────────────────────────────────────────────────────────────
 
 log() {
-  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE" >&2
+  # Write exactly ONE copy to $LOG_FILE. Echo to stderr only when stderr is a
+  # terminal (interactive foreground run).
+  #
+  # The old form was `printf … | tee -a "$LOG_FILE" >&2`. A daemon launched the
+  # conventional way — `nohup … >>"$LOG_FILE" 2>&1` — has fd 2 pointing back at
+  # $LOG_FILE itself, so `tee` wrote the line once (tee→file) and `>&2` wrote it
+  # a second time (tee's stdout→fd 2→same file). Every gc_sweep/scan/alert line
+  # landed twice. Verified 2026-05-17: watcher pid 79344 had fd 1 AND fd 2 both
+  # on inbox-watcher.log. The `[ -t 2 ]` guard keeps console echo for foreground
+  # runs without ever double-writing the file.
+  local line
+  line="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+  printf '%s\n' "$line" >>"$LOG_FILE"
+  [ -t 2 ] && printf '%s\n' "$line" >&2
+  return 0
 }
 
 alert() {
