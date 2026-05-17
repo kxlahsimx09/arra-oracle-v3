@@ -22,6 +22,18 @@
 #   verified (T2 deadline elapsed)       → failed_stuck + alert
 #   completed | failed_*                 (terminal — kept for audit)
 #
+# Sticky reply-routing (thread #151): a reply for a campaign whose OWNER
+# session is recorded (owner map below) is routed back to that exact session
+# instead of `--fresh`-spawning a sibling. The owner is the session that
+# OPENED the thread; the watcher learns it from the dispatch envelope's
+# `parent_session` field (§11b). Routing (route_to_owner):
+#   owner live + idle  → send-keys the reply into it (status
+#                        `delivered_to_owner`, then verified/completed like
+#                        `fired`); no new session.
+#   owner live + busy  → deferred — re-routed when the owner goes idle.
+#   owner idle/dead    → `--resume` the owner session in its worktree.
+#   owner worktree gone→ `--fresh` spawn; ownership transfers to the new wt.
+#
 # Wake key (§11f/§11k campaign session reuse): ANY envelope carrying a
 # `parent_thread:` (a §11k fan-out sub-task envelope) keys the session map +
 # worktree reuse on parent_thread — one session per oracle per campaign, not
@@ -40,9 +52,12 @@
 #   ├── inbox-watcher.log              (rotating-by-restart log)
 #   ├── inbox-watcher.pid
 #   ├── state/<oracle>/<fname>.state    (per-envelope state machine)
-#   └── sessions/<oracle>/thread-<K>.session-id  (per-wake-key session capture;
-#                                          K = parent_thread for any fan-out
-#                                          sub-task, else the envelope's thread)
+#   ├── sessions/<oracle>/thread-<K>.session-id  (per-wake-key session capture;
+#   │                                      K = parent_thread for any fan-out
+#   │                                      sub-task, else the envelope's thread)
+#   └── sessions/<oracle>/thread-<K>.owner  (sticky reply-routing, thread #151:
+#                                          absolute worktree path of the
+#                                          session that owns campaign K)
 #
 # Usage:
 #   bash inbox-watcher.sh                 # foreground (interactive log to stdout)
@@ -110,6 +125,18 @@ MAW_BIN=${MAW_BIN:-bun /Users/dev01/Code/github.com/Soul-Brews-Studio/maw-js/src
 CLAUDE_STUCK_TIMEOUT=${CLAUDE_STUCK_TIMEOUT:-600}
 
 CLAUDE_PROJECTS=${CLAUDE_PROJECTS:-$HOME/.claude/projects}
+
+# Sticky reply-routing (thread #151, §5(a)). A reply for a campaign is
+# send-keyed into the owner's live session ONLY when that session looks parked
+# at a prompt — its newest JSONL has been idle at least this many seconds. A
+# shorter idle ⇒ the owner is mid-turn, and the reply is deferred instead, so
+# send-keys never collides with an in-progress turn. Deliberately short: a
+# deferred envelope is re-checked every poll, so over-deferring only costs one
+# cycle of latency, while under-deferring risks a buffer collision.
+OWNER_IDLE_GRACE=${OWNER_IDLE_GRACE:-45}
+# tmux binary — overridable so tests can stub the worktree→window resolution
+# that owner send-keys routing depends on.
+TMUX_BIN=${TMUX_BIN:-tmux}
 
 # Resolve maw binary: prefer PATH-resolved `maw`, else direct bun invocation
 # of the local maw-js source tree (matches the dev01 ghq layout).
@@ -362,6 +389,114 @@ claude_alive_at() {
   return 0
 }
 
+# ─── Sticky reply-routing — owner map (thread #151) ────────────────────────
+#
+# A campaign's "owner" is the session that OPENED its thread. The watcher
+# cannot infer ownership: a thread opened inside an already-running session via
+# an `arra_thread` MCP call produces no inbox event, so the watcher never sees
+# that session. It must be TOLD — by the dispatcher, in the dispatch envelope's
+# `parent_session` field (§11b). record_owner_from_dispatch harvests that
+# field; route_to_owner uses it so a reply wakes the session that dispatched
+# the work, not a fresh sibling. Owner identity is the absolute worktree PATH
+# (a Claude session cannot reliably self-report its session-id UUID mid-run);
+# the UUID is derived from the path on demand (derive_session_id).
+
+owner_file() { printf '%s/sessions/%s/thread-%s.owner' "$STATE_DIR" "$1" "$2"; }
+
+# Echo the owner worktree path for (oracle, wake-key); return 1 if unrecorded.
+read_owner() {
+  local of v
+  of=$(owner_file "$1" "$2")
+  [ -f "$of" ] || return 1
+  v=$(cat "$of" 2>/dev/null)
+  [ -z "$v" ] && return 1
+  printf '%s' "$v"
+}
+
+write_owner() {
+  local of
+  of=$(owner_file "$1" "$2")
+  mkdir -p "$(dirname "$of")"
+  printf '%s\n' "$3" >"$of"
+}
+
+# Harvest campaign ownership from a dispatch envelope. ANY envelope carrying
+# parent_thread + parent_oracle + parent_session records
+# owner(parent_oracle, parent_thread) = parent_session. Runs on every scanned
+# envelope — cheap, idempotent. WRITE-ONCE: a later scan of the same dispatch
+# envelope must not clobber an ownership transfer made by route_to_owner's
+# dead-owner fallback, so it writes only when no owner file exists yet.
+record_owner_from_dispatch() {
+  local file=$1 pt po ps of
+  pt=$(grep '^parent_thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
+  po=$(grep '^parent_oracle:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
+  ps=$(grep '^parent_session:' "$file" 2>/dev/null | head -1 | sed -n 's/^parent_session: *//p')
+  [ -n "$pt" ] && [ -n "$po" ] && [ -n "$ps" ] || return 0
+  of=$(owner_file "$po" "$pt")
+  if [ ! -f "$of" ]; then
+    mkdir -p "$(dirname "$of")"
+    printf '%s\n' "$ps" >"$of"
+    log "owner recorded: campaign $pt (oracle $po) → $ps"
+  fi
+}
+
+# Derive a Claude session-id from a worktree: the newest JSONL basename under
+# its encoded project dir. EDGE (thread #151 §1): if a human ran multiple
+# claude sessions in one worktree this picks the most recent, which may not be
+# the intended one — rare for a single-purpose dispatch worktree, noted here
+# for a future debugger.
+derive_session_id() {
+  local wt=$1 proj_dir jsonl
+  [ -z "$wt" ] && return 1
+  proj_dir="$CLAUDE_PROJECTS/$(encode_cwd "$wt")"
+  [ -d "$proj_dir" ] || return 1
+  jsonl=$(ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
+  [ -z "$jsonl" ] && return 1
+  basename "$jsonl" .jsonl
+}
+
+# Classify an owner worktree into a routing action. Echoes exactly one of:
+#   gone       worktree dir absent → caller --fresh-spawns + transfers ownership
+#   resume     dir present, no claude process at cwd → --resume the owner session
+#   send_keys  dir present, claude process up, JSONL idle > OWNER_IDLE_GRACE →
+#              session parked at a prompt → deliver via send-keys (§5(a))
+#   busy       dir present, claude process up, JSONL written within
+#              OWNER_IDLE_GRACE → mid-turn → defer (avoid a buffer collision)
+# §5(a): the JSONL-idle gate eliminates the dangerous mid-turn send-keys; the
+# accepted residual is a human who typed-but-not-submitted (visible, recoverable).
+owner_route_decision() {
+  local wt=$1
+  [ -d "$wt" ] || { printf gone; return 0; }
+
+  local pid_found="" pid pcwd
+  while read -r pid; do
+    [ -z "$pid" ] && continue
+    pcwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    [ "$pcwd" = "$wt" ] && { pid_found=$pid; break; }
+  done < <(pgrep -f "claude " 2>/dev/null)
+  [ -z "$pid_found" ] && { printf resume; return 0; }
+
+  local proj_dir newest age
+  proj_dir="$CLAUDE_PROJECTS/$(encode_cwd "$wt")"
+  newest=$(stat -f %m "$proj_dir"/*.jsonl 2>/dev/null | sort -nr | head -1)
+  [ -z "$newest" ] && { printf resume; return 0; }   # process but no JSONL — anomalous
+  age=$(( $(date +%s) - newest ))
+  if [ "$age" -gt "$OWNER_IDLE_GRACE" ]; then printf send_keys; else printf busy; fi
+  return 0
+}
+
+# Map an owner worktree path → a `maw hey` target (`local:<session>:<window>`,
+# the #410 three-part form). Matches the worktree against tmux panes by cwd, so
+# it is robust to maw's window-naming scheme. Empty output ⇒ no window maps to
+# the worktree (the caller falls back to --resume). TMUX_BIN is overridable for
+# tests.
+resolve_tmux_target() {
+  local wt=$1
+  [ -z "$wt" ] && return 1
+  $TMUX_BIN list-windows -a -F '#{pane_current_path}|#{session_name}|#{window_name}' 2>/dev/null \
+    | awk -F'|' -v wt="$wt" '$1==wt {print "local:" $2 ":" $3; exit}'
+}
+
 # ─── Orchestrator fan-out dedup (§11k) ─────────────────────────────────────
 #
 # True (0) iff a NEW envelope for wake key `key` must DEFER rather than fire,
@@ -439,9 +574,9 @@ deferred_ready_to_fire() {
 # ─── State transitions ─────────────────────────────────────────────────────
 
 fire_wake() {
-  local oracle=$1 file=$2 fname=$3
+  local oracle=$1 file=$2 fname=$3 owner_resume_wt=${4:-}
   local thread_id wkey wake_ts wt_suffix sf wake_out wt_path
-  local sid_file prior_sid prior_wt resume_sid wt_arg
+  local sid_file prior_sid prior_wt resume_sid wt_arg owner_routed_flag=""
 
   thread_id=$(grep '^thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
   # Wake key — parent_thread for any fan-out sub-task envelope, else thread.
@@ -479,6 +614,26 @@ fire_wake() {
     fi
   fi
 
+  # Owner-record resume (sticky reply-routing, thread #151). When the caller
+  # passes an explicit owner worktree — the session that opened the thread,
+  # recorded from a dispatch envelope's `parent_session` — resume THAT session
+  # rather than the watcher's own session map. The session-id is derived from
+  # the owner worktree's newest JSONL (the owner was likely never
+  # watcher-spawned, so the session map has no entry for it). `owner_routed=1`
+  # is stamped on the state below so safe_to_retire never retires a worktree
+  # the watcher did not create. Takes precedence over Path 1.
+  if [ -n "$owner_resume_wt" ] && [ -d "$owner_resume_wt" ]; then
+    local owner_sid
+    owner_sid=$(derive_session_id "$owner_resume_wt")
+    if [ -n "$owner_sid" ]; then
+      resume_sid=$owner_sid
+      wt_suffix=$(basename "$owner_resume_wt" | sed 's/^[^.]*\.wt-[0-9]*-//')
+      owner_routed_flag=1
+      log "[$oracle] $fname → owner-resume into $owner_resume_wt (sid=$owner_sid)"
+    else
+      log "[$oracle] $fname → owner-resume requested but no JSONL under $owner_resume_wt; --fresh"
+    fi
+
   # Path 1 — worktree reuse via maw --resume. If we already have a
   # session-id mapped for this (oracle, wake-key) AND no claude is currently
   # alive in the worktree that birthed it, resume that session in the SAME
@@ -489,7 +644,7 @@ fire_wake() {
   # Skipped for cancel envelopes (handled above): cancel handler runs on
   # a fresh wake; prior session was just killed so resume would fail
   # anyway and the cancel doesn't need that context.
-  if [ -n "$wkey" ] && ! is_cancel_envelope "$file"; then
+  elif [ -n "$wkey" ] && ! is_cancel_envelope "$file"; then
     sid_file="$STATE_DIR/sessions/$oracle/thread-$wkey.session-id"
     if [ -f "$sid_file" ]; then
       prior_sid=$(cat "$sid_file")
@@ -514,8 +669,9 @@ fire_wake() {
     "wt_suffix=$wt_suffix" \
     "status=fired"
   [ -n "${resume_sid:-}" ] && set_state_field "$sf" resume_sid "$resume_sid"
+  [ -n "$owner_routed_flag" ] && set_state_field "$sf" owner_routed 1
 
-  log "[$oracle] $fname → fire (thread=$thread_id, suffix=$wt_suffix${resume_sid:+, RESUME sid=$resume_sid})"
+  log "[$oracle] $fname → fire (thread=$thread_id, suffix=$wt_suffix${resume_sid:+, RESUME sid=$resume_sid}${owner_routed_flag:+, owner-routed})"
 
   # Build prompt with FULL envelope path embedded. Without the path, fresh
   # subagents respond to `inbox: <fname>` by running `find / -name <fname>`,
@@ -667,6 +823,12 @@ safe_to_retire() {
   local sf=$1
   read_state "$sf" || { echo "state-unreadable"; return 1; }
 
+  # Sticky reply-routing (thread #151): an owner-routed envelope operates on a
+  # worktree the watcher did NOT spawn (the session that opened the thread —
+  # possibly human-driven). The watcher only retires what it created, so an
+  # owner-routed wt is never a retire candidate.
+  [ "${owner_routed:-}" = "1" ] && { echo "owner-routed-wt-not-watcher-spawned"; return 1; }
+
   [ -z "${wt_path:-}" ] && { echo "no-wt-path"; return 1; }
   [ ! -d "$wt_path" ] && { echo "wt-already-gone"; return 1; }
 
@@ -756,6 +918,13 @@ evict_session_id() {
     rm -f "$sid_file"
     log "[$oracle] evicted session-id thread-$key (campaign retired)"
   fi
+  # Sticky reply-routing (thread #151): the owner map is campaign-scoped state
+  # too — drop it on retire alongside the session-id.
+  local owner_f="$STATE_DIR/sessions/$oracle/thread-$key.owner"
+  if [ -f "$owner_f" ]; then
+    rm -f "$owner_f"
+    log "[$oracle] evicted owner map thread-$key (campaign retired)"
+  fi
 }
 
 # ─── Path 2b — periodic campaign GC sweep ─────────────────────────────────
@@ -809,17 +978,19 @@ gc_retire_completed() {
   done
 }
 
-# (2) Drop session-id cache files idle longer than the TTL.
+# (2) Drop session-id + owner cache files idle longer than the TTL. Both are
+# campaign-scoped routing state under sessions/<oracle>/ (thread #151 added the
+# .owner map); the TTL covers campaigns whose thread never formally closed.
 gc_evict_stale_sessions() {
-  local now sid_file mtime age_days
+  local now f mtime age_days
   now=$(date +%s)
-  for sid_file in "$STATE_DIR"/sessions/*/thread-*.session-id; do
-    [ -f "$sid_file" ] || continue
-    mtime=$(stat -f %m "$sid_file" 2>/dev/null) || continue
+  for f in "$STATE_DIR"/sessions/*/thread-*.session-id "$STATE_DIR"/sessions/*/thread-*.owner; do
+    [ -f "$f" ] || continue
+    mtime=$(stat -f %m "$f" 2>/dev/null) || continue
     age_days=$(( (now - mtime) / 86400 ))
     if [ "$age_days" -ge "$SESSION_TTL_DAYS" ]; then
-      rm -f "$sid_file"
-      log "gc: evicted stale session-id ${sid_file#"$STATE_DIR/sessions/"} (idle ${age_days}d ≥ ${SESSION_TTL_DAYS}d TTL)"
+      rm -f "$f"
+      log "gc: evicted stale routing file ${f#"$STATE_DIR/sessions/"} (idle ${age_days}d ≥ ${SESSION_TTL_DAYS}d TTL)"
     fi
   done
 }
@@ -902,20 +1073,119 @@ gc_sweep() {
   return 0
 }
 
+# ─── Sticky reply-routing — owner delivery (thread #151) ───────────────────
+
+# Send-keys path (§5(a)). Delivers the inbox prompt INTO the owner's already-
+# running claude session via `maw hey` (tmux send-keys) instead of spawning or
+# resuming a session. Pre-gated by owner_route_decision=send_keys (owner JSONL
+# idle > OWNER_IDLE_GRACE ⇒ parked at a prompt). The owner session was NOT
+# spawned by this watcher, so every send-keys is logged for audit (orchestrator
+# refinement, thread #151 msg 426) — a buffer collision becomes traceable, not
+# silent. T1/T2 verification then proceeds exactly as for `fired`: the prompt
+# lands in the owner's live JSONL and verify_delivery picks it up.
+deliver_to_owner() {
+  local oracle=$1 file=$2 fname=$3 sf=$4 thread_id=$5 key=$6 owner_wt=$7
+  local target envelope_path task_prompt now
+
+  target=$(resolve_tmux_target "$owner_wt")
+  if [ -z "$target" ]; then
+    # Owner is process-alive but no tmux window maps to its worktree, so
+    # send-keys has nowhere to go — fall back to a --resume into the worktree.
+    log "[$oracle] $fname → no tmux window maps to owner $owner_wt; falling back to --resume"
+    fire_wake "$oracle" "$file" "$fname" "$owner_wt"
+    return 0
+  fi
+
+  envelope_path="$INBOX_BASE/for-$oracle/$fname"
+  task_prompt="inbox: $fname (envelope path: $envelope_path — read this file directly with the Read tool; do not use \`find\`)"
+  now=$(date +%s)
+
+  # Write state BEFORE delivering — prevents a double-fire if the next scan
+  # races us (mirrors fire_wake). owner_routed=1 keeps safe_to_retire off this
+  # worktree — the watcher did not spawn it.
+  write_state "$sf" \
+    "fired_at=$now" \
+    "oracle=$oracle" \
+    "fname=$fname" \
+    "thread_id=$thread_id" \
+    "wake_key=$key" \
+    "wt_path=$owner_wt" \
+    "owner_target=$target" \
+    "owner_routed=1" \
+    "status=delivered_to_owner"
+
+  log "[$oracle] $fname → delivered_to_owner: send-keys into owner window $target (wt=$owner_wt, campaign $key) — owner session NOT watcher-spawned; any buffer collision is auditable here"
+
+  if ! $MAW_BIN hey "$target" "$task_prompt" >>"$LOG_FILE" 2>&1; then
+    set_state_field "$sf" status fire_failed
+    set_state_field "$sf" failed_at "$(date +%s)"
+    alert "[$oracle] maw hey FAILED delivering $fname into owner $target"
+    return 1
+  fi
+  return 0
+}
+
+# Route an envelope for campaign `key` back to its recorded owner (the session
+# that opened the thread). Caller has confirmed an owner record exists. Always
+# handles the envelope — by delivering, resuming, deferring, or transferring
+# ownership — and returns 0. This is the sticky-routing core (thread #151).
+route_to_owner() {
+  local oracle=$1 file=$2 fname=$3 sf=$4 thread_id=$5 key=$6 owner_wt=$7
+  local decision new_wt
+  decision=$(owner_route_decision "$owner_wt")
+  case "$decision" in
+    send_keys)
+      deliver_to_owner "$oracle" "$file" "$fname" "$sf" "$thread_id" "$key" "$owner_wt" ;;
+    busy)
+      # Owner mid-turn — defer; reconsider_deferred re-routes once it goes
+      # idle. Preserve deferred_since if already deferred (T2 age tracking).
+      if ! grep -q '^status=deferred$' "$sf" 2>/dev/null; then
+        write_state "$sf" \
+          "oracle=$oracle" "fname=$fname" "thread_id=$thread_id" \
+          "wake_key=$key" "deferred_since=$(date +%s)" "status=deferred"
+      fi
+      log "[$oracle] $fname → DEFER (owner session for campaign $key is mid-turn; re-route when idle)" ;;
+    resume)
+      log "[$oracle] $fname → owner-route: resume idle owner session (campaign $key)"
+      fire_wake "$oracle" "$file" "$fname" "$owner_wt" ;;
+    gone)
+      log "[$oracle] $fname → owner-route: owner worktree gone (campaign $key); --fresh + ownership transfer"
+      fire_wake "$oracle" "$file" "$fname"
+      new_wt=$(grep '^wt_path=' "$sf" 2>/dev/null | tail -1 | cut -d= -f2-)
+      [ -n "$new_wt" ] && { write_owner "$oracle" "$key" "$new_wt"; log "[$oracle] campaign $key ownership transferred → $new_wt"; } ;;
+  esac
+  return 0
+}
+
 # ─── Fire-or-defer dispatch (§11k orchestrator fan-out dedup) ──────────────
 
-# Entry point for a NEW envelope. Orchestrator fan-out replies whose parent
-# campaign already has a live/in-flight session are DEFERRED (status=deferred)
-# so the campaign is processed by ONE orchestrator session, serially — see
-# parent_session_busy. Cancel envelopes (priority-1) and all non-orchestrator
-# traffic always fire immediately.
+# Entry point for a NEW envelope. Resolution order:
+#   1. Sticky reply-routing (thread #151) — if the campaign has a recorded
+#      owner, route the reply back to that exact session (route_to_owner).
+#   2. §11k orchestrator fan-out dedup — an orchestrator reply whose campaign
+#      already has a live/in-flight session is DEFERRED so the campaign is
+#      processed by ONE session, serially (parent_session_busy). This is the
+#      backward-compatible path for dispatchers that do not yet stamp
+#      `parent_session`.
+#   3. Otherwise fire immediately. Cancel envelopes always fire (priority-1).
 maybe_fire_or_defer() {
   local oracle=$1 file=$2 fname=$3 sf=$4
-  local thread_id wkey
+  local thread_id wkey owner_wt
 
+  thread_id=$(grep '^thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
+  wkey=$(wake_key "$file" "$thread_id")
+
+  # 1. Sticky reply-routing — campaign has a recorded owner.
+  if [ -n "$wkey" ] && ! is_cancel_envelope "$file"; then
+    owner_wt=$(read_owner "$oracle" "$wkey") || owner_wt=""
+    if [ -n "$owner_wt" ]; then
+      route_to_owner "$oracle" "$file" "$fname" "$sf" "$thread_id" "$wkey" "$owner_wt"
+      return 0
+    fi
+  fi
+
+  # 2. §11k orchestrator fan-out dedup (no owner record).
   if [ "$oracle" = "orchestrator" ] && ! is_cancel_envelope "$file"; then
-    thread_id=$(grep '^thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
-    wkey=$(wake_key "$file" "$thread_id")
     if [ -n "$wkey" ] && parent_session_busy "$oracle" "$wkey" "$sf"; then
       write_state "$sf" \
         "oracle=$oracle" \
@@ -928,24 +1198,45 @@ maybe_fire_or_defer() {
       return 0
     fi
   fi
+
+  # 3. Fire immediately.
   fire_wake "$oracle" "$file" "$fname"
 }
 
-# A deferred envelope re-evaluates every scan. Once the parent campaign goes
-# idle this envelope (if it wins the deferred-sibling election) fires — and
-# fire_wake's Path 1 --resumes the campaign's worktree, so no sibling session
-# is ever spawned. If the campaign stays busy past T2 the envelope is NOT
-# lost — it stays queued and an alert surfaces the backlog.
+# A deferred envelope re-evaluates every scan. Two deferral sources:
+#   - owner mid-turn (sticky routing) — re-run route_to_owner, which delivers
+#     via send-keys / resumes / transfers once the owner goes idle.
+#   - §11k fan-out dedup — once the campaign goes idle this envelope (if it
+#     wins the deferred-sibling election) fires; fire_wake's Path 1 --resumes
+#     the campaign worktree so no sibling session is spawned.
+# Either way, if the campaign stays busy past T2 the envelope is NOT lost — it
+# stays queued and an alert surfaces the backlog.
 reconsider_deferred() {
   local sf=$1 file=$2
   read_state "$sf" || return 0
-  local key=${wake_key:-$thread_id} now age
+  local key=${wake_key:-$thread_id} now age owner_wt
 
   if [ ! -f "$file" ]; then
     # Envelope archived out-of-band while deferred — close it out.
     set_state_field "$sf" status completed
     set_state_field "$sf" completed_at "$(date +%s)"
     log "[$oracle] $fname COMPLETED (archived while deferred)"
+    return 0
+  fi
+
+  # Owner-routed deferral: re-run sticky routing. route_to_owner re-defers if
+  # the owner is still mid-turn, or delivers/resumes/transfers once it is idle.
+  owner_wt=$(read_owner "$oracle" "$key") || owner_wt=""
+  if [ -n "$owner_wt" ]; then
+    if mkdir "$sf.lock" 2>/dev/null; then
+      route_to_owner "$oracle" "$file" "$fname" "$sf" "${thread_id:-}" "$key" "$owner_wt"
+      rmdir "$sf.lock" 2>/dev/null
+    fi
+    now=$(date +%s)
+    age=$((now - ${deferred_since:-now}))
+    if [ "$age" -ge "$T2_PROCESSING_DEADLINE" ] && grep -q '^status=deferred$' "$sf" 2>/dev/null; then
+      alert "[$oracle] $fname owner-DEFERRED ${age}s — owner session for campaign $key still mid-turn past T2; still queued (not dropped)"
+    fi
     return 0
   fi
 
@@ -981,6 +1272,11 @@ scan_inbox() {
       fname=$(basename "$file")
       [ "$fname" = ".gitkeep" ] && continue
 
+      # Sticky reply-routing (thread #151): harvest campaign ownership from any
+      # envelope carrying parent_session — runs on every file, every scan,
+      # write-once + idempotent, regardless of the envelope's own state.
+      record_owner_from_dispatch "$file"
+
       sf=$(state_path "$oracle" "$fname")
 
       if [ ! -f "$sf" ]; then
@@ -1004,7 +1300,7 @@ scan_inbox() {
         # shellcheck disable=SC1090
         source "$sf"
         case "${status:-unknown}" in
-          fired)              verify_delivery "$sf" ;;
+          fired|delivered_to_owner) verify_delivery "$sf" ;;
           verified)           verify_processing "$sf" "$file" ;;
           deferred)           reconsider_deferred "$sf" "$file" ;;
           completed|failed_*|fire_failed) : ;;  # terminal
@@ -1030,6 +1326,11 @@ scan_inbox() {
       file="$INBOX_BASE/for-$oracle/$fname"
       case "${status:-}" in
         verified)  [ ! -f "$file" ] && verify_processing "$sf" "$file" ;;
+        # A delivered_to_owner envelope can be archived FAST — the owner is a
+        # live session that may read+reply+archive within one poll. Pass 1
+        # won't see the vanished file, so verify it here (→ verified → a later
+        # pass → completed). Without this it would hang in delivered_to_owner.
+        delivered_to_owner) [ ! -f "$file" ] && verify_delivery "$sf" ;;
         # A deferred envelope whose file was archived out-of-band: Pass 1
         # never sees it (it iterates files still in for-{oracle}/), so finalize
         # it here.
@@ -1147,6 +1448,13 @@ case ${1:-loop} in
         printf '  %s → %s\n' "${f#"$STATE_DIR/sessions/"}" "$(cat "$f")"
       done
     fi
+    echo
+    echo "campaign owner map (sticky reply-routing):"
+    if [ -d "$STATE_DIR/sessions" ]; then
+      find "$STATE_DIR/sessions" -name 'thread-*.owner' -type f 2>/dev/null | while read -r f; do
+        printf '  %s → %s\n' "${f#"$STATE_DIR/sessions/"}" "$(cat "$f")"
+      done
+    fi
     ;;
   scan-once)
     log "scan-once (single pass)"
@@ -1167,7 +1475,8 @@ usage: $0 {loop|start|stop|status|scan-once|gc-once}
 env overrides: INBOX_BASE, STATE_DIR, LOG_FILE, INBOX_POLL_INTERVAL,
                T1_DELIVERY_DEADLINE, T2_PROCESSING_DEADLINE,
                INBOX_SCAN_ENABLED, INBOX_AUTO_CLEAN, INBOX_GC_INTERVAL,
-               SESSION_TTL_DAYS, MAW_BIN, CLAUDE_PROJECTS
+               SESSION_TTL_DAYS, MAW_BIN, CLAUDE_PROJECTS,
+               OWNER_IDLE_GRACE, TMUX_BIN
 USAGE
     exit 2
     ;;
