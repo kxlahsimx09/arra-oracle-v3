@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# inbox-loop-closure-hook.sh — Claude Code `Stop` hook (§11d enforcement)
+#
+# Problem it fixes: a dispatched oracle agent does the work but its session
+# exits without (1) writing the reply envelope for a `needs_response: true`
+# envelope and/or (2) archiving the inbound envelope per AGENTS.md §11d.
+# A skill step alone does not stick — agents skip it. This hook turns the
+# §11e Step 0.5 close-out into a hard, harness-level gate: the session
+# CANNOT end while the loop is open.
+#
+# Mechanism: registered as a `Stop` hook in ~/.claude/settings.json. On every
+# stop it identifies the oracle (via the inbox-watcher's own session→oracle
+# map), then blocks the stop (exit 2 + stderr) if the oracle still has an
+# unhandled envelope, or archived a needs_response envelope with no reply.
+#
+# Self-gating: it engages ONLY for sessions the inbox-watcher spawned to
+# handle an envelope (session-id reverse lookup). Every other claude session
+# — interactive dev work, non-oracle panes — is a silent no-op.
+#
+# Fail-open: any unexpected error allows the stop. A hook must never wedge a
+# session. The inbox-watcher T2 `failed_stuck` gate remains the backstop.
+#
+# Owner: brew-ops. See AGENTS.md §11l. Source of truth: this file in
+# arra-oracle-v3/scripts/; deployed copy at ~/.claude/hooks/ by
+# install-inbox-loop-closure-hook.sh.
+
+set -uo pipefail
+trap 'exit 0' ERR   # fail-open: never block a session on a hook bug
+
+INBOX_BASE=${INBOX_BASE:-$HOME/.arra-oracle-v2/ψ/inbox}
+WATCHER_STATE=${INBOX_WATCHER_STATE:-$HOME/.cache/inbox-watcher}
+HOOK_STATE=${INBOX_LOOP_HOOK_STATE:-$HOME/.cache/inbox-loop-closure}
+MAX_BLOCKS=${INBOX_LOOP_MAX_BLOCKS:-3}
+REPLY_WINDOW_HOURS=${INBOX_LOOP_REPLY_WINDOW_HOURS:-12}
+
+allow() { exit 0; }                       # let the session stop
+block() { printf '%s\n' "$1" >&2; exit 2; }  # exit 2 → Claude sees stderr, continues
+
+mkdir -p "$HOOK_STATE" 2>/dev/null || true
+# opportunistic GC of stale per-session block counters (>2 days old)
+find "$HOOK_STATE" -name '*.blocks' -mtime +2 -delete 2>/dev/null || true
+
+# --- read the Stop-hook payload from stdin -----------------------------------
+payload=$(cat 2>/dev/null || true)
+sid=$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null || true)
+[ -z "$sid" ] && allow
+
+# --- identify the oracle this session belongs to -----------------------------
+# Primary: the inbox-watcher writes session_id= into each per-envelope state
+# file (~/.cache/inbox-watcher/state/<oracle>/<envelope>.state). Reverse-lookup
+# that map. Only watcher-spawned inbox sessions match → only they are gated.
+oracle=""
+if [ -d "$WATCHER_STATE/state" ]; then
+  hit=$(grep -rlF "session_id=$sid" "$WATCHER_STATE"/state/*/ 2>/dev/null | head -1 || true)
+  [ -n "$hit" ] && oracle=$(basename "$(dirname "$hit")")
+fi
+# Fallback: the sessions/<oracle>/thread-<K>.session-id index.
+if [ -z "$oracle" ] && [ -d "$WATCHER_STATE/sessions" ]; then
+  for f in "$WATCHER_STATE"/sessions/*/*.session-id; do
+    [ -f "$f" ] || continue
+    if [ "$(cat "$f" 2>/dev/null)" = "$sid" ]; then
+      oracle=$(basename "$(dirname "$f")"); break
+    fi
+  done
+fi
+# Last resort: explicit env override (for future maw-injected wakes).
+[ -z "$oracle" ] && oracle=${ARRA_ORACLE:-}
+
+# Not a watcher-spawned oracle inbox session → nothing to enforce.
+[ -z "$oracle" ] && allow
+inbox_dir="$INBOX_BASE/for-$oracle"
+[ -d "$inbox_dir" ] || allow
+
+# --- frontmatter field reader (value of `field:` inside the first --- block) -
+fm_field() {  # $1=file $2=field
+  awk -v f="$2" '
+    /^---[[:space:]]*$/ { c++; next }
+    c==1 && $0 ~ "^"f":" {
+      sub("^"f":[[:space:]]*",""); sub("[[:space:]]*#.*","")
+      gsub(/^[[:space:]]+|[[:space:]]+$/,""); print; exit
+    }
+    c>=2 { exit }
+  ' "$1" 2>/dev/null
+}
+
+# --- Check 1: inbound envelopes still unhandled in the inbox root ------------
+unhandled=""
+for f in "$inbox_dir"/*.md; do
+  [ -e "$f" ] || continue
+  bn=$(basename "$f")
+  [ "$bn" = ".gitkeep" ] && continue
+  from=$(fm_field "$f" from)
+  thr=$(fm_field "$f" thread)
+  nr=$(fm_field "$f" needs_response)
+  po=$(fm_field "$f" parent_oracle)
+  reply_to=${po:-$from}
+  unhandled+="  • $bn"$'\n'"      from=$from thread=${thr:-none} needs_response=${nr:-false} → reply to for-${reply_to}/"$'\n'
+done
+
+# --- Check 2: needs_response envelopes archived WITHOUT a reply --------------
+# A handled envelope correctly closed by §11c carries handled_by_inbox (reply
+# was sent) or handled_note (§11g moot/closed — no reply owed). One that has
+# needs_response:true and neither is a silent stall. Scoped to a recent mtime
+# window so old pre-hook debt is not re-litigated by unrelated sessions.
+reply_gap=""
+cutoff=$(( $(date +%s) - REPLY_WINDOW_HOURS * 3600 ))
+for f in "$inbox_dir"/handled/*/*.md; do
+  [ -e "$f" ] || continue
+  mt=$(stat -f %m "$f" 2>/dev/null || echo 0)
+  [ "$mt" -lt "$cutoff" ] && continue
+  [ "$(fm_field "$f" needs_response)" = "true" ] || continue
+  [ -n "$(fm_field "$f" handled_by_inbox)" ] && continue
+  [ -n "$(fm_field "$f" handled_note)" ] && continue
+  from=$(fm_field "$f" from); thr=$(fm_field "$f" thread)
+  po=$(fm_field "$f" parent_oracle); reply_to=${po:-$from}
+  reply_gap+="  • handled/$(basename "$(dirname "$f")")/$(basename "$f")"$'\n'"      from=$from thread=${thr:-none} → reply to for-${reply_to}/"$'\n'
+done
+
+# --- clean? let the session stop ---------------------------------------------
+if [ -z "$unhandled" ] && [ -z "$reply_gap" ]; then
+  rm -f "$HOOK_STATE/$sid.blocks" 2>/dev/null || true
+  allow
+fi
+
+# --- circuit breaker: don't loop forever on a genuinely stuck agent ----------
+bc_file="$HOOK_STATE/$sid.blocks"
+bc=$(( $(cat "$bc_file" 2>/dev/null || echo 0) + 1 ))
+printf '%s' "$bc" >"$bc_file"
+
+if [ "$bc" -gt "$MAX_BLOCKS" ]; then
+  rm -f "$bc_file" 2>/dev/null || true
+  ts=$(date '+%Y-%m-%d %H:%M:%S')
+  printf '%s [%s] loop-closure gave up after %s blocks\nunhandled:\n%sreply_gap:\n%s\n' \
+    "$ts" "$oracle" "$MAX_BLOCKS" "$unhandled" "$reply_gap" \
+    >>"$HOOK_STATE/escalations.log" 2>/dev/null || true
+  # Make the give-up VISIBLE: notify the orchestrator (a silent give-up would
+  # re-introduce the exact bug this hook exists to kill).
+  thr=$(printf '%s' "$unhandled$reply_gap" | grep -oE 'thread=[0-9]+' | head -1 | cut -d= -f2)
+  notify="$INBOX_BASE/for-orchestrator/$(date +%Y-%m-%d_%H-%M)_from-${oracle}${thr:+_thread-$thr}_notify.md"
+  if [ -d "$INBOX_BASE/for-orchestrator" ]; then
+    { printf -- '---\nfrom: %s\nto: orchestrator\ntype: notify\n' "$oracle"
+      [ -n "$thr" ] && printf 'thread: %s\n' "$thr"
+      printf 'subject: loop-closure FAILED — %s could not close its inbox after %s attempts\n' "$oracle" "$MAX_BLOCKS"
+      printf 'needs_response: false\npriority: high\ncreated: %s\n---\n\n' "$(date +%Y-%m-%dT%H:%M:%S%z)"
+      printf 'The inbox-loop-closure Stop hook blocked %s %s times but the loop is still open.\n\n' "$oracle" "$MAX_BLOCKS"
+      printf 'Unhandled inbound envelopes:\n%s\nneeds_response envelopes archived without a reply:\n%s\n' "${unhandled:-  (none)}" "${reply_gap:-  (none)}"
+      printf '\nManual close-out required. See ~/.cache/inbox-loop-closure/escalations.log\n'
+    } >"$notify" 2>/dev/null || true
+  fi
+  printf '⚠️  inbox loop-closure: %s still open after %s attempts — allowing stop, orchestrator notified.\n' \
+    "$oracle" "$MAX_BLOCKS" >&2
+  allow
+fi
+
+# --- build the block message -------------------------------------------------
+msg="🔁 INBOX LOOP NOT CLOSED — you are oracle \"$oracle\" and cannot end this session yet (attempt $bc/$MAX_BLOCKS).
+
+Per AGENTS.md §11c–§11d and the brew-ops SKILL \"Inbox protocol\" (envelope-first,
+archive-second), every inbound envelope you handled must be fully closed out
+BEFORE your session ends."
+
+if [ -n "$unhandled" ]; then
+  msg+="
+
+── Unhandled inbound envelope(s) still in for-$oracle/ ──
+$unhandled
+For EACH, before stopping:
+  1. arra_thread_read its thread; if status is closed → §11g moot path
+     (archive with handled_note, no reply).
+  2. If needs_response=true → post your result to that thread (arra_thread)
+     AND write a reply envelope to the for-{reply-target}/ shown above
+     (filename: YYYY-MM-DD_HH-MM_from-${oracle}_thread-<id>_reply.md).
+  3. Archive the inbound envelope (P-001 — move, never delete):
+       cd \"$INBOX_BASE/for-$oracle/\"
+       month=\$(date +%Y-%m); mkdir -p handled/\$month
+       # first append handled_at / handled_by_thread / handled_by_inbox
+       #   to the envelope frontmatter, THEN:
+       git mv <envelope>.md handled/\$month/"
+fi
+
+if [ -n "$reply_gap" ]; then
+  msg+="
+
+── needs_response envelope(s) archived WITHOUT a reply ──
+$reply_gap
+A thread reply with no reply ENVELOPE is a silent stall — the requestor's
+watcher never wakes. For EACH: post your result to the thread, write the
+reply envelope to the for-{reply-target}/ shown above, and append
+handled_by_inbox: <reply-envelope-path> to the archived envelope's frontmatter."
+fi
+
+msg+="
+
+Do this now, then finish. (This gate is the inbox-loop-closure Stop hook —
+AGENTS.md §11l. It clears automatically once the loop is closed.)"
+
+block "$msg"
