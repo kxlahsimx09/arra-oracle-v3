@@ -52,13 +52,26 @@ export async function handleHandoff(ctx: ToolContext, input: OracleHandoffInput)
   if ('needsInit' in vault) console.error(`[Vault] ${vault.hint}`);
   const vaultRoot = 'path' in vault ? vault.path : null;
 
-  const project = detectProject(ctx.repoRoot)?.toLowerCase() || '_universal';
+  // Project detection can fail (repoRoot unset, or a path with no
+  // github.com/owner/repo segment). It used to fall back to
+  // `_universal/ψ/inbox/handoff/` — but recipients and arra_inbox only sweep
+  // the canonical vault-root `ψ/inbox/handoff/`, so those handoffs landed in
+  // an invisible hole (campaign #108 thread #114: 10 files stranded there).
+  // On detection failure, file to the canonical vault-root inbox instead, so
+  // the handoff stays discoverable rather than silently disappearing.
+  const project = detectProject(ctx.repoRoot)?.toLowerCase() || null;
 
   let dirPath: string;
   let sourceFileRel: string;
   if (vaultRoot) {
-    dirPath = path.join(vaultRoot, project, 'ψ', 'inbox', 'handoff');
-    sourceFileRel = `${project}/ψ/inbox/handoff/${filename}`;
+    if (project) {
+      dirPath = path.join(vaultRoot, project, 'ψ', 'inbox', 'handoff');
+      sourceFileRel = `${project}/ψ/inbox/handoff/${filename}`;
+    } else {
+      dirPath = path.join(vaultRoot, 'ψ', 'inbox', 'handoff');
+      sourceFileRel = `ψ/inbox/handoff/${filename}`;
+      console.error('[MCP:HANDOFF] project detection failed — filing to canonical vault-root inbox (not _universal/)');
+    }
   } else {
     dirPath = path.join(ctx.repoRoot, 'ψ/inbox/handoff');
     sourceFileRel = `ψ/inbox/handoff/${filename}`;
