@@ -157,7 +157,13 @@ msg="🔁 INBOX LOOP NOT CLOSED — you are oracle \"$oracle\" and cannot end th
 
 Per AGENTS.md §11c–§11d and the brew-ops SKILL \"Inbox protocol\" (envelope-first,
 archive-second), every inbound envelope you handled must be fully closed out
-BEFORE your session ends."
+BEFORE your session ends.
+
+If this gate is unexpected: an inbox reply for a campaign you own was routed
+into THIS session by the inbox-watcher (AGENTS.md §11l / §151 sticky
+thread→session ownership) — the envelope filename(s) and thread id(s) below
+are the inbox-routed reply(ies) that still need closing out. This is expected
+behaviour, not a bug; handle them as listed and the gate clears."
 
 if [ -n "$unhandled" ]; then
   msg+="
