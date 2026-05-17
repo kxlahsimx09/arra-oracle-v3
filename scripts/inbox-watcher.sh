@@ -17,9 +17,9 @@
 #                                           owner idle → delivered_to_owner
 #                                           owner down → fired (--resume)
 #                                           owner gone → fired (--fresh)
-#   NEW (orchestrator envelope whose      → deferred  (queued behind the live
-#        parent campaign already has a               orchestrator session;
-#        live/in-flight session)                     no sibling spawned)
+#   NEW (envelope whose campaign already  → deferred  (queued behind the live
+#        has a live/in-flight session                 campaign session; no
+#        but no owner record — §11k/§153)             sibling spawned)
 #   deferred (campaign/owner idle)       → fire_wake / fire_to_owner → fired
 #   fired | delivered_to_owner            → verified  (T1: JSONL has prompt;
 #                                           capture session-id)
@@ -515,7 +515,14 @@ claude_alive_at() {
   return 0
 }
 
-# ─── Orchestrator fan-out dedup (§11k) ─────────────────────────────────────
+# ─── Fan-out dedup fallback (§11k + §153) ──────────────────────────────────
+#
+# This is the no-owner-record fallback behind §151 owner routing — see
+# maybe_fire_or_defer §2. Used for EVERY oracle (§153): an orchestrator whose
+# fan-out replies share a parent_thread, AND a worker getting a 2nd dispatch
+# for a campaign whose first dispatch fired but could not record an owner
+# (fire_wake parsed no worktree path, or a fire_failed left a non-terminal
+# state). Either way, dedup keeps a busy campaign to ONE session.
 #
 # True (0) iff a NEW envelope for wake key `key` must DEFER rather than fire,
 # because the campaign already has work in progress. "Busy" means either:
@@ -1138,10 +1145,15 @@ fire_to_owner() {
 
 # Entry point for a NEW envelope. Decision order:
 #  1. §151 owner routing — if the campaign has a recorded owner, route the
-#     reply back to that exact session (busy=defer, idle=send-keys,
-#     resumable=--resume, gone=--fresh+transfer).
-#  2. §11k orchestrator fan-out dedup — only reached when no owner record
-#     exists (e.g. a pre-#151 dispatcher that did not stamp parent_session).
+#     reply/dispatch back to that exact session (busy=defer, idle=send-keys,
+#     resumable=--resume, gone=--fresh+transfer). Oracle-agnostic, so a 2nd
+#     dispatch to a busy worker is already serialized onto its session.
+#  2. §11k/§153 fan-out dedup fallback — reached only when no owner record
+#     exists (a pre-#151 dispatcher that did not stamp parent_session, or a
+#     worker whose first dispatch fired but recorded no worktree path).
+#     Applies to EVERY oracle so a busy worker never gets a sibling spawned
+#     (the wt-43/wt-46 incident, thread #151/#153). When it un-defers,
+#     fire_wake Path 1 --resumes the campaign session.
 #  3. plain fire_wake.
 # Cancel envelopes (priority-1) skip owner routing and always fire fresh.
 maybe_fire_or_defer() {
@@ -1182,8 +1194,15 @@ maybe_fire_or_defer() {
     fi
   fi
 
-  # ── 2. Orchestrator fan-out dedup (§11k) — no owner record case ──────────
-  if [ "$oracle" = "orchestrator" ] && ! is_cancel_envelope "$file"; then
+  # ── 2. Fan-out dedup fallback (§11k + §153) — no owner-record case ───────
+  # Symmetric mirror of §1: when a campaign has work in flight but NO owner
+  # record (the first dispatch's fire_wake parsed no worktree path, or a
+  # fire_failed left a non-terminal state), defer behind the in-flight sibling
+  # instead of --fresh-spawning. NOT gated to the orchestrator (§153): a busy
+  # worker getting a 2nd same-campaign dispatch must serialize onto its
+  # existing session, never spawn a sibling (the wt-43/wt-46 incident). When
+  # it un-defers, fire_wake Path 1 --resumes the campaign session.
+  if ! is_cancel_envelope "$file"; then
     if [ -n "$wkey" ] && parent_session_busy "$oracle" "$wkey" "$sf"; then
       write_state "$sf" \
         "oracle=$oracle" \
@@ -1192,7 +1211,7 @@ maybe_fire_or_defer() {
         "wake_key=$wkey" \
         "deferred_since=$(date +%s)" \
         "status=deferred"
-      log "[$oracle] $fname → DEFER (parent campaign $wkey already has a live session; queued, will --resume into it when idle)"
+      log "[$oracle] $fname → DEFER (campaign $wkey already has a live session; queued, will --resume into it when idle)"
       return 0
     fi
   fi
