@@ -15,6 +15,18 @@ export class LanceDBAdapter implements VectorStoreAdapter {
   private collectionName: string;
   private embedder: EmbeddingProvider;
 
+  /**
+   * Serializes writes within this process. Two concurrent addDocuments()
+   * calls that interleave their `table.add()` can produce a LanceDB manifest
+   * version referencing a fragment the other writer has not flushed yet —
+   * the manifest-drift failure (thread #113, recurrences 2026-04-14/04-21/05-16).
+   * NOTE: this guards in-process concurrency only. `@lancedb/lancedb@0.27.2`
+   * has no inter-process write lock, so concurrent writes from other Oracle
+   * processes (other MCP server instances, the HTTP server) can still drift a
+   * manifest. The inter-process file lock is tracked as thread #113 Phase 2.
+   */
+  private writeChain: Promise<void> = Promise.resolve();
+
   constructor(collectionName: string, dbPath: string, embedder: EmbeddingProvider) {
     this.collectionName = collectionName;
     this.dbPath = dbPath;
@@ -101,6 +113,15 @@ export class LanceDBAdapter implements VectorStoreAdapter {
 
   async addDocuments(docs: VectorDocument[]): Promise<void> {
     if (docs.length === 0) return;
+    // Chain onto the prior write so concurrent callers in this process
+    // serialize. The chain keeps advancing even if a write rejects, so one
+    // failed write does not wedge every subsequent one.
+    const run = this.writeChain.then(() => this.addDocumentsLocked(docs));
+    this.writeChain = run.then(() => {}, () => {});
+    return run;
+  }
+
+  private async addDocumentsLocked(docs: VectorDocument[]): Promise<void> {
     if (!this.table) await this.ensureCollection();
 
     const texts = docs.map(d => d.document);
@@ -195,6 +216,27 @@ export class LanceDBAdapter implements VectorStoreAdapter {
   async getCollectionInfo(): Promise<{ count: number; name: string }> {
     const stats = await this.getStats();
     return { count: stats.count, name: this.collectionName };
+  }
+
+  /**
+   * Active health probe. Runs a real vector search so a drifted manifest is
+   * detected: countRows() answers from manifest metadata even when a data
+   * fragment is missing, but search() must read fragments and throws
+   * `lance error: Not found …` on drift. A zero query vector is used so the
+   * probe needs no Ollama round-trip; it still exercises the fragment-read
+   * path. See thread #113 — this is the signal arra_stats must report instead
+   * of the connect-time-only vectorStatus.
+   */
+  async health(): Promise<{ ok: boolean; error?: string; count?: number }> {
+    try {
+      if (!this.table) await this.ensureCollection();
+      const probe = new Array(this.embedder.dimensions).fill(0);
+      await this.table.search(probe).distanceType('cosine').limit(1).toArray();
+      const count = await this.table.countRows();
+      return { ok: true, count };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
   }
 
   async getAllEmbeddings(limit: number = 5000): Promise<{ ids: string[]; embeddings: number[][]; metadatas: any[] }> {

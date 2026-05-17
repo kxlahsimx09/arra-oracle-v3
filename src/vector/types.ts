@@ -34,6 +34,14 @@ export interface VectorStoreAdapter {
   getStats(): Promise<{ count: number }>;
   getCollectionInfo(): Promise<{ count: number; name: string }>;
   getAllEmbeddings?(limit?: number): Promise<{ ids: string[]; embeddings: number[][]; metadatas: any[] }>;
+  /**
+   * Active health probe — runs a real query so backend faults that getStats()
+   * cannot see are detected. LanceDB manifest drift is the motivating case:
+   * countRows() still answers from manifest metadata while search() fails on a
+   * missing data fragment. Optional — callers fall back to getStats() when an
+   * adapter does not implement it. See thread #113.
+   */
+  health?(): Promise<{ ok: boolean; error?: string; count?: number }>;
 }
 
 /**
