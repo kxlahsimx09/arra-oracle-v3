@@ -884,8 +884,17 @@ maybe_retire_worktree() {
   fi
 
   # All gates pass — perform the retire.
+  #
+  # The main repo is the worktree path minus its `.wt-<N>-<suffix>` tail.
+  # maw creates worktrees as SIBLINGS of the main checkout
+  # (`<repo>.wt-42-…` next to `<repo>`), not as children — so `git worktree
+  # remove` must run with `-C <main repo>`. `-C "$wt_path/.."` (used before
+  # this fix) resolved to the *parent directory that holds both*, which is
+  # not a git repo at all, so the remove returned nonzero on every retire
+  # and NO worktree was ever reclaimed. `-C "$wt_path"` is equally wrong: a
+  # linked worktree cannot remove itself. Same derivation as discover_repos.
   local repo_path branch
-  repo_path=$(git -C "$wt_path" rev-parse --show-toplevel 2>/dev/null)
+  repo_path=${wt_path%.wt-*}
   branch=$(git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null)
 
   # Best-effort kill the tmux window for this wake (non-fatal if gone).
@@ -897,7 +906,7 @@ maybe_retire_worktree() {
   # maw-injected `.agent` symlink + `.DS_Store` first so the otherwise-clean
   # worktree isn't rejected for those alone (Bug B).
   strip_worktree_noise "$wt_path"
-  if git -C "$wt_path/.." worktree remove "$wt_path" 2>>"$LOG_FILE"; then
+  if git -C "$repo_path" worktree remove "$wt_path" 2>>"$LOG_FILE"; then
     log "[$oracle] $fname RETIRED worktree $wt_path"
     # Best-effort branch delete (only succeeds if merged or no unique commits)
     [ -n "$branch" ] && [ "$branch" != "HEAD" ] && \
