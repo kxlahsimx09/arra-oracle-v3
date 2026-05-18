@@ -157,3 +157,38 @@ test("gc keeps a worktree whose thread is not closed", () => {
   expect(existsSync(worktree)).toBe(true);
   expect(stateBody()).not.toContain("retired_at=");
 });
+
+// ─── #164 — terminal-failure envelopes are retired too ────────────────────
+//
+// gc_retire_terminal originally iterated `status=completed` only, so a
+// `failed_no_prompt` / `failed_stuck` envelope kept its worktree forever:
+// the state file still references it, so gc_prune_orphan_worktrees skips it
+// as well. Observed leaks: wt-9 (failed_no_prompt), wt-50 (failed_stuck).
+// The gate (safe_to_retire) is unchanged — failure envelopes are retired on
+// EXACTLY the same conditions as completed ones, no looser.
+
+test("gc retires a failed_stuck envelope's clean worktree (#164 terminal-failure leak)", () => {
+  writeState({ ...completedState(), status: "failed_stuck" });
+  expect(existsSync(worktree)).toBe(true);
+
+  gcOnce();
+
+  expect(existsSync(worktree)).toBe(false);
+  expect(stateBody()).toContain("retired_at=");
+});
+
+test("gc keeps a failed_no_prompt envelope whose thread is not closed", () => {
+  // Same thread-not-closed gate as completed — terminal-failure does not
+  // bypass safe_to_retire. thread/2 has no stub → status empty → not closed.
+  writeState({
+    ...completedState(),
+    status: "failed_no_prompt",
+    thread_id: "2",
+    wake_key: "2",
+  });
+
+  gcOnce();
+
+  expect(existsSync(worktree)).toBe(true);
+  expect(stateBody()).not.toContain("retired_at=");
+});
