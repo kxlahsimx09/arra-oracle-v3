@@ -32,6 +32,7 @@ WATCHER_STATE=${INBOX_WATCHER_STATE:-$HOME/.cache/inbox-watcher}
 HOOK_STATE=${INBOX_LOOP_HOOK_STATE:-$HOME/.cache/inbox-loop-closure}
 MAX_BLOCKS=${INBOX_LOOP_MAX_BLOCKS:-3}
 REPLY_WINDOW_HOURS=${INBOX_LOOP_REPLY_WINDOW_HOURS:-12}
+ORACLE_API=${ORACLE_API:-http://localhost:47778/api}  # for §11g moot detection
 
 allow() { exit 0; }                       # let the session stop
 block() { printf '%s\n' "$1" >&2; exit 2; }  # exit 2 → Claude sees stderr, continues
@@ -97,11 +98,45 @@ for f in "$inbox_dir"/*.md; do
   unhandled+="  • $bn"$'\n'"      from=$from thread=${thr:-none} needs_response=${nr:-false} → reply to for-${reply_to}/"$'\n'
 done
 
+# --- thread status via the Oracle API (mirrors inbox-watcher's thread_status)
+# Echoes 'closed'|'active'|'pending'|'' — empty means the API is unreachable
+# or the thread is unknown.
+thread_status() {  # $1=thread id — always exits 0 (failure = empty output)
+  [ -n "${1:-}" ] || { echo ""; return 0; }
+  curl -sf -m 3 "$ORACLE_API/thread/$1" 2>/dev/null \
+    | jq -r '.thread.status // empty' 2>/dev/null || true
+}
+
+# --- does a reply envelope from THIS oracle for thread <thr> exist? ----------
+# The §11c close-out artifact is a reply envelope on disk in the requestor's
+# inbox (root, or already archived under handled/). The check verifies that
+# ARTIFACT — it does not trust a frontmatter field, because an agent can stamp
+# handled_by_inbox without ever writing the file (thread #159).
+reply_envelope_exists() {  # $1=reply-target oracle  $2=thread id
+  local d="$INBOX_BASE/for-$1" g
+  [ -d "$d" ] || return 1
+  for g in "$d"/*_from-"$oracle"_thread-"$2"_reply.md \
+           "$d"/handled/*/*_from-"$oracle"_thread-"$2"_reply.md; do
+    [ -e "$g" ] && return 0
+  done
+  return 1
+}
+
 # --- Check 2: needs_response envelopes archived WITHOUT a reply --------------
-# A handled envelope correctly closed by §11c carries handled_by_inbox (reply
-# was sent) or handled_note (§11g moot/closed — no reply owed). One that has
-# needs_response:true and neither is a silent stall. Scoped to a recent mtime
-# window so old pre-hook debt is not re-litigated by unrelated sessions.
+# §11c close-out for a needs_response:true envelope is a REPLY ENVELOPE in the
+# requestor's inbox — that is the artifact the requestor's watcher routes on to
+# wake them. This check verifies that artifact EXISTS; it deliberately does NOT
+# trust the handled_by_inbox / handled_note frontmatter fields.
+#
+# Why (thread #159, recurrence of the #140 class): next-architect finished a
+# resumed-session dispatch, archived the consult envelope with a bogus
+# handled_by_inbox (the inbound envelope's own basename, not a reply path) plus
+# a verbose handled_note, but never wrote the reply envelope. The old check
+# skipped on mere field-presence, so the Stop hook passed and the orchestrator
+# was never woken. Verifying the artifact closes that hole for fresh and
+# --resume sessions alike. A missing reply is a gap UNLESS the thread is closed
+# (§11g moot — no reply owed). Scoped to a recent mtime window so old pre-hook
+# debt is not re-litigated by unrelated sessions.
 reply_gap=""
 cutoff=$(( $(date +%s) - REPLY_WINDOW_HOURS * 3600 ))
 for f in "$inbox_dir"/handled/*/*.md; do
@@ -109,11 +144,17 @@ for f in "$inbox_dir"/handled/*/*.md; do
   mt=$(stat -f %m "$f" 2>/dev/null || echo 0)
   [ "$mt" -lt "$cutoff" ] && continue
   [ "$(fm_field "$f" needs_response)" = "true" ] || continue
-  [ -n "$(fm_field "$f" handled_by_inbox)" ] && continue
-  [ -n "$(fm_field "$f" handled_note)" ] && continue
   from=$(fm_field "$f" from); thr=$(fm_field "$f" thread)
   po=$(fm_field "$f" parent_oracle); reply_to=${po:-$from}
-  reply_gap+="  • handled/$(basename "$(dirname "$f")")/$(basename "$f")"$'\n'"      from=$from thread=${thr:-none} → reply to for-${reply_to}/"$'\n'
+  # Loop closed: the reply envelope artifact exists.
+  reply_envelope_exists "$reply_to" "$thr" && continue
+  # No reply envelope — a closed thread is §11g moot (no reply owed).
+  st=$(thread_status "$thr")
+  [ "$st" = "closed" ] && continue
+  # API unreachable (empty status): degrade to the pre-fix moot escape so a
+  # transient outage cannot wedge a session on a legitimately-mooted envelope.
+  [ -z "$st" ] && [ -n "$(fm_field "$f" handled_note)" ] && continue
+  reply_gap+="  • handled/$(basename "$(dirname "$f")")/$(basename "$f")"$'\n'"      from=$from thread=${thr:-none} status=${st:-unreachable} → reply to for-${reply_to}/"$'\n'
 done
 
 # --- clean? let the session stop ---------------------------------------------
@@ -190,9 +231,12 @@ if [ -n "$reply_gap" ]; then
 ── needs_response envelope(s) archived WITHOUT a reply ──
 $reply_gap
 A thread reply with no reply ENVELOPE is a silent stall — the requestor's
-watcher never wakes. For EACH: post your result to the thread, write the
-reply envelope to the for-{reply-target}/ shown above, and append
-handled_by_inbox: <reply-envelope-path> to the archived envelope's frontmatter."
+watcher never wakes. For EACH: post your result to the thread, then WRITE the
+reply envelope FILE to the for-{reply-target}/ shown above (filename:
+YYYY-MM-DD_HH-MM_from-${oracle}_thread-<id>_reply.md), and append
+handled_by_inbox: <that-reply-envelope-path> to the archived envelope's
+frontmatter. This gate verifies the reply envelope file actually exists —
+stamping handled_by_inbox without writing the file will NOT clear it."
 fi
 
 msg+="
