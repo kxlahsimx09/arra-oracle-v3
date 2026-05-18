@@ -1370,10 +1370,10 @@ scan_inbox() {
     done
   done
 
-  # Pass 2 — iterate state files for verified (or deferred) envelopes whose
-  # backing file has been archived (moved out of the inbox root). Pass 1
-  # misses these because it only sees files currently in for-{oracle}/, so an
-  # envelope archived between two scans never reaches `completed` without it.
+  # Pass 2 — iterate state files for non-terminal envelopes whose backing file
+  # has been archived (moved out of the inbox root). Pass 1 misses these
+  # because it only sees files currently in for-{oracle}/, so an envelope
+  # archived between two scans never reaches `completed` without it.
   for state_dir in "$STATE_DIR"/state/*/; do
     [ -d "$state_dir" ] || continue
     oracle=$(basename "$state_dir")
@@ -1386,6 +1386,14 @@ scan_inbox() {
       file="$INBOX_BASE/for-$oracle/$fname"
       case "${status:-}" in
         verified)  [ ! -f "$file" ] && verify_processing "$sf" "$file" ;;
+        # A `fired` envelope archived before Pass 1's verify_delivery ran:
+        # the agent resumed, processed, and archived it inside one poll
+        # interval, so the T1 probe never saw the file and the state froze
+        # at `fired`. Left unreconciled, campaign_inflight() counts it as a
+        # perpetual in-flight sibling and dead-locks every later envelope of
+        # the campaign (thread #170 — next-writer #167 DEFERRED ~2h). The
+        # file being gone proves §11d archival, i.e. the agent handled it.
+        fired)     [ ! -f "$file" ] && verify_processing "$sf" "$file" ;;
         # A §151 send-keys delivery whose file was archived between scans —
         # the owner already processed it; finalize to completed here.
         delivered_to_owner) [ ! -f "$file" ] && verify_processing "$sf" "$file" ;;
