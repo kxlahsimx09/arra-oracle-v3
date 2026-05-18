@@ -949,10 +949,16 @@ evict_session_id() {
 # maybe_retire_worktree only fires the instant an envelope reaches
 # `completed`. Three things slip past it, so a periodic sweep mops up:
 #
-#   (1) An envelope that completed while its thread was still open had its
-#       retire SKIPPED (thread-not-closed gate) and the thread closing later
-#       triggers nothing. gc_retire_completed re-runs the retire gate on every
-#       completed-but-not-retired envelope.
+#   (1) An envelope that reached a terminal state while its thread was still
+#       open had its retire SKIPPED (thread-not-closed gate) and the thread
+#       closing later triggers nothing. gc_retire_terminal re-runs the retire
+#       gate on every terminal-but-not-retired envelope. Terminal covers both
+#       `completed` AND the terminal-failure states `failed_no_prompt` /
+#       `failed_stuck`: a failed envelope still holds a state file referencing
+#       its worktree, so gc_prune_orphan_worktrees skips it too — without this
+#       its worktree leaks forever (#164: wt-9 failed_no_prompt, wt-50
+#       failed_stuck). The retire gate (safe_to_retire) is the SAME for all
+#       three — thread closed, tree clean, claude dead, not owner-routed.
 #   (2) session-id cache files accumulate. Retire-driven eviction
 #       (evict_session_id) handles closed campaigns; gc_evict_stale_sessions
 #       is the 30-day TTL backstop for campaigns whose thread never closed.
@@ -980,16 +986,24 @@ discover_repos() {
   done | sort -u
 }
 
-# (1) Re-run the retire gate on completed-but-not-retired envelopes. A retire
+# (1) Re-run the retire gate on terminal-but-not-retired envelopes. A retire
 # SKIPPED earlier for `thread-not-closed` succeeds here once the thread closes.
-gc_retire_completed() {
+# Terminal = `completed` plus the terminal-failure states (#164): a
+# `failed_no_prompt` / `failed_stuck` envelope still pins its worktree via a
+# state file, so without this it never gets reaped. safe_to_retire (called by
+# maybe_retire_worktree) is the only gate — identical for success and failure,
+# so failure envelopes are NOT retired any more eagerly than completed ones.
+gc_retire_terminal() {
   local sf
   for sf in "$STATE_DIR"/state/*/*.state; do
     [ -f "$sf" ] || continue
     unset status retired_at
     # shellcheck disable=SC1090
     source "$sf"
-    [ "${status:-}" = "completed" ] || continue
+    case "${status:-}" in
+      completed|failed_no_prompt|failed_stuck) ;;
+      *) continue ;;
+    esac
     [ -n "${retired_at:-}" ] && continue
     maybe_retire_worktree "$sf"
   done
@@ -1081,7 +1095,7 @@ gc_prune_orphan_worktrees() {
 gc_sweep() {
   [ "$INBOX_AUTO_CLEAN" = "1" ] || return 0
   log "gc-sweep start"
-  gc_retire_completed
+  gc_retire_terminal
   gc_evict_stale_sessions
   gc_prune_orphan_worktrees
   log "gc-sweep done"
