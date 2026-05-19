@@ -800,14 +800,32 @@ thread_status() {
     | jq -r '.thread.status // empty' 2>/dev/null
 }
 
-# True iff any other active state file (not $sf) references the same wt_path.
+# True iff any other NON-TERMINAL state file (not $sf) references the same
+# wt_path. Only a non-terminal sibling — `fired` / `verified` / `deferred` /
+# `delivered_to_owner` — still has live work in the worktree and so must
+# block its retire. A terminal sibling (`completed` / `failed_no_prompt` /
+# `failed_stuck` / `fire_failed`) is done with the worktree.
+#
+# The status filter is load-bearing (thread #172). The §11f/§11k
+# campaign-session-reuse pattern parks EVERY sub-thread envelope of a
+# campaign on the one shared `wt_path`. Once such a campaign closes, all its
+# envelopes are terminal — and the pre-filter check (any state file at all)
+# made each envelope cite the others as a reason to skip: a mutual-blocking
+# deadlock in which the worktree could never retire. 7 of 10 mb-next
+# worktrees leaked exactly this way (thread #172 audit). Terminal siblings
+# no longer count, so the campaign's spawning (non-owner-routed) envelope
+# now retires the shared worktree.
 other_state_references_wt() {
-  local sf=$1 wt=$2
+  local sf=$1 wt=$2 st
   [ -z "$wt" ] && return 1
   for other in "$STATE_DIR"/state/*/*.state; do
     [ -f "$other" ] || continue
     [ "$other" = "$sf" ] && continue
-    grep -q "^wt_path=$wt$" "$other" && return 0
+    grep -q "^wt_path=$wt$" "$other" || continue
+    st=$(grep '^status=' "$other" 2>/dev/null | tail -1 | cut -d= -f2)
+    case "$st" in
+      fired|verified|deferred|delivered_to_owner) return 0 ;;
+    esac
   done
   return 1
 }
