@@ -192,3 +192,55 @@ test("gc keeps a failed_no_prompt envelope whose thread is not closed", () => {
   expect(existsSync(worktree)).toBe(true);
   expect(stateBody()).not.toContain("retired_at=");
 });
+
+// ─── #172 — campaign worktrees shared by N terminal envelopes ──────────────
+//
+// §11f/§11k campaign-session reuse parks every sub-thread envelope of a
+// campaign on ONE shared wt_path. other_state_references_wt used to match
+// ANY sibling state file regardless of status, so once a campaign closed
+// all its envelopes were terminal and each cited the others as a reason to
+// skip the retire — a mutual-blocking deadlock. The worktree leaked
+// forever. Fix: only a NON-TERMINAL sibling blocks the retire.
+
+const SIBLING_NAME =
+  "2026-05-18_01-00_from-orchestrator_thread-1_consult.md.state";
+
+/** Write a second `<oracle>/<fname>.state` file under a distinct name. */
+function writeSiblingState(fields: Record<string, string>) {
+  const body = Object.entries(fields)
+    .map(([k, v]) => `${k}=${v}`)
+    .join("\n");
+  writeFileSync(join(stateDir, "state", "brew-ops", SIBLING_NAME), body + "\n");
+}
+
+test("gc retires a worktree shared by two terminal campaign envelopes (#172 deadlock)", () => {
+  // Two completed envelopes of one campaign, both on the same wt_path.
+  writeState(completedState());
+  writeSiblingState({
+    ...completedState(),
+    fname: SIBLING_NAME.replace(/\.state$/, ""),
+  });
+  expect(existsSync(worktree)).toBe(true);
+
+  gcOnce();
+
+  // Pre-fix: each envelope skipped on `wt-shared-by-other-envelope`. Now the
+  // worktree retires — terminal siblings no longer block.
+  expect(existsSync(worktree)).toBe(false);
+});
+
+test("gc keeps a worktree a non-terminal sibling still references (#172 guard intact)", () => {
+  // One completed envelope + one still-`fired` sibling on the same wt_path.
+  writeState(completedState());
+  writeSiblingState({
+    ...completedState(),
+    fname: SIBLING_NAME.replace(/\.state$/, ""),
+    status: "fired",
+  });
+
+  gcOnce();
+
+  // The live sibling still owns work in the worktree → retire stays blocked.
+  expect(existsSync(worktree)).toBe(true);
+  expect(stateBody()).not.toContain("retired_at=");
+});
