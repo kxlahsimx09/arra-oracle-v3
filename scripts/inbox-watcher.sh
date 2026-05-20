@@ -515,6 +515,20 @@ claude_alive_at() {
   return 0
 }
 
+# Stricter gate used by the retire/prune paths (#1191). claude_alive_at returns
+# 0 only for "active" (JSONL within CLAUDE_STUCK_TIMEOUT); a live pid sitting
+# idle at its prompt is "STUCK (resume OK)" and returns 1 — but that's exactly
+# the case retire must NOT proceed on (the orchestrator waiting overnight for
+# its next reply). Retire gates on "any live claude pid with cwd=wt", which is
+# the claude_pids_at predicate. Reuses `claude_pids_at` unchanged so the
+# fire_wake Path 1 reuse decision (which legitimately treats stuck as
+# --resumable) keeps its existing semantics.
+claude_present_at() {
+  local wt=$1
+  [ -z "$wt" ] && return 1
+  [ -n "$(claude_pids_at "$wt")" ]
+}
+
 # ─── Fan-out dedup fallback (§11k + §153) ──────────────────────────────────
 #
 # This is the no-owner-record fallback behind §151 owner routing — see
@@ -881,7 +895,11 @@ safe_to_retire() {
   unpushed=$(git -C "$wt_path" log '@{u}..' --oneline 2>/dev/null | head -1)
   [ -n "$unpushed" ] && { echo "wt-has-unpushed-commits"; return 1; }
 
-  claude_alive_at "$wt_path" && { echo "claude-still-alive"; return 1; }
+  # #1191 — any live claude pid at this wt blocks retire, not just an
+  # "actively-writing" one. claude_alive_at would treat an idle-prompt orchestrator
+  # as "STUCK (resume OK)" and let retire proceed, deleting the worktree out from
+  # under a session that's just waiting for its next reply.
+  claude_present_at "$wt_path" && { echo "claude-pid-at-wt"; return 1; }
 
   other_state_references_wt "$sf" "$wt_path" && { echo "wt-shared-by-other-envelope"; return 1; }
 
@@ -1072,7 +1090,9 @@ gc_try_prune_worktree() {
   any_state_references_wt "$wt" && return 0
   # tmux window still open for this suffix → in use.
   [ -n "$suffix" ] && printf '%s' "$maw_windows" | grep -q "$suffix" && return 0
-  claude_alive_at "$wt" && return 0
+  # #1191 — same stricter gate as safe_to_retire: a live claude pid at the
+  # worktree (even one idle at its prompt) keeps the worktree.
+  claude_present_at "$wt" && return 0
   dirty=$(git -C "$wt" status --short 2>/dev/null \
     | grep -vE '^\?\? \.(agent|DS_Store)/?$' | head -1)
   [ -n "$dirty" ] && { log "gc: keep orphan-candidate $wt (dirty)"; return 0; }
