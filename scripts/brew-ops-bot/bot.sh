@@ -36,6 +36,12 @@ ORACLE_DB=$HOME/.arra-oracle-v2/oracle.db
 SQLITE=$(command -v sqlite3 || echo /usr/bin/sqlite3)
 RETRO_ROOT=$HOME/.arra-oracle-v2/ψ/memory/retrospectives
 
+# Defined here (above their first top-level caller, load_roles) so bash
+# resolves `log` to this function instead of falling through to PATH and
+# hitting macOS /usr/bin/log. See helpers section below for siblings.
+log()   { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
+audit() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$AUDIT_FILE"; }
+
 # Role registry — loaded dynamically from maw fleet configs at boot.
 # Format per entry: <role>|<session>|<repo-path>
 # Sources scanned (in order; later entries override earlier ones by role name):
@@ -97,8 +103,7 @@ SCRIPT_DIR_BOT_INIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
-log()   { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
-audit() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$AUDIT_FILE"; }
+# log() / audit() are hoisted above load_roles (see top of file).
 
 # HTML-escape dynamic content before embedding in send_tg's parse_mode=HTML.
 html_escape() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
