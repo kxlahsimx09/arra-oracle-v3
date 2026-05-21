@@ -674,6 +674,21 @@ fire_wake() {
         # Re-use the existing wt_suffix so maw attaches to the same worktree
         # window. We extract it from the prior wt path: `<repo>.wt-<N>-<suffix>`.
         wt_suffix=$(basename "$prior_wt" | sed 's/^[^.]*\.wt-[0-9]*-//')
+
+        # Pre-resume fetch (thread #199): maw createWorktree fetches +
+        # fast-forwards local default on --fresh spawn, but Path 1 reuse
+        # picks up wherever the previous resume left the wt. A long-lived
+        # campaign session that resumes 3+ times without re-fetching can
+        # hit the same stale-base trap as wt-48 / PR #215 from the other
+        # direction. Best-effort; offline or refused update-ref must not
+        # block the resume.
+        (
+          cd "$prior_wt" 2>/dev/null && \
+          git fetch origin --quiet 2>/dev/null && \
+          _def=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null) && \
+          [ -n "$_def" ] && \
+          git update-ref "refs/heads/${_def#origin/}" "refs/remotes/$_def" 2>/dev/null
+        ) || true
       fi
     fi
   fi
