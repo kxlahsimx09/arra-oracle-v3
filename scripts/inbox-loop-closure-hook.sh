@@ -84,12 +84,60 @@ fm_field() {  # $1=file $2=field
   ' "$1" 2>/dev/null
 }
 
+# --- campaign scoping (thread #214) ------------------------------------------
+# With concurrent sessions of one oracle (the #181 parallel-sessions-same-role
+# pattern), for-{oracle}/ holds envelopes for SIBLING sessions' campaigns too.
+# Gate THIS session only on its OWN campaign — keyed by wake_key
+# (parent_thread || thread), the same key §11f and the inbox-watcher use. Derive
+# my wake_key(s) from the watcher state files that name my session_id.
+#
+#   EXCEPTION — the orchestrator is the multi-campaign hub: for-orchestrator/
+#   legitimately receives replies from ALL the campaigns it owns, and one hub
+#   session spans many wake_keys (verified thread #214: sid 6812815d owned
+#   wake_keys 162/167/168/170). Scoping it would blind it to its other
+#   campaigns' loops, so the orchestrator stays whole-dir — explicitly, not by
+#   relying on the undeterminable-fallback being hit.
+#
+# Undeterminable wake_key (cache evicted / unknown sid) → fall back to whole-dir:
+# over-blocking is safe (the §11i T2 failed_stuck watcher gate is the backstop);
+# silently missing a sibling's leak is not what we want, but a missed gap on a
+# cold session is preferable to cross-campaign contamination on a warm one.
+scope_campaign=0
+my_wake_keys=""
+if [ "$oracle" != "orchestrator" ] && [ -d "$WATCHER_STATE/state/$oracle" ]; then
+  my_wake_keys=$(grep -lF "session_id=$sid" "$WATCHER_STATE/state/$oracle"/*.state 2>/dev/null \
+    | while IFS= read -r sf; do
+        wk=$(sed -n 's/^wake_key=//p' "$sf" 2>/dev/null | head -1 || true)
+        [ -n "$wk" ] || wk=$(sed -n 's/^thread_id=//p' "$sf" 2>/dev/null | head -1 || true)
+        [ -n "$wk" ] && printf '%s\n' "$wk"
+      done | sort -u) || true
+  [ -n "$my_wake_keys" ] && scope_campaign=1
+fi
+
+# envelope wake_key = parent_thread (campaign) else thread
+env_wake_key() {  # $1=file
+  local pt
+  pt=$(fm_field "$1" parent_thread)
+  if [ -n "$pt" ]; then printf '%s' "$pt"; return 0; fi
+  fm_field "$1" thread
+}
+
+# is this envelope in THIS session's campaign? (true when scoping is off)
+in_scope() {  # $1=file → 0 = in scope, 1 = sibling campaign (skip)
+  [ "$scope_campaign" = 1 ] || return 0
+  local wk
+  wk=$(env_wake_key "$1")
+  [ -n "$wk" ] || return 0   # no thread/parent_thread → don't skip (be safe)
+  if printf '%s\n' "$my_wake_keys" | grep -qxF "$wk"; then return 0; else return 1; fi
+}
+
 # --- Check 1: inbound envelopes still unhandled in the inbox root ------------
 unhandled=""
 for f in "$inbox_dir"/*.md; do
   [ -e "$f" ] || continue
   bn=$(basename "$f")
   [ "$bn" = ".gitkeep" ] && continue
+  in_scope "$f" || continue          # thread #214: skip sibling-campaign envelopes
   from=$(fm_field "$f" from)
   thr=$(fm_field "$f" thread)
   nr=$(fm_field "$f" needs_response)
@@ -141,6 +189,7 @@ reply_gap=""
 cutoff=$(( $(date +%s) - REPLY_WINDOW_HOURS * 3600 ))
 for f in "$inbox_dir"/handled/*/*.md; do
   [ -e "$f" ] || continue
+  in_scope "$f" || continue          # thread #214: only THIS session's campaign
   mt=$(stat -f %m "$f" 2>/dev/null || echo 0)
   [ "$mt" -lt "$cutoff" ] && continue
   [ "$(fm_field "$f" needs_response)" = "true" ] || continue
@@ -200,11 +249,14 @@ Per AGENTS.md §11c–§11d and the brew-ops SKILL \"Inbox protocol\" (envelope-
 archive-second), every inbound envelope you handled must be fully closed out
 BEFORE your session ends.
 
-If this gate is unexpected: an inbox reply for a campaign you own was routed
-into THIS session by the inbox-watcher (AGENTS.md §11l / §151 sticky
-thread→session ownership) — the envelope filename(s) and thread id(s) below
-are the inbox-routed reply(ies) that still need closing out. This is expected
-behaviour, not a bug; handle them as listed and the gate clears."
+If this gate is unexpected: the envelope(s) below were routed into THIS session
+by the inbox-watcher for a campaign you own (AGENTS.md §11l / §151 sticky
+thread→session ownership). As of thread #214 this gate is campaign-scoped — it
+lists ONLY envelopes whose wake_key (parent_thread || thread) matches the
+campaign this session was spawned to handle, so a sibling same-oracle session's
+envelopes are NOT shown here and are NOT yours to close. Handle the one(s)
+listed and the gate clears. (The orchestrator hub is the exception — it sees all
+its campaigns whole-dir, by design.)"
 
 if [ -n "$unhandled" ]; then
   msg+="
