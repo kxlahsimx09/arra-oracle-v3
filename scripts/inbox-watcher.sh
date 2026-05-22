@@ -26,7 +26,19 @@
 #   fired | delivered_to_owner            → failed_no_prompt + alert
 #        (T1 deadline elapsed)
 #   verified (T2: file moved out of root)→ completed
-#   verified (T2 deadline elapsed)       → failed_stuck + alert
+#   verified (transient API-error tail +  → transient_retry  (thread #210:
+#        claude exited — e.g. 529 on        529/5xx/timeout stall, re-resume
+#        first turn)                         with backoff, suppresses T2)
+#   verified (non-transient API error,    → failed_api_nontransient + escalate
+#        4xx tail)                           (no retry — a retry can't fix it)
+#   verified (T2 deadline elapsed,        → failed_stuck + alert
+#        no API-error tail)
+#   transient_retry (tail advanced to    → verified  (recovered; fresh clock)
+#        real work)
+#   transient_retry (backoff elapsed,    → re-resume (--resume same sid/wt),
+#        still error, < cap)                 advance retry_count
+#   transient_retry (cap reached, still  → failed_transient_exhausted +
+#        error)                              escalation envelope to orchestrator
 #   completed | failed_*                 (terminal — kept for audit)
 #
 # §151 sticky thread→session ownership: the dispatcher stamps
@@ -79,6 +91,9 @@
 #   INBOX_AUTO_CLEAN            1         (retire worktrees/sessions on close)
 #   INBOX_GC_INTERVAL           600       (s) cadence of the campaign GC sweep
 #   SESSION_TTL_DAYS            30        idle-days before a session-id is GC'd
+#   INBOX_RETRY_BACKOFF         "30 120 300 600"  (s) waits before retry 1..N
+#   INBOX_RETRY_MAX             4         transient re-resume attempts before escalate
+#   INBOX_RETRY_VERIFY_WINDOW   =T1       (s) post-final-attempt recovery window
 #   MAW_BIN                     auto-detect (`maw` on PATH, else local cli.ts)
 
 set -u
@@ -126,6 +141,28 @@ MAW_BIN=${MAW_BIN:-bun /Users/dev01/Code/github.com/Soul-Brews-Studio/maw-js/src
 # more conservative; tune lower only if the operator actively wants to
 # steal worktrees from slow-but-legitimate sessions.
 CLAUDE_STUCK_TIMEOUT=${CLAUDE_STUCK_TIMEOUT:-600}
+
+# ─── Transient API-error auto-retry (thread #210) ──────────────────────────
+# A freshly-woken session can 529 ("API Error: 529 Overloaded", transient
+# Anthropic-side) on its FIRST turn and exit before doing any work. The wake
+# prompt IS in the JSONL, so T1 marks the envelope `verified`; it then sits
+# until T2 `failed_stuck` (~30 min) and recovery was manual. The recovering
+# move has always been `maw wake --resume <sid>` once the 529 cleared — the
+# same path fire_wake Path 1 / fire_to_owner already use. This automates it:
+# detect a transient-error JSONL tail on a `verified` envelope whose claude
+# has exited, then re-resume the SAME session/worktree with exponential
+# backoff, capped, before falling through to escalate. Distinct from a genuine
+# logic stall — that has no `isApiErrorMessage` tail and is untouched here.
+#
+# Backoff = seconds to wait BEFORE attempts 1..N. Default 30s→2m→5m→10m, cap
+# 4 (≈17.5 min window): wt-1 evidence (thread #210) showed a re-fire 529 again,
+# so a ~7.5 min/cap-3 window risked premature exhaust. Tune from observed
+# retry/recovery timestamps per P-002 — all env-overridable.
+INBOX_RETRY_BACKOFF=${INBOX_RETRY_BACKOFF:-"30 120 300 600"}
+INBOX_RETRY_MAX=${INBOX_RETRY_MAX:-4}
+# After the final attempt, give the resumed session this long to recover before
+# declaring `failed_transient_exhausted`. Defaults to the T1 delivery window.
+INBOX_RETRY_VERIFY_WINDOW=${INBOX_RETRY_VERIFY_WINDOW:-$T1_DELIVERY_DEADLINE}
 
 CLAUDE_PROJECTS=${CLAUDE_PROJECTS:-$HOME/.claude/projects}
 
@@ -610,6 +647,91 @@ deferred_ready_to_fire() {
   return 0
 }
 
+# ─── Transient API-error detection (thread #210) ───────────────────────────
+#
+# Classify the TAIL of a worktree's newest JSONL into exactly one signal,
+# keying on Claude Code's own per-turn fields (robust — no fragile prose
+# matching). Each transcript line is one of: assistant turn (an API error
+# carries `isApiErrorMessage:true` + numeric `apiErrorStatus`), real assistant
+# output ("work"), a user tool_result ("work"), a user prompt/nudge
+# ("prompt"), or non-message bookkeeping (last-prompt / queue-operation /
+# attachment — ignored). Among the message turns:
+#
+#   error <code>  the LAST message turn is the API error and NO work follows
+#                 it (a re-delivered prompt after the error still counts as
+#                 "error" — the resume landed but produced nothing). <code> is
+#                 apiErrorStatus, else parsed from the text, else empty.
+#   progress      real work (assistant output or a tool_result) exists AFTER
+#                 the last error — the session moved on / recovered.
+#   pending       message turns exist, none is an error, none is work yet
+#                 (only a freshly-delivered prompt) — claude is spinning up.
+#   <empty>       no message turns / no JSONL.
+#
+# "progress" requires WORK after the error, not merely a turn — a bare
+# re-delivered prompt is NOT recovery. Paired with the caller's
+# claude-is-dead gate this cannot mistake an in-flight retry for a recovery.
+inspect_jsonl_tail() {
+  local wt=$1 proj jsonl
+  [ -z "$wt" ] && return 0
+  proj="$CLAUDE_PROJECTS/$(encode_cwd "$wt")"
+  [ -d "$proj" ] || return 0
+  jsonl=$(ls -t "$proj"/*.jsonl 2>/dev/null | head -1)
+  [ -z "$jsonl" ] && return 0
+  jq -rRn '
+    def cls:
+      if (.type=="assistant" and (.isApiErrorMessage==true)) then "error"
+      elif (.type=="assistant") then "work"
+      elif (.type=="user"
+            and (((.message.content // null) | type) == "array")
+            and ([ .message.content[]? | select(.type=="tool_result") ] | length > 0))
+        then "work"
+      elif (.type=="user") then "prompt"
+      else "skip" end;
+    [ inputs | fromjson? | select(.type=="assistant" or .type=="user") ] as $m
+    | ($m | length) as $n
+    | if $n == 0 then ""
+      else
+        [ range(0;$n) | select(($m[.] | cls) == "error") ] as $errs
+        | [ range(0;$n) | select(($m[.] | cls) == "work")  ] as $works
+        | if ($errs | length) == 0 then
+            (if ($works | length) > 0 then "progress" else "pending" end)
+          else
+            ($errs[-1]) as $lei
+            | if ([ $works[] | select(. > $lei) ] | length) > 0 then "progress"
+              else
+                ($m[$lei]) as $E
+                | ( ($E.apiErrorStatus // empty)
+                    // ( [ $E.message.content[]? | select(.type=="text") | .text ] | join(" ")
+                         | (capture("API Error: (?<c>[0-9]{3})").c // "") ) ) as $code
+                | "error " + ($code | tostring)
+              end
+          end
+      end
+  ' < "$jsonl" 2>/dev/null
+}
+
+# Map an API status code to retry policy. 5xx + rate-limit (429) + request
+# timeout (408) + unknown(empty) are transient (retry-worthy); other 4xx are
+# client errors a retry can't fix → escalate immediately, don't burn attempts.
+classify_api_code() {
+  case "$1" in
+    529|500|502|503|504|429|408|"") echo transient ;;
+    4[0-9][0-9])                    echo nontransient ;;
+    *)                              echo transient ;;
+  esac
+}
+
+# Echo the idx-th (0-based) backoff value from INBOX_RETRY_BACKOFF, clamped to
+# the last entry for idx beyond the list.
+backoff_at() {
+  local idx=$1
+  # shellcheck disable=SC2086
+  set -- $INBOX_RETRY_BACKOFF
+  [ "$#" -eq 0 ] && { echo 30; return; }
+  [ "$idx" -ge "$#" ] && idx=$(($# - 1))
+  eval "echo \${$((idx + 1))}"
+}
+
 # ─── State transitions ─────────────────────────────────────────────────────
 
 fire_wake() {
@@ -808,10 +930,221 @@ verify_processing() {
     return 0
   fi
 
+  # thread #210 — transient API-error stall: if the woken session 529'd on its
+  # first turn and exited, enter the retry cycle (which re-resumes with backoff)
+  # rather than letting it sit ~30 min to T2. Returns 0 only if it transitioned
+  # — in which case the T2 gate below is suppressed while a retry is pending.
+  maybe_enter_transient_retry "$sf" && return 0
+
   if [ "$age" -ge "$T2_PROCESSING_DEADLINE" ]; then
     set_state_field "$sf" status failed_stuck
     set_state_field "$sf" failed_at "$now"
     alert "[$oracle] $fname STUCK — file still in inbox after $((T2_PROCESSING_DEADLINE / 60))min"
+  fi
+}
+
+# ─── Transient API-error retry cycle (thread #210) ─────────────────────────
+
+# Called from verify_processing on a `verified` envelope whose file is still
+# present. Returns 0 (caller stops, T2 suppressed) iff it transitioned the
+# envelope into the retry cycle or straight to escalate; 1 otherwise.
+#
+# Gate: only when claude has EXITED at the worktree — a transient stall is a
+# dead process with a 529 tail. A live claude (still working, even slow) is
+# never touched here; it flows to the existing T2 `failed_stuck`. A genuine
+# logic stall has no `isApiErrorMessage` tail (tail = "progress"/"pending"/
+# empty) → also returns 1 → unchanged behaviour.
+maybe_enter_transient_retry() {
+  local sf=$1
+  read_state "$sf" || return 1
+  [ -z "${wt_path:-}" ] && return 1
+  [ ! -d "$wt_path" ] && return 1
+  claude_alive_at "$wt_path" && return 1   # still working → not a stall
+
+  local tail kind code class now
+  tail=$(inspect_jsonl_tail "$wt_path")
+  kind=${tail%% *}
+  [ "$kind" != "error" ] && return 1       # only an API-error tail is a stall
+  code=${tail#error}; code=${code# }
+  class=$(classify_api_code "$code")
+  now=$(date +%s)
+
+  if [ "$class" = "nontransient" ]; then
+    # 4xx client error — retry can't fix it. Escalate immediately (no attempts).
+    set_state_field "$sf" status failed_api_nontransient
+    set_state_field "$sf" failed_at "$now"
+    set_state_field "$sf" last_error "${code:-?}"
+    set_state_field "$sf" retry_count 0
+    set_state_field "$sf" transient_detected_at "$now"
+    alert "[$oracle] $fname NON-TRANSIENT API error (${code:-?}) on first turn — no retry, escalating"
+    write_exhaust_escalation "$sf" "non-transient API error ${code:-?}"
+    return 0
+  fi
+
+  local first_delay
+  first_delay=$(backoff_at 0)
+  set_state_field "$sf" status transient_retry
+  set_state_field "$sf" retry_count 0
+  set_state_field "$sf" last_error "${code:-transient}"
+  set_state_field "$sf" transient_detected_at "$now"
+  set_state_field "$sf" next_retry_at "$((now + first_delay))"
+  log "[$oracle] $fname → TRANSIENT_RETRY (last_error=${code:-?}; re-resume #1 in ${first_delay}s; cap=$INBOX_RETRY_MAX)"
+  return 0
+}
+
+# Re-deliver the original envelope via `maw wake --resume <captured-sid>` into
+# the SAME worktree — the proven recovery path (fire_wake Path 1 / owner_resume
+# do exactly this). Never `--fresh`: that would orphan the worktree/session and
+# drop §151 owner continuity. Bookkeeping (count, next_retry_at) is owned by the
+# caller; this is just the fire.
+fire_transient_resume() {
+  local sf=$1
+  read_state "$sf" || return 1
+  local sid wt_suffix envelope_path task_prompt wake_out
+  sid=${session_id:-${resume_sid:-}}
+  wt_suffix=$(basename "$wt_path" | sed 's/^[^.]*\.wt-[0-9]*-//')
+  envelope_path="$INBOX_BASE/for-$oracle/$fname"
+  task_prompt="inbox: $fname (envelope path: $envelope_path — read this file directly with the Read tool; do not use \`find\`)"
+  log "[$oracle] $fname → TRANSIENT-RETRY #$(( ${retry_count:-0} + 1 )) (resume sid=${sid:-?}, wt_suffix=$wt_suffix, last_error=${last_error:-?})"
+  wake_out=$($MAW_BIN wake "$oracle" --resume "$sid" --wt "$wt_suffix" --no-attach \
+    --task "$task_prompt" 2>&1) || {
+    alert "[$oracle] $fname transient-retry maw wake --resume nonzero: $(printf '%s' "$wake_out" | tail -3 | tr '\n' ' ')"
+  }
+  printf '%s\n' "$wake_out" >>"$LOG_FILE"
+  # Re-assert §151 owner continuity (the worktree is unchanged).
+  [ -n "${wake_key:-}" ] && record_owner "$oracle" "$wake_key" "$wt_path"
+  return 0
+}
+
+# Write the §11h escalation envelope to for-orchestrator/ when auto-retry gives
+# up. Carries everything the orchestrator needs to re-dispatch in one step
+# (session-id, wt_path, last_error, retry_count, original inbox: fname) so the
+# wake it triggers needs no re-derivation. `from: inbox-watcher` is documentary
+# — routing is by the for-orchestrator/ directory.
+write_exhaust_escalation() {
+  local sf=$1 reason=$2
+  read_state "$sf" || return 0
+  local ts created fn_esc dest sid
+  ts=$(date '+%Y-%m-%d_%H-%M')
+  created=$(date '+%Y-%m-%dT%H:%M:%S%z' | sed -E 's/([0-9]{2})$/:\1/')
+  sid=${session_id:-${resume_sid:-}}
+  fn_esc="${ts}_from-inbox-watcher_thread-${thread_id:-0}_escalate.md"
+  dest="$INBOX_BASE/for-orchestrator/$fn_esc"
+  mkdir -p "$INBOX_BASE/for-orchestrator"
+  cat >"$dest" <<EOF
+---
+from: inbox-watcher
+from_role: watcher-daemon
+to: orchestrator
+to_role: orchestrator
+type: escalate
+thread: ${thread_id:-}
+needs_response: true
+priority: high
+created: ${created}
+---
+
+**Transient-API auto-retry gave up — manual re-dispatch needed (thread #210).**
+
+Reason: ${reason}. Handing to you per §11h; \`${fn_esc%.md}\` stays terminal (no further auto-retry).
+
+- oracle: \`${oracle}\`
+- original envelope: \`${fname}\`
+- thread: \`${thread_id:-?}\`  wake_key: \`${wake_key:-?}\`
+- session-id: \`${sid:-?}\`
+- wt_path: \`${wt_path:-?}\`
+- last_error: \`${last_error:-?}\`
+- retry_count: \`${retry_count:-0}\`
+- detected_at: \`${transient_detected_at:-?}\`
+
+Re-dispatch once the API has recovered:
+\`maw wake ${oracle} --resume ${sid:-<sid>} --wt $(basename "${wt_path:-x}" | sed 's/^[^.]*\.wt-[0-9]*-//') --no-attach --task "inbox: ${fname}"\`
+or re-fire a fresh envelope for thread ${thread_id:-?}.
+EOF
+  log "[$oracle] $fname EXHAUSTED → escalation envelope for-orchestrator/$fn_esc"
+}
+
+# Re-evaluated every scan while status=transient_retry (mirrors
+# reconsider_deferred). Liveness gate first: a live claude is an in-flight
+# retry or ongoing work → wait. Once claude is dead, the JSONL tail decides:
+# work-after-error → recovered (back to verified, fresh clock); still error →
+# respect backoff, then re-resume or, at the cap, exhaust + escalate.
+reconsider_transient_retry() {
+  local sf=$1 file=$2
+  read_state "$sf" || return 0
+  local now; now=$(date +%s)
+
+  # Agent recovered + archived (possibly out-of-band) → completed.
+  if [ ! -f "$file" ]; then
+    set_state_field "$sf" status completed
+    set_state_field "$sf" completed_at "$now"
+    log "[$oracle] $fname COMPLETED (archived during transient-retry — recovered after ${retry_count:-0} re-resume(s))"
+    [ "$INBOX_AUTO_CLEAN" = "1" ] && maybe_retire_worktree "$sf"
+    return 0
+  fi
+
+  # Worktree vanished mid-cycle → can't resume → escalate.
+  if [ -z "${wt_path:-}" ] || [ ! -d "${wt_path:-/nonexistent}" ]; then
+    set_state_field "$sf" status failed_transient_exhausted
+    set_state_field "$sf" failed_at "$now"
+    alert "[$oracle] $fname transient-retry ABORT (worktree gone); escalating"
+    write_exhaust_escalation "$sf" "worktree gone mid-retry"
+    return 0
+  fi
+
+  # Live claude → a retry is spinning up or work is ongoing. Wait.
+  if claude_alive_at "$wt_path"; then
+    local age
+    age=$((now - ${transient_detected_at:-now}))
+    [ "$age" -ge "$T2_PROCESSING_DEADLINE" ] && \
+      alert "[$oracle] $fname transient-retry: claude busy ${age}s past T2 (still queued, not dropped)"
+    return 0
+  fi
+
+  # claude dead — inspect the tail.
+  local tail kind
+  tail=$(inspect_jsonl_tail "$wt_path")
+  kind=${tail%% *}
+  if [ "$kind" != "error" ]; then
+    # Real work followed the error (progress) — or no error tail at all
+    # (pending/empty) with claude already gone: treat as recovered and hand
+    # back to the normal verified→T2 flow with a FRESH clock so T2 measures
+    # from recovery, not the original fire.
+    set_state_field "$sf" status verified
+    set_state_field "$sf" fired_at "$now"
+    set_state_field "$sf" recovered_at "$now"
+    log "[$oracle] $fname → RECOVERED from transient stall after ${retry_count:-0} re-resume(s) (tail=${kind:-none}; back to verified)"
+    return 0
+  fi
+
+  # Still an API-error tail. Refresh last_error, then respect the backoff clock.
+  local code; code=${tail#error}; code=${code# }
+  [ -n "$code" ] && set_state_field "$sf" last_error "$code"
+  [ "$now" -lt "${next_retry_at:-0}" ] && return 0
+
+  # Backoff elapsed. Out of attempts?
+  if [ "${retry_count:-0}" -ge "$INBOX_RETRY_MAX" ]; then
+    set_state_field "$sf" status failed_transient_exhausted
+    set_state_field "$sf" failed_at "$now"
+    alert "[$oracle] $fname TRANSIENT-EXHAUSTED after ${retry_count} re-resume(s) (last_error=${last_error:-?}); escalating"
+    write_exhaust_escalation "$sf" "transient API error ${last_error:-?} persisted across ${retry_count} retries"
+    return 0
+  fi
+
+  # Fire one re-resume. Lock so a racing scan can't double-fire.
+  if mkdir "$sf.lock" 2>/dev/null; then
+    fire_transient_resume "$sf"
+    local new_count delay
+    new_count=$(( ${retry_count:-0} + 1 ))
+    set_state_field "$sf" retry_count "$new_count"
+    set_state_field "$sf" last_retry_at "$now"
+    if [ "$new_count" -ge "$INBOX_RETRY_MAX" ]; then
+      delay=$INBOX_RETRY_VERIFY_WINDOW          # final attempt — short recovery window
+    else
+      delay=$(backoff_at "$new_count")          # wait before the next attempt
+    fi
+    set_state_field "$sf" next_retry_at "$((now + delay))"
+    rmdir "$sf.lock" 2>/dev/null
   fi
 }
 
@@ -1415,8 +1748,9 @@ scan_inbox() {
           fired)              verify_delivery "$sf" ;;
           delivered_to_owner) verify_delivery "$sf" ;;  # §151 send-keys — T1 on owner JSONL
           verified)           verify_processing "$sf" "$file" ;;
+          transient_retry)    reconsider_transient_retry "$sf" "$file" ;;  # thread #210
           deferred)           reconsider_deferred "$sf" "$file" ;;
-          completed|failed_*|fire_failed) : ;;  # terminal
+          completed|failed_*|fire_failed) : ;;  # terminal (incl. failed_transient_exhausted / failed_api_nontransient)
           *)                  alert "[$oracle] $fname unknown status=$status" ;;
         esac
       fi
@@ -1454,6 +1788,10 @@ scan_inbox() {
         # never sees it (it iterates files still in for-{oracle}/), so finalize
         # it here.
         deferred)  [ ! -f "$file" ] && reconsider_deferred "$sf" "$file" ;;
+        # A transient_retry envelope archived out-of-band (the resumed session
+        # recovered + handled it between scans): reconsider finalizes it to
+        # completed when it sees the file gone (thread #210).
+        transient_retry) [ ! -f "$file" ] && reconsider_transient_retry "$sf" "$file" ;;
       esac
     done
   done
@@ -1594,7 +1932,8 @@ usage: $0 {loop|start|stop|status|scan-once|gc-once}
 env overrides: INBOX_BASE, STATE_DIR, LOG_FILE, INBOX_POLL_INTERVAL,
                T1_DELIVERY_DEADLINE, T2_PROCESSING_DEADLINE,
                INBOX_SCAN_ENABLED, INBOX_AUTO_CLEAN, INBOX_GC_INTERVAL,
-               SESSION_TTL_DAYS, MAW_BIN, CLAUDE_PROJECTS
+               SESSION_TTL_DAYS, INBOX_RETRY_BACKOFF, INBOX_RETRY_MAX,
+               INBOX_RETRY_VERIFY_WINDOW, MAW_BIN, CLAUDE_PROJECTS
 USAGE
     exit 2
     ;;
