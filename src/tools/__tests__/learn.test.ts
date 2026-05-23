@@ -237,22 +237,26 @@ describe('validateProjectInput (the guard)', () => {
 });
 
 // ============================================================================
-// Thread #221 finding D — arra_learn(project=...) resolution is NOT broken in
-// current source.
+// Thread #221 finding D — arra_learn(project=...) resolution is NOT broken.
 // ============================================================================
 //
-// wt-17 (thread #219 msg 969) observed a live `arra_learn(project=
-// github.com/Soul-Brews-Studio/arra-oracle-v3)` silently fall back to
-// _universal/ with no `project:` frontmatter. The question (thread #221): is
-// that a bug in current source, or only the stale running server (PID 5859, up
-// since May 17, pre-HEAD)? This block pins the verdict to *stale-server-only*:
-// the exact mixed-case input the handler receives resolves cleanly and the
-// whitelist guard accepts it, so handleLearn writes project-first WITH the
-// `project:` frontmatter line — it does not fall back to _universal/. A restart
-// onto current source is what fixes the observed behaviour; no code change.
+// wt-17 (thread #219 msg 969) saw a learning it filed land in _universal/ with
+// no `project:` frontmatter. The question (thread #221): code bug, or only the
+// stale running server (PID 5859, up since May 17)? Evidence makes it NEITHER:
+//   - Current source resolves the exact input (this block).
+//   - The live PID-5859 server reproduced a project-first write with the same
+//     input (2026-05-23 ~15:40 GMT+7) — so it is not a stale-server gap either.
+//   - The actual cause was caller-side: wt-17's `project` argument leaked into
+//     the `pattern` body as literal `</pattern><parameter name="project">…`
+//     tool-call markup (visible on disk in
+//     _universal/ψ/.../2026-05-23_arralearn-with-a-project-writes-the-learning.md),
+//     so no `project` value reached handleLearn → correct _universal fallback.
+// This block pins the part the server owns: when the handler DOES receive the
+// input, it resolves it and the whitelist accepts it (project-first, not
+// _universal). No D code change; the malformed-call mode is client-side.
 
-describe('finding D: explicit project= resolves in current source (no _universal fallback)', () => {
-  const WT17_INPUT = 'github.com/Soul-Brews-Studio/arra-oracle-v3'; // exactly as wt-17 typed it
+describe('finding D: explicit project= resolves (handler-side is correct)', () => {
+  const WT17_INPUT = 'github.com/Soul-Brews-Studio/arra-oracle-v3'; // the slug wt-17 intended
   const RESOLVED = 'github.com/soul-brews-studio/arra-oracle-v3';
 
   it('normalizeProject resolves the mixed-case input to the canonical slug', () => {

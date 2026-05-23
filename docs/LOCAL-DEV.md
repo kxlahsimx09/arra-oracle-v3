@@ -41,9 +41,10 @@ curl http://localhost:47778/api/health
 > **Restart after every deploy.** Bun does not hot-reload `src/`, so a
 > long-running server keeps serving whatever source it booted with. After
 > fast-forwarding the checkout to merged code, restart this process (stop →
-> `bun run src/server.ts`) — otherwise on-the-wire `arra_*` tool behaviour
-> silently lags the deployed source. (A 6-day-stale server, PID up since
-> May 17, was the root of the thread #221 finding-D `arra_learn` drift.)
+> `bun run src/server.ts`) — otherwise on-the-wire `arra_*` tool behaviour can
+> silently lag the deployed source, and in-memory handles (e.g. the LanceDB
+> vector reader) keep stale fragments. Precedent: a server left up 6 days
+> (since May 17) held a stale LanceDB handle until restarted (thread #221).
 
 ## 2. Run the CLI
 
