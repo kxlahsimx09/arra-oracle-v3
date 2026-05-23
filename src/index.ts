@@ -16,6 +16,7 @@ import { Database } from 'bun:sqlite';
 import * as schema from './db/schema.ts';
 import { createDatabase } from './db/index.ts';
 import { createVectorStore } from './vector/factory.ts';
+import { runBootIntegrityCheck } from './vector/boot-integrity.ts';
 import type { VectorStoreAdapter } from './vector/types.ts';
 import path from 'path';
 import fs from 'fs';
@@ -313,6 +314,11 @@ async function main() {
   } catch (e) {
     console.error('[Startup] Vector store pre-connect failed:', e instanceof Error ? e.message : e);
   }
+
+  // Phase 3 (thread #115): boot integrity check — a real health() probe so a
+  // drifted manifest is named loudly at startup (with the rebuild command), not
+  // discovered weeks later at an audit. Never throws, never auto-rebuilds.
+  await runBootIntegrityCheck();
 
   await server.run();
 }

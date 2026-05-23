@@ -42,6 +42,7 @@ import { oraclenetRoutes } from './routes/oraclenet/index.ts';
 import { sessionsRoutes } from './routes/sessions/index.ts';
 import { vaultRoutes } from './routes/vault/index.ts';
 import { createMenuRoutes } from './routes/menu/index.ts';
+import { runBootIntegrityCheck } from './vector/boot-integrity.ts';
 
 import pkg from '../package.json' with { type: 'json' };
 
@@ -206,6 +207,14 @@ console.log(`
    Swagger: http://localhost:${PORT}/swagger
    Version: ${pkg.version}
 `);
+
+// Phase 3 (thread #115): boot integrity check. Fire-and-forget so it never
+// delays serving — a real health() probe logs a loud, rebuild-command-naming
+// signal if the manifest is drifted. Logs to stdout here (HTTP server). No
+// auto-rebuild (P-003).
+runBootIntegrityCheck({ log: (m) => console.log(m) }).catch((e) =>
+  console.error('[boot-integrity] check errored (non-fatal):', e),
+);
 
 export default {
   port: Number(PORT),
