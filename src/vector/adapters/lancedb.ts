@@ -6,6 +6,7 @@
  */
 
 import type { VectorStoreAdapter, VectorDocument, VectorQueryResult, EmbeddingProvider } from '../types.ts';
+import { InterProcessWriteLock } from './write-lock.ts';
 
 export class LanceDBAdapter implements VectorStoreAdapter {
   readonly name = 'lancedb';
@@ -16,21 +17,40 @@ export class LanceDBAdapter implements VectorStoreAdapter {
   private embedder: EmbeddingProvider;
 
   /**
-   * Serializes writes within this process. Two concurrent addDocuments()
-   * calls that interleave their `table.add()` can produce a LanceDB manifest
-   * version referencing a fragment the other writer has not flushed yet —
-   * the manifest-drift failure (thread #113, recurrences 2026-04-14/04-21/05-16).
-   * NOTE: this guards in-process concurrency only. `@lancedb/lancedb@0.27.2`
-   * has no inter-process write lock, so concurrent writes from other Oracle
-   * processes (other MCP server instances, the HTTP server) can still drift a
-   * manifest. The inter-process file lock is tracked as thread #113 Phase 2.
+   * Serializes writes within this process — two concurrent addDocuments()
+   * calls that interleave their `table.add()` can commit a manifest version
+   * referencing a fragment the other writer has not flushed yet (the
+   * manifest-drift failure, thread #115). This is the in-process half; the
+   * cross-process half is `writeLock` below.
    */
   private writeChain: Promise<void> = Promise.resolve();
+
+  /**
+   * Cross-process half of the drift fix (thread #115 Phase 2). `@lancedb/
+   * lancedb@0.27.2` has no inter-process write lock, so concurrent writes from
+   * *other* Oracle processes (other MCP instances, the HTTP server, the
+   * indexer) sharing this dir can still race a manifest — the documented root
+   * cause across 4 recurrences. A file lock keyed per collection serializes
+   * the manifest-mutating ops across every process. Reads stay lock-free.
+   */
+  private writeLock: InterProcessWriteLock;
 
   constructor(collectionName: string, dbPath: string, embedder: EmbeddingProvider) {
     this.collectionName = collectionName;
     this.dbPath = dbPath;
     this.embedder = embedder;
+    // Lock dir sits beside the lancedb dir (not inside — `tableNames()` would
+    // otherwise enumerate it), shared by every process using the same dbPath.
+    // Per-collection keying lets bge-m3 and qwen3 writes proceed independently.
+    const lockRoot = `${dbPath.replace(/\/+$/, '')}.write-locks`;
+    const safeName = collectionName.replace(/[^A-Za-z0-9_.-]/g, '_');
+    this.writeLock = new InterProcessWriteLock(`${lockRoot}/${safeName}.lock`, {
+      onContended: ({ waitedMs, holder }) =>
+        console.warn(
+          `[LanceDB] write-lock on '${collectionName}' contended: waited ${waitedMs}ms` +
+          (holder ? `, held by pid ${holder.pid} (op=${holder.op ?? '?'})` : '')
+        ),
+    });
   }
 
   async connect(): Promise<void> {
@@ -83,17 +103,20 @@ export class LanceDBAdapter implements VectorStoreAdapter {
 
     const tableNames = await this.db.tableNames();
     if (tableNames.includes(this.collectionName)) {
-      this.table = await this.db.openTable(this.collectionName);
+      this.table = await this.db.openTable(this.collectionName); // read path — no lock
     } else {
-      // Create with a schema-defining dummy row, then delete it
-      const dims = this.embedder.dimensions;
-      this.table = await this.db.createTable(this.collectionName, [{
-        id: '__init__',
-        text: '',
-        metadata: '{}',
-        vector: new Array(dims).fill(0),
-      }]);
-      await this.table.delete('id = "__init__"');
+      // First-ever create mutates the manifest, so hold the cross-process lock.
+      await this.writeLock.withLock(async () => {
+        // Create with a schema-defining dummy row, then delete it
+        const dims = this.embedder.dimensions;
+        this.table = await this.db.createTable(this.collectionName, [{
+          id: '__init__',
+          text: '',
+          metadata: '{}',
+          vector: new Array(dims).fill(0),
+        }]);
+        await this.table.delete('id = "__init__"');
+      }, 'createCollection');
     }
 
     console.log(`[LanceDB] Collection '${this.collectionName}' ready`);
@@ -103,7 +126,9 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     if (!this.db) throw new Error('LanceDB not connected');
 
     try {
-      await this.db.dropTable(this.collectionName);
+      // Drop mutates the manifest and races concurrent writers (e.g. an
+      // operator rebuild while arra_learn is mid-write) — hold the lock.
+      await this.writeLock.withLock(() => this.db.dropTable(this.collectionName), 'dropCollection');
       this.table = null;
       console.log(`[LanceDB] Collection '${this.collectionName}' deleted`);
     } catch (e) {
@@ -134,7 +159,10 @@ export class LanceDBAdapter implements VectorStoreAdapter {
       vector: embeddings[i],
     }));
 
-    await this.table.add(rows);
+    // Embedding ran above, outside the lock (it's slow + read-only) so the
+    // critical section is just the manifest-mutating append. The lock crosses
+    // process boundaries; writeChain still serializes our own callers.
+    await this.writeLock.withLock(() => this.table.add(rows), 'addDocuments');
     console.log(`[LanceDB] Added ${docs.length} documents`);
   }
 
