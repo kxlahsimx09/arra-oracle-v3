@@ -237,6 +237,37 @@ describe('validateProjectInput (the guard)', () => {
 });
 
 // ============================================================================
+// Thread #221 finding D — arra_learn(project=...) resolution is NOT broken in
+// current source.
+// ============================================================================
+//
+// wt-17 (thread #219 msg 969) observed a live `arra_learn(project=
+// github.com/Soul-Brews-Studio/arra-oracle-v3)` silently fall back to
+// _universal/ with no `project:` frontmatter. The question (thread #221): is
+// that a bug in current source, or only the stale running server (PID 5859, up
+// since May 17, pre-HEAD)? This block pins the verdict to *stale-server-only*:
+// the exact mixed-case input the handler receives resolves cleanly and the
+// whitelist guard accepts it, so handleLearn writes project-first WITH the
+// `project:` frontmatter line — it does not fall back to _universal/. A restart
+// onto current source is what fixes the observed behaviour; no code change.
+
+describe('finding D: explicit project= resolves in current source (no _universal fallback)', () => {
+  const WT17_INPUT = 'github.com/Soul-Brews-Studio/arra-oracle-v3'; // exactly as wt-17 typed it
+  const RESOLVED = 'github.com/soul-brews-studio/arra-oracle-v3';
+
+  it('normalizeProject resolves the mixed-case input to the canonical slug', () => {
+    expect(normalizeProject(WT17_INPUT)).toBe(RESOLVED);
+  });
+
+  it('validateProjectInput accepts the normalized slug (whitelist hit, no throw)', () => {
+    // handleLearn validates normalizeProject(projectInput); a hit here means the
+    // resolved project survives to projectDir + the `project:` frontmatter line,
+    // so the write lands project-first, not in _universal/.
+    expect(() => validateProjectInput(normalizeProject(WT17_INPUT))).not.toThrow();
+  });
+});
+
+// ============================================================================
 // getKnownProjects (baseline ∪ fleet-derived)
 // ============================================================================
 
