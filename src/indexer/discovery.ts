@@ -7,8 +7,9 @@ import path from 'path';
 
 /**
  * Discover project-first psi directories in vault.
- * Scans {host}/{org}/{repo}/psi/ at repoRoot for github.com, gitlab.com, bitbucket.org.
- * Returns absolute paths to each project's psi directory.
+ * Scans {host}/{org}/{repo}/psi/ at repoRoot for github.com, gitlab.com, bitbucket.org,
+ * plus the _universal/psi/ bucket for learnings filed with no resolvable project.
+ * Returns absolute paths to each psi directory.
  */
 export function discoverProjectPsiDirs(repoRoot: string): string[] {
   const dirs: string[] = [];
@@ -29,6 +30,17 @@ export function discoverProjectPsiDirs(repoRoot: string): string[] {
         }
       }
     }
+  }
+
+  // _universal/\u03c8 holds learnings filed via arra_learn with no resolvable
+  // project \u2014 projectDir falls back to '_universal' in src/tools/learn.ts.
+  // It is not a {host}/{org}/{repo} path, so the host loop above skips it; without
+  // this the batch reindexer never sees those files, leaving them index-only, and
+  // a from-scratch rebuild silently drops them (e.g. the five 2026-05-21
+  // orchestrator-pattern learnings). Thread #221 (finding C).
+  const universalPsi = path.join(repoRoot, '_universal', '\u03c8');
+  if (fs.existsSync(universalPsi) && fs.statSync(universalPsi).isDirectory()) {
+    dirs.push(universalPsi);
   }
 
   if (dirs.length > 0) {
