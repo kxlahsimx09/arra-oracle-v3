@@ -582,7 +582,14 @@ fi  # end fail-fast vs multi-fail branch
 # write the full prompt to a file in the run-dir, and pass a short pointer
 # as the wake prompt. The wake shell can handle 1-line ASCII trivially.
 PROMPT_FILE="$RUN_DIR/investigation-prompt.md"
-printf '%s\n' "$INVESTIGATE_PROMPT" > "$PROMPT_FILE"
+{
+  printf 'Bootstrap this session before any other work:\n'
+  printf '1) Read .agent/AGENTS.md\n'
+  printf '2) Read .agent/skills/pg-tester/SKILL.md\n'
+  printf '3) Confirm role identity as pg-tester\n'
+  printf '4) Then execute the task below exactly.\n\n'
+  printf '%s\n' "$INVESTIGATE_PROMPT"
+} > "$PROMPT_FILE"
 WAKE_POINTER="อ่าน $PROMPT_FILE ให้จบก่อน — นั่นคือ task ของคุณ. ทำตามคำสั่งในไฟล์ investigate + report ผ่าน mcp__tester-telegram__telegram_send ห้ามแก้ code/test."
 
 # ── Primary notification (ALWAYS send, before spawning investigation) ─────

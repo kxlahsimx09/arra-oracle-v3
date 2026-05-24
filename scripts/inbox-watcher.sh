@@ -245,6 +245,23 @@ jsonl_has_prompt() {
   grep -qF "inbox: $fname" "$jsonl" 2>/dev/null
 }
 
+role_from_oracle() {
+  local oracle="$1"
+  echo "${oracle%-oracle}"
+}
+
+build_task_prompt() {
+  local oracle="$1" fname="$2" envelope_path="$3" role
+  role=$(role_from_oracle "$oracle")
+  cat <<EOF
+Bootstrap this session before any other work:
+1) Read .agent/AGENTS.md
+2) Read .agent/skills/${role}/SKILL.md
+3) Confirm role identity as ${role}
+4) Then process inbox: $fname (envelope path: $envelope_path — read this file directly with the Read tool; do not use \`find\`)
+EOF
+}
+
 # Phase 7 — cancel envelope detection. A cancel envelope is one whose
 # filename ends in `_cancel.md` OR whose frontmatter sets `user_action:
 # cancel`. The bot's /cancel command produces both signals. Cancel
@@ -837,7 +854,8 @@ fire_wake() {
   # `inbox: $fname` substring preserves T1 verification (jsonl_has_prompt,
   # line ~143) which greps for exactly that marker.
   local envelope_path="$INBOX_BASE/for-$oracle/$fname"
-  local task_prompt="inbox: $fname (envelope path: $envelope_path — read this file directly with the Read tool; do not use \`find\`)"
+  local task_prompt
+  task_prompt=$(build_task_prompt "$oracle" "$fname" "$envelope_path")
 
   # Capture maw wake output to extract the resolved worktree path.
   if [ -n "${resume_sid:-}" ]; then
@@ -1004,7 +1022,7 @@ fire_transient_resume() {
   sid=${session_id:-${resume_sid:-}}
   wt_suffix=$(basename "$wt_path" | sed 's/^[^.]*\.wt-[0-9]*-//')
   envelope_path="$INBOX_BASE/for-$oracle/$fname"
-  task_prompt="inbox: $fname (envelope path: $envelope_path — read this file directly with the Read tool; do not use \`find\`)"
+  task_prompt=$(build_task_prompt "$oracle" "$fname" "$envelope_path")
   log "[$oracle] $fname → TRANSIENT-RETRY #$(( ${retry_count:-0} + 1 )) (resume sid=${sid:-?}, wt_suffix=$wt_suffix, last_error=${last_error:-?})"
   wake_out=$($MAW_BIN wake "$oracle" --resume "$sid" --wt "$wt_suffix" --no-attach \
     --task "$task_prompt" 2>&1) || {
@@ -1506,7 +1524,7 @@ fire_to_owner() {
 
   thread_id=$(grep '^thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
   envelope_path="$INBOX_BASE/for-$oracle/$fname"
-  task_prompt="inbox: $fname (envelope path: $envelope_path — read this file directly with the Read tool; do not use \`find\`)"
+  task_prompt=$(build_task_prompt "$oracle" "$fname" "$envelope_path")
   wake_ts=$(date +%s)
 
   if [ "$(owner_state "$owner_wt")" = "idle" ]; then

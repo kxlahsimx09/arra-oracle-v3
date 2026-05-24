@@ -43,7 +43,7 @@ log()   { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
 audit() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$AUDIT_FILE"; }
 
 # Role registry — loaded dynamically from maw fleet configs at boot.
-# Format per entry: <role>|<session>|<repo-path>
+# Format per entry: <role>|<session>|<repo-path>|<default-engine>
 # Sources scanned (in order; later entries override earlier ones by role name):
 #   1. ~/.config/maw/fleet/*.json                         (user-level, primary)
 #   2. ~/Code/github.com/<owner>/<repo>/.agent/fleet/*.json (project-local)
@@ -71,14 +71,14 @@ load_roles() {
     repo_slug=$(jq -r '.project_repos[0] // empty' "$f" 2>/dev/null)
     [ -z "$repo_slug" ] && continue
     local repo_path="$HOME/Code/github.com/$repo_slug"
-    while IFS= read -r win; do
+    while IFS=$'\t' read -r win eng; do
       [ -z "$win" ] && continue
       local role="${win%-oracle}"
       # dedupe: only first occurrence wins
       case "|$seen|" in *"|$role|"*) continue ;; esac
       seen+="|$role"
-      ROLES+=("${role}|${session}|${repo_path}")
-    done < <(jq -r '.windows[].name // empty' "$f" 2>/dev/null)
+      ROLES+=("${role}|${session}|${repo_path}|${eng}")
+    done < <(jq -r '.windows[]? | [(.name // empty), (.engine // empty)] | @tsv' "$f" 2>/dev/null)
   done
   REPOS=()
   local seen_repo="" rp
@@ -249,13 +249,46 @@ update_status() {
   fi
 }
 
-# Path to the chat-watcher script (sibling file, same dir).
+# Path to watcher scripts (sibling files, same dir).
 SCRIPT_DIR_BOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WATCHER_SCRIPT="$SCRIPT_DIR_BOT/chat-watcher.sh"
+WATCHER_SCRIPT_CLAUDE="$SCRIPT_DIR_BOT/chat-watcher.sh"
+WATCHER_SCRIPT_CODEX="$SCRIPT_DIR_BOT/codex-watcher.sh"
 
-# Phase 4 helpers — auto-push agent output to Telegram when claude stabilizes.
+# Phase 4 helpers — auto-push agent output to Telegram when chats respond.
 watch_pid_file() { echo "$STATE_DIR/watch.$(echo "$1" | tr '/' '_').pid"; }
 user_send_marker() { echo "$STATE_DIR/last-user-send.$(echo "$1" | tr '/' '_')"; }
+chat_runtime_file() { echo "$STATE_DIR/chat-runtime.$(echo "$1" | tr '/' '_').env"; }
+
+normalize_engine() {
+  case "${1:-}" in
+    codex)  echo "codex" ;;
+    *)      echo "claude" ;;
+  esac
+}
+
+set_chat_engine() {
+  local chat_id="$1" engine
+  engine=$(normalize_engine "${2:-claude}")
+  echo "ENGINE=$engine" > "$(chat_runtime_file "$chat_id")"
+}
+
+get_chat_engine() {
+  local chat_id="$1" f
+  f=$(chat_runtime_file "$chat_id")
+  if [ -f "$f" ]; then
+    local raw
+    raw=$(grep -m1 '^ENGINE=' "$f" | cut -d'=' -f2-)
+    [ -n "$raw" ] && { normalize_engine "$raw"; return; }
+  fi
+  echo "claude"
+}
+
+watcher_script_for_engine() {
+  case "$1" in
+    codex) echo "$WATCHER_SCRIPT_CODEX" ;;
+    *)     echo "$WATCHER_SCRIPT_CLAUDE" ;;
+  esac
+}
 
 stop_watcher_for() {
   local chat_id="$1"
@@ -268,13 +301,17 @@ stop_watcher_for() {
 }
 
 start_watcher_for() {
-  local pane="$1" chat_id="$2"
+  local pane="$1" chat_id="$2" engine="${3:-}"
+  engine=$(normalize_engine "${engine:-$(get_chat_engine "$chat_id")}")
+  set_chat_engine "$chat_id" "$engine"
   stop_watcher_for "$chat_id"  # idempotent — kill any prior watcher first
-  if [ ! -x "$WATCHER_SCRIPT" ]; then
-    log "watcher script not executable: $WATCHER_SCRIPT"
+  local watcher_script
+  watcher_script=$(watcher_script_for_engine "$engine")
+  if [ ! -x "$watcher_script" ]; then
+    log "watcher script not executable: $watcher_script (engine=$engine)"
     return
   fi
-  nohup bash "$WATCHER_SCRIPT" "$pane" "$chat_id" </dev/null >/dev/null 2>&1 &
+  nohup bash "$watcher_script" "$pane" "$chat_id" </dev/null >/dev/null 2>&1 &
   disown
 }
 
@@ -285,13 +322,15 @@ recover_watchers() {
   while IFS= read -r role; do
     while IFS='|' read -r pane sess win cmd slug; do
       [ -z "$pane" ] && continue
-      local chat="$role/$slug"
+      local chat="$role/$slug" engine
       local pf; pf=$(watch_pid_file "$chat")
       if [ -f "$pf" ] && kill -0 "$(cat "$pf" 2>/dev/null)" 2>/dev/null; then
         continue  # already running
       fi
+      engine=$(get_chat_engine "$chat")
+      [ "$engine" = "claude" ] && engine=$(detect_engine_from_cmd "$cmd")
       log "recover_watchers: spawning watcher for $chat ($pane)"
-      start_watcher_for "$pane" "$chat"
+      start_watcher_for "$pane" "$chat" "$engine"
     done <<< "$(chats_for_role "$role")"
   done <<< "$(all_roles)"
 }
@@ -308,6 +347,18 @@ role_repo() {
   for line in "${ROLES[@]}"; do
     case "$line" in "${role}|"*) echo "$line" | cut -d'|' -f3; return ;; esac
   done
+}
+role_default_engine() {
+  local role="$1" line raw
+  for line in "${ROLES[@]}"; do
+    case "$line" in "${role}|"*)
+      raw=$(echo "$line" | cut -d'|' -f4)
+      normalize_engine "$raw"
+      return
+      ;;
+    esac
+  done
+  echo "claude"
 }
 all_roles() { for line in "${ROLES[@]}"; do echo "$line" | cut -d'|' -f1; done; }
 
@@ -358,6 +409,17 @@ resolve_chat() {
     lines=$(chats_for_role "$target")
     [ "$(echo "$lines" | grep -c .)" = "1" ] && echo "$lines"
   fi
+}
+
+canonical_chat_from_target() {
+  local target="$1" expanded resolved role slug via_alias
+  via_alias=$(resolve_alias "$target")
+  [ -n "$via_alias" ] && expanded="$via_alias" || expanded="$target"
+  resolved=$(resolve_chat "$expanded")
+  [ -z "$resolved" ] && return 1
+  role="${expanded%%/*}"
+  slug=$(echo "$resolved" | cut -d'|' -f5)
+  echo "$role/$slug"
 }
 
 cmd_alias() {
@@ -420,6 +482,57 @@ cmd_alias() {
 
 # claude alive in pane = pane_current_command looks like a claude version (2.x)
 is_claude() { case "$1" in 2.*|claude|claude-*) return 0 ;; *) return 1 ;; esac; }
+is_codex() { case "$1" in codex|codex-*) return 0 ;; *) return 1 ;; esac; }
+is_agent_cmd() { is_claude "$1" || is_codex "$1"; }
+
+detect_engine_from_cmd() {
+  if is_codex "$1"; then
+    echo "codex"
+  else
+    echo "claude"
+  fi
+}
+
+detect_engine_for_target() {
+  local target="$1"
+  local pane_cmd pane
+  pane=$(resolve_chat "$target" | cut -d'|' -f1)
+  if [ -n "$pane" ]; then
+    pane_cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null)
+    detect_engine_from_cmd "$pane_cmd"
+    return
+  fi
+  echo "claude"
+}
+
+start_engine_in_pane() {
+  local pane="$1" engine="$2" cmd
+  case "$engine" in
+    codex)  cmd="codex --dangerously-bypass-approvals-and-sandbox" ;;
+    *)      cmd="claude --dangerously-skip-permissions" ;;
+  esac
+  tmux send-keys -t "$pane" C-c 2>/dev/null
+  sleep 0.2
+  tmux send-keys -t "$pane" -- "$cmd" 2>/dev/null
+  sleep 0.3
+  tmux send-keys -t "$pane" Enter 2>/dev/null
+}
+
+send_role_bootstrap_prompt() {
+  local pane="$1" role="$2" engine="$3"
+  local auto="${AUTO_BOOTSTRAP_ON_NEW:-1}"
+  [ "$auto" = "0" ] && return 0
+  local skill_path=".agent/skills/${role}/SKILL.md"
+  local bootstrap="Bootstrap this session before any other work:
+1) Read .agent/AGENTS.md
+2) Read ${skill_path}
+3) Confirm role identity as ${role}
+4) Summarize active workflows and wait for my task."
+  tmux send-keys -t "$pane" -- "$bootstrap" 2>/dev/null
+  sleep 0.3
+  tmux send-keys -t "$pane" Enter 2>/dev/null
+  log "/new bootstrap sent for role=$role engine=$engine"
+}
 
 # Encode a path the way Claude Code does for ~/.claude/projects/ dir names:
 # replace "/" with "-" and "." with "-". So /A/B.wt-1 → -A-B-wt-1.
@@ -432,6 +545,15 @@ find_jsonl() {
   local dir=$HOME/.claude/projects/$enc
   [ ! -d "$dir" ] && return 1
   ls -t "$dir"/*.jsonl 2>/dev/null | head -1
+}
+
+find_codex_jsonl() {
+  local cwd="$1" file file_cwd
+  while IFS= read -r file; do
+    [ -f "$file" ] || continue
+    file_cwd=$(head -n 1 "$file" 2>/dev/null | jq -r 'select(.type == "session_meta") | .payload.cwd // empty' 2>/dev/null)
+    [ "$file_cwd" = "$cwd" ] && { echo "$file"; return; }
+  done < <(find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' -type f 2>/dev/null | sort -r | head -200)
 }
 
 # ── Phase 1 read-only ──────────────────────────────────────────────────────
@@ -447,8 +569,8 @@ cmd_help() {
 /chats [role]             list chats (all or by role)
 /chat &lt;role[/slug]|alias&gt;  switch context (auto-pick if 1 chat)
 /alias [name [role/slug]] set/list alias; /alias rm &lt;name&gt; ลบ
-/new &lt;role&gt; [slug]        spawn new chat (uses maw wake)
-/relaunch [role/slug]     restart claude in existing pane (after -p exit)
+/new &lt;role&gt; [slug] [claude|codex]  spawn new chat (default=claude)
+/relaunch [role/slug]     restart chat engine in existing pane
 /close &lt;role/slug&gt;        kill chat (pane + leaves worktree orphan)
 /close all [auto]         audit + close safe chats; sweep orphan wt/aliases
 
@@ -560,7 +682,7 @@ cmd_roles() {
 " && continue
     local active=0
     while IFS='|' read -r _ _ _ cmd _; do
-      is_claude "$cmd" && active=$((active + 1))
+      is_agent_cmd "$cmd" && active=$((active + 1))
     done <<< "$cmds"
     out+="✅ <b>$role</b> — $n chat(s), $active active
 "
@@ -582,8 +704,11 @@ cmd_chats() {
     [ -n "$filter" ] && [ "$role" != "$filter" ] && continue
     while IFS='|' read -r pane sess win cmd slug; do
       [ -z "$pane" ] && continue
-      local marker; is_claude "$cmd" && marker="✅" || marker="⚪"
-      out+="$marker <code>$role/$slug</code> $pane (cmd=$cmd)
+      local marker engine
+      is_agent_cmd "$cmd" && marker="✅" || marker="⚪"
+      engine=$(get_chat_engine "$role/$slug")
+      [ "$engine" = "claude" ] && engine=$(detect_engine_from_cmd "$cmd")
+      out+="$marker <code>$role/$slug</code> $pane (cmd=$cmd, engine=$engine)
 "
       found=1
     done <<< "$(chats_for_role "$role")"
@@ -591,7 +716,7 @@ cmd_chats() {
   [ "$found" = "0" ] && out+="(ยังไม่มี chats)"
   out+="
 
-✅=claude alive  ⚪=zsh idle"
+✅=agent alive (claude/codex)  ⚪=zsh idle"
   send_tg "$out"
 }
 
@@ -633,28 +758,42 @@ cmd_chat() {
   while IFS= read -r r; do
     case "$win" in "${r}-"*) role="$r"; slug="${win#${r}-}"; break ;; esac
   done <<< "$(all_roles)"
-  echo "$role/$slug" > "$(active_chat_file "$tg_chat")"
+  local chat_key="$role/$slug" engine
+  engine=$(get_chat_engine "$chat_key")
+  if [ "$engine" = "claude" ]; then
+    engine=$(detect_engine_from_cmd "$cmd")
+  fi
+  set_chat_engine "$chat_key" "$engine"
+  echo "$chat_key" > "$(active_chat_file "$tg_chat")"
   # Phase 4 v2: each chat has its own watcher (independent of active context).
   # /chat just routes plain messages — doesn't toggle the watcher.
   # If pane's watcher isn't running (e.g. after bot restart), spawn it.
-  if [ ! -f "$(watch_pid_file "$role/$slug")" ] || ! kill -0 "$(cat "$(watch_pid_file "$role/$slug")" 2>/dev/null)" 2>/dev/null; then
-    start_watcher_for "$pane" "$role/$slug"
+  if [ ! -f "$(watch_pid_file "$chat_key")" ] || ! kill -0 "$(cat "$(watch_pid_file "$chat_key")" 2>/dev/null)" 2>/dev/null; then
+    start_watcher_for "$pane" "$chat_key" "$engine"
   fi
-  local al; al=$(chat_alias "$role/$slug")
+  local al; al=$(chat_alias "$chat_key")
   local al_label; [ -n "$al" ] && al_label=" (<b>$al</b>)" || al_label=""
-  send_tg "✓ active chat: <code>$role/$slug</code>${al_label} ($pane, cmd=$cmd)
+  send_tg "✓ active chat: <code>$chat_key</code>${al_label} ($pane, cmd=$cmd, engine=$engine)
 ส่งข้อความตอนนี้ → ไป chat นี้
 /watch ดู watcher status, /look /history ดูเนื้อหา"
   update_status "$tg_chat"
 }
 
 cmd_new() {
-  local tg_chat="$1" role="$2" slug="${3:-$(date +%Y%m%d-%H%M%S)}"
-  [ -z "$role" ] && { send_tg "❌ usage: /new &lt;role&gt; [slug]"; return; }
+  local tg_chat="$1" role="$2" arg3="${3:-}" arg4="${4:-}"
+  local slug engine
+  if [ "$arg3" = "claude" ] || [ "$arg3" = "codex" ]; then
+    slug="$(date +%Y%m%d-%H%M%S)"
+    engine="$arg3"
+  else
+    slug="${arg3:-$(date +%Y%m%d-%H%M%S)}"
+    engine=$(normalize_engine "${arg4:-$(role_default_engine "$role")}")
+  fi
+  [ -z "$role" ] && { send_tg "❌ usage: /new &lt;role&gt; [slug] [claude|codex]"; return; }
   local repo
   repo=$(role_repo "$role")
   [ -z "$repo" ] && { send_tg "❌ unknown role: $role (ใช้ /roles)"; return; }
-  audit "/new $role $slug"
+  audit "/new $role $slug engine=$engine"
 
   # Pre-flight: ensure local main is current with origin/main so the worktree
   # forks from latest base. Two paths depending on what's checked out in the
@@ -711,12 +850,11 @@ status:
   send_tg "✓ pulled main → <code>$pulled_head</code>
 ⏳ spawning <code>$role/$slug</code>..."
 
-  # maw wake creates worktree + pane. Without --task it leaves zsh prompt;
-  # we send `claude --dangerously-skip-permissions` afterward to start
-  # interactive claude in the new pane.
+  # maw wake creates worktree + pane. We'll align the pane engine afterward
+  # (claude or codex), independent from maw's default template command.
   local out
   out=$(maw wake "$role" --wt "$slug" --fresh 2>&1 | tail -8)
-  log "/new $role/$slug — maw wake output: $out"
+  log "/new $role/$slug (engine=$engine) — maw wake output: $out"
   sleep 2
   # find the pane maw created
   local pane
@@ -726,32 +864,29 @@ status:
 <pre>$(echo "$out" | html_escape)</pre>"
     return
   fi
-  # Maw's send-keys template (`claude --continue || claude -p '<task>'`) often
-  # already starts an interactive claude in fresh worktrees — `--continue`
-  # silently opens a new session even with no prior conversation. So we MUST
-  # NOT blindly send-keys our own `claude --dangerously...` line; if claude is
-  # already up, that text would land inside claude's input box as a "user
-  # message" and trigger a response (observed 2026-04-28: brew-ops/20260428-195326
-  # got "That's the Claude Code CLI flag..." spurious turn).
-  #
-  # Wait for maw's template to settle, then check pane_current_command:
-  #   - shell (zsh/bash/sh/fish) → maw didn't start claude → start it ourselves
-  #   - claude version (e.g. 2.1.119) → maw started it → leave alone
+  # Wait for maw's template to settle, then enforce desired engine in pane.
   sleep 3
-  local pane_cmd
+  local pane_cmd target_engine
+  target_engine=$(normalize_engine "$engine")
+  local chat_key="$role/$slug"
+  set_chat_engine "$chat_key" "$target_engine"
   pane_cmd=$(tmux list-panes -t "$pane" -F "#{pane_current_command}" 2>/dev/null | head -1)
   if echo "$pane_cmd" | grep -qE '^(zsh|bash|sh|fish)$'; then
-    log "/new $role/$slug — pane at $pane_cmd, starting claude"
-    tmux send-keys -t "$pane" -- "claude --dangerously-skip-permissions" 2>/dev/null
-    sleep 0.3
-    tmux send-keys -t "$pane" Enter 2>/dev/null
+    log "/new $role/$slug — pane at $pane_cmd, starting $target_engine"
+    start_engine_in_pane "$pane" "$target_engine"
+    sleep 3
+  elif { [ "$target_engine" = "claude" ] && is_codex "$pane_cmd"; } || \
+       { [ "$target_engine" = "codex" ] && is_claude "$pane_cmd"; }; then
+    log "/new $role/$slug — pane has $pane_cmd, switching to $target_engine"
+    start_engine_in_pane "$pane" "$target_engine"
     sleep 3
   else
-    log "/new $role/$slug — pane already running $pane_cmd, skip claude start"
+    log "/new $role/$slug — pane already running $pane_cmd (engine=$target_engine), skip restart"
   fi
-  echo "$role/$slug" > "$(active_chat_file "$tg_chat")"
-  start_watcher_for "$pane" "$role/$slug"
-  send_tg "✓ created <code>$role/$slug</code> ($pane)
+  echo "$chat_key" > "$(active_chat_file "$tg_chat")"
+  start_watcher_for "$pane" "$chat_key" "$target_engine"
+  send_role_bootstrap_prompt "$pane" "$role" "$target_engine"
+  send_tg "✓ created <code>$chat_key</code> ($pane, engine=$target_engine)
 ✓ now active chat
 🔔 auto-push เปิดอยู่
 ส่งข้อความเริ่มคุย หรือ /look ดู splash"
@@ -783,6 +918,12 @@ remove_aliases_for_chat() {
   [ -f "$f" ] || return
   local tmp; tmp=$(mktemp)
   awk -F= -v c="$chat" 'NF>=2 { v=substr($0, index($0,"=")+1); if (v != c) print }' "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+remove_runtime_for_chat() {
+  local chat="$1" f
+  f=$(chat_runtime_file "$chat")
+  [ -f "$f" ] && rm -f "$f"
 }
 
 # Safe worktree remove (no -f). No-op for the main repo dir or missing path.
@@ -855,6 +996,7 @@ cmd_close_all() {
         stop_watcher_for "$chat"
         tmux kill-pane -t "$pane" 2>/dev/null
         remove_aliases_for_chat "$chat"
+        remove_runtime_for_chat "$chat"
         remove_worktree_for_chat "$cwd" "$repo"
         local af; af=$(active_chat_file "$CHAT")
         [ -s "$af" ] && [ "$(cat "$af" 2>/dev/null)" = "$chat" ] && rm -f "$af"
@@ -905,7 +1047,6 @@ cmd_close() {
   local pane
   pane=$(echo "$resolved" | cut -d'|' -f1)
   audit "/close $target ($pane)"
-  stop_watcher_for "$target"
   tmux kill-pane -t "$pane" 2>/dev/null
   # Drop any aliases pointing at the closed chat so they don't dangle.
   # Derive canonical role/slug: expand alias (if $target was one) for the
@@ -913,7 +1054,9 @@ cmd_close() {
   local _expanded="$target" _via
   _via=$(resolve_alias "$target"); [ -n "$_via" ] && _expanded="$_via"
   local _canon_chat="${_expanded%%/*}/$(echo "$resolved" | cut -d'|' -f5)"
+  stop_watcher_for "$_canon_chat"
   remove_aliases_for_chat "$_canon_chat"
+  remove_runtime_for_chat "$_canon_chat"
   # If we just killed the active chat, clear active state
   # (resolve_chat may have prefix-matched, so compare resolved target)
   local resolved_target="$target"
@@ -995,8 +1138,8 @@ cmd_end() {
   update_status "$tg_chat"
 }
 
-# /relaunch — re-spawn claude in an existing pane after `claude -p` exited.
-# Different from /new: keeps the pane + worktree, just restarts claude inside.
+# /relaunch — re-spawn the chat engine in an existing pane.
+# Different from /new: keeps the pane + worktree, just restarts inside.
 cmd_relaunch() {
   local tg_chat="$1" target="${2:-}"
   if [ -z "$target" ]; then
@@ -1011,15 +1154,22 @@ cmd_relaunch() {
   [ -z "$pane" ] && { send_tg "❌ chat <code>$target</code> ไม่เจอ pane (ตายแล้ว?) — ใช้ /new ถ้าจะสร้างใหม่"; return; }
   local pane_cmd
   pane_cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null)
-  if is_claude "$pane_cmd"; then
+  local engine
+  engine=$(get_chat_engine "$target")
+  [ "$engine" = "claude" ] && engine=$(detect_engine_from_cmd "$pane_cmd")
+  set_chat_engine "$target" "$engine"
+  if [ "$engine" = "claude" ] && is_claude "$pane_cmd"; then
     send_tg "✓ claude รันอยู่แล้วใน <code>$target</code> (cmd=<code>$pane_cmd</code>) — ไม่ต้อง relaunch"
     return
   fi
-  audit "/relaunch $target pane=$pane prev_cmd=$pane_cmd"
-  tmux send-keys -t "$pane" -- "claude --dangerously-skip-permissions" 2>/dev/null
-  sleep 0.3
-  tmux send-keys -t "$pane" Enter 2>/dev/null
-  send_tg "🔄 relaunch claude ใน <code>$target</code> (was <code>${pane_cmd:-?}</code>) — รอสักครู่ให้ขึ้น แล้วลองส่งข้อความใหม่"
+  if [ "$engine" = "codex" ] && is_codex "$pane_cmd"; then
+    send_tg "✓ codex รันอยู่แล้วใน <code>$target</code> (cmd=<code>$pane_cmd</code>) — ไม่ต้อง relaunch"
+    return
+  fi
+  audit "/relaunch $target pane=$pane prev_cmd=$pane_cmd engine=$engine"
+  start_engine_in_pane "$pane" "$engine"
+  start_watcher_for "$pane" "$target" "$engine"
+  send_tg "🔄 relaunch $engine ใน <code>$target</code> (was <code>${pane_cmd:-?}</code>) — รอสักครู่ให้ขึ้น แล้วลองส่งข้อความใหม่"
 }
 
 cmd_watch() {
@@ -1052,11 +1202,14 @@ cmd_watch() {
         [ -f "$f" ] && target=$(cat "$f")
       }
       [ -z "$target" ] && { send_tg "❌ usage: /watch on &lt;role/slug&gt;"; return; }
-      local resolved; resolved=$(resolve_chat "$target")
+      local resolved canon
+      resolved=$(resolve_chat "$target")
       [ -z "$resolved" ] && { send_tg "❌ ไม่เจอ chat <code>$target</code>"; return; }
-      local pane; pane=$(echo "$resolved" | cut -d'|' -f1)
-      start_watcher_for "$pane" "$target"
-      send_tg "✓ watcher on for <code>$target</code> ($pane)"
+      canon=$(canonical_chat_from_target "$target")
+      local pane engine; pane=$(echo "$resolved" | cut -d'|' -f1)
+      engine=$(get_chat_engine "$canon")
+      start_watcher_for "$pane" "$canon" "$engine"
+      send_tg "✓ watcher on for <code>$canon</code> ($pane, engine=$engine)"
       ;;
     off)
       [ -z "$target" ] && {
@@ -1064,8 +1217,10 @@ cmd_watch() {
         [ -f "$f" ] && target=$(cat "$f")
       }
       [ -z "$target" ] && { send_tg "❌ usage: /watch off &lt;role/slug&gt;"; return; }
-      stop_watcher_for "$target"
-      send_tg "✓ watcher off for <code>$target</code> (chat ยังอยู่ — push หยุด)"
+      local canon; canon=$(canonical_chat_from_target "$target")
+      [ -z "$canon" ] && { send_tg "❌ ไม่เจอ chat <code>$target</code>"; return; }
+      stop_watcher_for "$canon"
+      send_tg "✓ watcher off for <code>$canon</code> (chat ยังอยู่ — push หยุด)"
       ;;
     all)
       recover_watchers
@@ -1087,7 +1242,11 @@ cmd_history() {
   # numeric arg means N when used after slash form
   case "$target" in [0-9]*) n="$target"; target=$(cat "$(active_chat_file "$tg_chat")" 2>/dev/null) ;; esac
   [ -z "$target" ] && { send_tg "❌ no active chat"; return; }
-  local role="${target%%/*}" slug="${target#*/}"
+  local canon
+  canon=$(canonical_chat_from_target "$target")
+  [ -n "$canon" ] && target="$canon"
+  local role="${target%%/*}" slug="${target#*/}" engine
+  engine=$(get_chat_engine "$target")
   local repo; repo=$(role_repo "$role")
   [ -z "$repo" ] && { send_tg "❌ unknown role: $role"; return; }
 
@@ -1097,46 +1256,68 @@ cmd_history() {
   # Fall back to repo dir if pane is dead.
   local cwd jsonl pane
   pane=$(resolve_chat "$target" | cut -d'|' -f1)
+  if [ "$engine" = "claude" ] && [ -n "$pane" ]; then
+    local pane_cmd
+    pane_cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null)
+    engine=$(detect_engine_from_cmd "$pane_cmd")
+    set_chat_engine "$target" "$engine"
+  fi
   if [ -n "$pane" ]; then
     cwd=$(tmux display-message -p -t "$pane" "#{pane_current_path}" 2>/dev/null)
   fi
   [ -z "$cwd" ] && cwd="$repo"
-  jsonl=$(find_jsonl "$cwd")
-  if [ -z "$jsonl" ]; then
-    # last resort: try old guess patterns for dead chats
-    if [ "$slug" = "oracle" ] || [ "$slug" = "main" ]; then
-      jsonl=$(find_jsonl "$repo")
-    else
-      local guess1 guess2
-      guess1=$(ls -d "${repo}.wt-"*"-${slug}" 2>/dev/null | head -1)
-      guess2="${repo}/.claude/worktrees/${slug}"
-      [ -d "$guess1" ] && jsonl=$(find_jsonl "$guess1")
-      [ -z "$jsonl" ] && [ -d "$guess2" ] && jsonl=$(find_jsonl "$guess2")
+  local turns
+  if [ "$engine" = "codex" ]; then
+    jsonl=$(find_codex_jsonl "$cwd")
+    if [ -z "$jsonl" ] && [ "$slug" = "oracle" -o "$slug" = "main" ]; then
+      jsonl=$(find_codex_jsonl "$repo")
     fi
-  fi
-  [ -z "$jsonl" ] && { send_tg "❌ ไม่เจอ JSONL session ของ <code>$target</code>
+    [ -z "$jsonl" ] && { send_tg "❌ ไม่เจอ codex session ของ <code>$target</code>
+cwd ที่ลอง: <code>$cwd</code>"; return; }
+    turns=$(jq -r '
+      select(.type == "event_msg" and (.payload.type == "user_message" or .payload.type == "agent_message")) |
+      if .payload.type == "user_message" then
+        "[user] " + ((.payload.message // "")[0:400])
+      else
+        "[" + (.payload.phase // "assistant") + "] " + ((.payload.message // "")[0:400])
+      end
+    ' "$jsonl" 2>/dev/null | tail -"$n")
+  else
+    jsonl=$(find_jsonl "$cwd")
+    if [ -z "$jsonl" ]; then
+      # last resort: try old guess patterns for dead chats
+      if [ "$slug" = "oracle" ] || [ "$slug" = "main" ]; then
+        jsonl=$(find_jsonl "$repo")
+      else
+        local guess1 guess2
+        guess1=$(ls -d "${repo}.wt-"*"-${slug}" 2>/dev/null | head -1)
+        guess2="${repo}/.claude/worktrees/${slug}"
+        [ -d "$guess1" ] && jsonl=$(find_jsonl "$guess1")
+        [ -z "$jsonl" ] && [ -d "$guess2" ] && jsonl=$(find_jsonl "$guess2")
+      fi
+    fi
+    [ -z "$jsonl" ] && { send_tg "❌ ไม่เจอ claude JSONL session ของ <code>$target</code>
 cwd ที่ลอง: <code>$cwd</code>
 encoded: <code>$(encode_cwd "$cwd")</code>"; return; }
-  # Parse last N user/assistant turns. JSONL message.content can be:
-  #   - string (simple message)
-  #   - array of blocks: text / tool_use / tool_result / thinking
-  # Filter to entries with non-empty text; skip pure tool/thinking rows so
-  # the output reads like a conversation, not a tool log.
-  local turns
-  turns=$(jq -r '
-    select(.type == "user" or .type == "assistant") |
-    ((.message.content // "") |
-      if type == "string" then .
-      elif type == "array" then (map(select(.type == "text") | .text) | join("\n"))
-      else "" end
-    ) as $text |
-    if ($text | length) > 0 then
-      "[" + .type + "] " + ($text[0:400])
-    else empty end
-  ' "$jsonl" 2>/dev/null | tail -"$n")
-  [ -z "$turns" ] && { send_tg "❌ JSONL parse ว่าง — schema อาจต่างไป
+    # Parse last N user/assistant turns. JSONL message.content can be:
+    #   - string (simple message)
+    #   - array of blocks: text / tool_use / tool_result / thinking
+    # Filter to entries with non-empty text; skip pure tool/thinking rows.
+    turns=$(jq -r '
+      select(.type == "user" or .type == "assistant") |
+      ((.message.content // "") |
+        if type == "string" then .
+        elif type == "array" then (map(select(.type == "text") | .text) | join("\n"))
+        else "" end
+      ) as $text |
+      if ($text | length) > 0 then
+        "[" + .type + "] " + ($text[0:400])
+      else empty end
+    ' "$jsonl" 2>/dev/null | tail -"$n")
+  fi
+  [ -z "$turns" ] && { send_tg "❌ history parse ว่าง — schema อาจต่างไป
 file: $jsonl"; return; }
-  send_tg "📜 <b>history</b> <code>$target</code> (last $n turns):
+  send_tg "📜 <b>history</b> <code>$target</code> (engine=$engine, last $n turns):
 <pre>$(echo "$turns" | html_escape)</pre>"
 }
 
@@ -1214,46 +1395,73 @@ cmd_ctx() {
     [ ! -f "$f" ] && { send_tg "❌ ไม่มี active chat — /chat ก่อน หรือ /ctx &lt;role/slug&gt;"; return; }
     target=$(cat "$f")
   fi
-  local role="${target%%/*}"
+  local canon
+  canon=$(canonical_chat_from_target "$target")
+  [ -n "$canon" ] && target="$canon"
+  local role="${target%%/*}" slug="${target#*/}"
   local repo; repo=$(role_repo "$role")
   [ -z "$repo" ] && { send_tg "❌ unknown role: $role"; return; }
 
-  local cwd pane jsonl
+  local cwd pane jsonl engine
   pane=$(resolve_chat "$target" | cut -d'|' -f1)
+  engine=$(get_chat_engine "$target")
+  if [ "$engine" = "claude" ] && [ -n "$pane" ]; then
+    local pane_cmd
+    pane_cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null)
+    engine=$(detect_engine_from_cmd "$pane_cmd")
+    set_chat_engine "$target" "$engine"
+  fi
   [ -n "$pane" ] && cwd=$(tmux display-message -p -t "$pane" "#{pane_current_path}" 2>/dev/null)
   [ -z "$cwd" ] && cwd="$repo"
-  jsonl=$(find_jsonl "$cwd")
-  [ -z "$jsonl" ] && { send_tg "❌ ไม่เจอ JSONL session ของ <code>$target</code>"; return; }
+  local usage_all tokens out_tokens model max_ctx ctx_max
+  model=""
+  if [ "$engine" = "codex" ]; then
+    jsonl=$(find_codex_jsonl "$cwd")
+    if [ -z "$jsonl" ] && [ "$slug" = "oracle" -o "$slug" = "main" ]; then
+      jsonl=$(find_codex_jsonl "$repo")
+    fi
+    [ -z "$jsonl" ] && { send_tg "❌ ไม่เจอ codex session ของ <code>$target</code>"; return; }
+    usage_all=$(jq -r '
+      select(.type == "event_msg" and .payload.type == "token_count") |
+      [
+        ((.payload.info.last_token_usage.input_tokens // 0) | tostring),
+        ((.payload.info.last_token_usage.output_tokens // 0) | tostring),
+        ((.payload.info.model_context_window // 0) | tostring)
+      ] | join("\t")
+    ' "$jsonl" 2>/dev/null)
+    [ -z "$usage_all" ] && { send_tg "📊 <b>$target</b>: ยังไม่มี token_count ใน codex session นี้"; return; }
+    local last_codex; last_codex=$(printf '%s' "$usage_all" | tail -1)
+    tokens=$(printf '%s' "$last_codex" | cut -f1)
+    out_tokens=$(printf '%s' "$last_codex" | cut -f2)
+    ctx_max=$(printf '%s' "$last_codex" | cut -f3)
+    [ -z "$ctx_max" ] || [ "$ctx_max" -le 0 ] && ctx_max=200000
+  else
+    jsonl=$(find_jsonl "$cwd")
+    [ -z "$jsonl" ] && { send_tg "❌ ไม่เจอ claude JSONL session ของ <code>$target</code>"; return; }
+    # Single jq pass so input / output / model come from the same line.
+    # Context window load = input_tokens + cache_creation_input_tokens + cache_read_input_tokens.
+    usage_all=$(jq -r '
+      select(.type == "assistant") |
+      select(.message.usage.input_tokens != null) |
+      [
+        (((.message.usage.input_tokens // 0)
+          + (.message.usage.cache_creation_input_tokens // 0)
+          + (.message.usage.cache_read_input_tokens // 0)) | tostring),
+        ((.message.usage.output_tokens // 0) | tostring),
+        (.message.model // "")
+      ] | join("\t")
+    ' "$jsonl" 2>/dev/null)
+    [ -z "$usage_all" ] && { send_tg "📊 <b>$target</b>: ยังไม่มีข้อมูล usage ใน session นี้"; return; }
+    local last_line; last_line=$(printf '%s' "$usage_all" | tail -1)
+    tokens=$(printf '%s' "$last_line" | cut -f1)
+    out_tokens=$(printf '%s' "$last_line" | cut -f2)
+    model=$(printf '%s' "$last_line" | cut -f3)
+    # Infer context-window tier from the high-water mark across the session.
+    max_ctx=$(printf '%s' "$usage_all" | awk -F'\t' 'BEGIN{m=0} {if($1+0>m) m=$1+0} END{print m+0}')
+    ctx_max=200000
+    [ "$max_ctx" -gt 200000 ] && ctx_max=1000000
+  fi
 
-  # Single jq pass so input / output / model come from the same line.
-  # Context window load = input_tokens + cache_creation_input_tokens + cache_read_input_tokens.
-  # input_tokens alone is just the uncached delta of the latest turn (often 1) — almost
-  # all of the prompt lives in cache_read_input_tokens, which is what fills the window.
-  local usage_all tokens out_tokens model max_ctx
-  usage_all=$(jq -r '
-    select(.type == "assistant") |
-    select(.message.usage.input_tokens != null) |
-    [
-      (((.message.usage.input_tokens // 0)
-        + (.message.usage.cache_creation_input_tokens // 0)
-        + (.message.usage.cache_read_input_tokens // 0)) | tostring),
-      ((.message.usage.output_tokens // 0) | tostring),
-      (.message.model // "")
-    ] | join("\t")
-  ' "$jsonl" 2>/dev/null)
-  [ -z "$usage_all" ] && { send_tg "📊 <b>$target</b>: ยังไม่มีข้อมูล usage ใน session นี้"; return; }
-
-  local last_line; last_line=$(printf '%s' "$usage_all" | tail -1)
-  tokens=$(printf '%s' "$last_line" | cut -f1)
-  out_tokens=$(printf '%s' "$last_line" | cut -f2)
-  model=$(printf '%s' "$last_line" | cut -f3)
-
-  # Infer context-window tier from the high-water mark across the session.
-  # JSONL doesn't expose the [1m] beta — model field is just "claude-opus-4-7" for
-  # both 200k and 1M variants. If we ever observed >200k loaded, this must be 1M.
-  max_ctx=$(printf '%s' "$usage_all" | awk -F'\t' 'BEGIN{m=0} {if($1+0>m) m=$1+0} END{print m+0}')
-  local ctx_max=200000
-  [ "$max_ctx" -gt 200000 ] && ctx_max=1000000
   local pct=$((tokens * 100 / ctx_max))
   local remaining=$((ctx_max - tokens))
 
@@ -1270,7 +1478,7 @@ model: <code>$model</code>"
 
   send_tg "📊 <b>${target}${al}</b>
 ${bar} <b>${pct}%</b>
-ctx:    <code>$tokens</code> / <code>$ctx_max</code>${out_tokens:+    output: <code>$out_tokens</code>}
+ctx:    <code>$tokens</code> / <code>$ctx_max</code> (${engine})${out_tokens:+    output: <code>$out_tokens</code>}
 left:   <code>$remaining</code> tokens${model_line}"
 }
 
@@ -1291,10 +1499,21 @@ cmd_quota() {
       local chat="$role/$slug"
       local cwd; cwd=$(tmux display-message -p -t "$pane" "#{pane_current_path}" 2>/dev/null)
       [ -z "$cwd" ] && continue
-      local j; j=$(find_jsonl "$cwd")
+      local engine; engine=$(get_chat_engine "$chat")
+      [ "$engine" = "claude" ] && engine=$(detect_engine_from_cmd "$_cmd")
+      local j
+      if [ "$engine" = "codex" ]; then
+        j=$(find_codex_jsonl "$cwd")
+      else
+        j=$(find_jsonl "$cwd")
+      fi
       [ -z "$j" ] && continue
       local first_ts
-      first_ts=$(jq -r 'select(.timestamp) | .timestamp' "$j" 2>/dev/null | head -1)
+      if [ "$engine" = "codex" ]; then
+        first_ts=$(jq -r 'select(.type == "session_meta") | (.payload.timestamp // .timestamp)' "$j" 2>/dev/null | head -1)
+      else
+        first_ts=$(jq -r 'select(.timestamp) | .timestamp' "$j" 2>/dev/null | head -1)
+      fi
       [ -z "$first_ts" ] && continue
       # JSONL timestamps are UTC (ISO 8601 with Z suffix). Parse with -u so
       # we don't add the local timezone offset (would show +7h on GMT+7).
@@ -1305,12 +1524,12 @@ cmd_quota() {
       local al; al=$(chat_alias "$chat")
       [ -n "$al" ] && al=" ($al)"
       if [ "$age_m" -lt 300 ]; then
-        session_lines+="• <code>${chat}${al}</code>: started ${age_m}m ago (in window)
+        session_lines+="• <code>${chat}${al}</code>: started ${age_m}m ago (in window, ${engine})
 "
         [ "$epoch" -lt "$oldest_in_window" ] || [ "$oldest_in_window" -eq 0 ] && oldest_in_window=$epoch
       else
         local h=$(( age_m / 60 )) m=$(( age_m % 60 ))
-        session_lines+="• <code>${chat}${al}</code>: ${h}h ${m}m old (outside window)
+        session_lines+="• <code>${chat}${al}</code>: ${h}h ${m}m old (outside window, ${engine})
 "
       fi
     done <<< "$(chats_for_role "$role")"
@@ -1342,14 +1561,14 @@ cmd_send_to_chat() {
   pane=$(resolve_chat "$target" | cut -d'|' -f1)
   [ -z "$pane" ] && { send_tg "❌ active chat <code>$target</code> ตายแล้ว"; rm -f "$f"; return; }
   audit "→ chat=$target pane=$pane text=$text"
-  # Refuse if claude isn't running in the pane — text would land in zsh and
+  # Refuse if no agent CLI is running in the pane — text would land in zsh and
   # never reach the agent. Observed 2026-05-01 after pg-tester's `claude -p`
   # exited and the user typed via brewbot, producing zsh "command not found"
   # for every Thai message until they noticed.
   local pane_cmd
   pane_cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null)
-  if ! is_claude "$pane_cmd"; then
-    send_tg "❌ claude ไม่ได้รันใน <code>$target</code> (pane cmd=<code>${pane_cmd:-?}</code>) — ข้อความจะตกใน shell, ไม่ส่งให้
+  if ! is_agent_cmd "$pane_cmd"; then
+    send_tg "❌ ไม่มี agent CLI รันใน <code>$target</code> (pane cmd=<code>${pane_cmd:-?}</code>) — ข้อความจะตกใน shell, ไม่ส่งให้
 รีเริ่ม: <code>/relaunch</code> (active chat) หรือ <code>/relaunch $target</code>"
     return
   fi
@@ -1365,7 +1584,7 @@ cmd_send_to_chat() {
   tmux send-keys -t "$pane" -- "$text" 2>/dev/null
   sleep 0.3
   tmux send-keys -t "$pane" Enter 2>/dev/null
-  send_tg "→ <code>$target</code> sent. 🔔 watcher จะ push ตอน claude ตอบเสร็จ"
+  send_tg "→ <code>$target</code> sent. 🔔 watcher จะ push ตอน agent ตอบเสร็จ"
 }
 
 # ── dispatcher ─────────────────────────────────────────────────────────────
@@ -1385,7 +1604,7 @@ dispatch() {
     /chats)       cmd_chats "${2:-}" ;;
     /chat)        cmd_chat "$chat_id" "${2:-}" ;;
     /alias)       cmd_alias "$chat_id" "${2:-}" "${3:-}" ;;
-    /new)         cmd_new "$chat_id" "${2:-}" "${3:-}" ;;
+    /new)         cmd_new "$chat_id" "${2:-}" "${3:-}" "${4:-}" ;;
     /relaunch)    cmd_relaunch "$chat_id" "${2:-}" ;;
     /close)       cmd_close "${2:-}" "${3:-}" ;;
     /look)        cmd_look "$chat_id" "${2:-25}" ;;
