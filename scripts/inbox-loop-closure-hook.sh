@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# inbox-loop-closure-hook.sh — Claude Code `Stop` hook (§11d enforcement)
+# inbox-loop-closure-hook.sh — Agent CLI `Stop` hook (§11d enforcement)
 #
 # Problem it fixes: a dispatched oracle agent does the work but its session
 # exits without (1) writing the reply envelope for a `needs_response: true`
@@ -8,20 +8,21 @@
 # §11e Step 0.5 close-out into a hard, harness-level gate: the session
 # CANNOT end while the loop is open.
 #
-# Mechanism: registered as a `Stop` hook in ~/.claude/settings.json. On every
-# stop it identifies the oracle (via the inbox-watcher's own session→oracle
-# map), then blocks the stop (exit 2 + stderr) if the oracle still has an
-# unhandled envelope, or archived a needs_response envelope with no reply.
+# Mechanism: registered as a `Stop` hook in agent runtimes (Claude/Codex). On
+# every stop it identifies the oracle (via the inbox-watcher's own
+# session→oracle map), then blocks the stop (exit 2 + stderr) if the oracle
+# still has an unhandled envelope, or archived a needs_response envelope with
+# no reply.
 #
 # Self-gating: it engages ONLY for sessions the inbox-watcher spawned to
-# handle an envelope (session-id reverse lookup). Every other claude session
-# — interactive dev work, non-oracle panes — is a silent no-op.
+# handle an envelope (session-id reverse lookup). Every other session —
+# interactive dev work, non-oracle panes — is a silent no-op.
 #
 # Fail-open: any unexpected error allows the stop. A hook must never wedge a
 # session. The inbox-watcher T2 `failed_stuck` gate remains the backstop.
 #
 # Owner: brew-ops. See AGENTS.md §11l. Source of truth: this file in
-# arra-oracle-v3/scripts/; deployed copy at ~/.claude/hooks/ by
+# arra-oracle-v3/scripts/; deployed copy under runtime hooks dirs by
 # install-inbox-loop-closure-hook.sh.
 
 set -uo pipefail
@@ -35,7 +36,7 @@ REPLY_WINDOW_HOURS=${INBOX_LOOP_REPLY_WINDOW_HOURS:-12}
 ORACLE_API=${ORACLE_API:-http://localhost:47778/api}  # for §11g moot detection
 
 allow() { exit 0; }                       # let the session stop
-block() { printf '%s\n' "$1" >&2; exit 2; }  # exit 2 → Claude sees stderr, continues
+block() { printf '%s\n' "$1" >&2; exit 2; }  # exit 2 → runtime sees stderr, continues
 
 mkdir -p "$HOOK_STATE" 2>/dev/null || true
 # opportunistic GC of stale per-session block counters (>2 days old)
@@ -43,7 +44,13 @@ find "$HOOK_STATE" -name '*.blocks' -mtime +2 -delete 2>/dev/null || true
 
 # --- read the Stop-hook payload from stdin -----------------------------------
 payload=$(cat 2>/dev/null || true)
-sid=$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null || true)
+# Runtime payloads vary:
+# - Claude hooks commonly include top-level `.session_id`
+# - Codex rollout/session payloads use `.payload.id` (session UUID)
+# Keep this tolerant and fail-open.
+sid=$(printf '%s' "$payload" \
+  | jq -r '.session_id // .payload.session_id // .payload.id // .id // empty' 2>/dev/null || true)
+[ -z "$sid" ] && sid=${ARRA_SESSION_ID:-${SESSION_ID:-}}
 [ -z "$sid" ] && allow
 
 # --- identify the oracle this session belongs to -----------------------------

@@ -518,7 +518,14 @@ cmd_run() {
             mkdir -p "$STATE_DIR/wake-prompts"
             wake_ts=$(date +%Y%m%d-%H%M%S)
             wake_prompt_file="$STATE_DIR/wake-prompts/${role}-${wake_ts}.md"
-            printf '%s\n' "$prompt" > "$wake_prompt_file"
+            {
+              printf 'Bootstrap this session before any other work:\n'
+              printf '1) Read .agent/AGENTS.md\n'
+              printf '2) Read .agent/skills/%s/SKILL.md\n' "$role"
+              printf '3) Confirm role identity as %s\n' "$role"
+              printf '4) Then execute the task below exactly.\n\n'
+              printf '%s\n' "$prompt"
+            } > "$wake_prompt_file"
             wake_pointer="อ่าน $wake_prompt_file ให้จบก่อน — นั่นคือ task ของคุณ ครบทุกบรรทัด. ทำตามคำสั่งในไฟล์ทั้งหมด ห้ามข้าม."
             # NOTE: --task flag, not positional. Positional [task] becomes
             # wakeOpts.task → slugged into the worktree/tmux-pane name, which

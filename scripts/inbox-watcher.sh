@@ -165,6 +165,8 @@ INBOX_RETRY_MAX=${INBOX_RETRY_MAX:-4}
 INBOX_RETRY_VERIFY_WINDOW=${INBOX_RETRY_VERIFY_WINDOW:-$T1_DELIVERY_DEADLINE}
 
 CLAUDE_PROJECTS=${CLAUDE_PROJECTS:-$HOME/.claude/projects}
+CODEX_SESSIONS=${CODEX_SESSIONS:-$HOME/.codex/sessions}
+CODEX_SESSION_SCAN_LIMIT=${CODEX_SESSION_SCAN_LIMIT:-300}
 
 # Resolve maw binary: prefer PATH-resolved `maw`, else direct bun invocation
 # of the local maw-js source tree (matches the dev01 ghq layout).
@@ -243,6 +245,23 @@ jsonl_has_prompt() {
   local jsonl=$1 fname=$2
   [ -f "$jsonl" ] || return 1
   grep -qF "inbox: $fname" "$jsonl" 2>/dev/null
+}
+
+role_from_oracle() {
+  local oracle="$1"
+  echo "${oracle%-oracle}"
+}
+
+build_task_prompt() {
+  local oracle="$1" fname="$2" envelope_path="$3" role
+  role=$(role_from_oracle "$oracle")
+  cat <<EOF
+Bootstrap this session before any other work:
+1) Read .agent/AGENTS.md
+2) Read .agent/skills/${role}/SKILL.md
+3) Confirm role identity as ${role}
+4) Then process inbox: $fname (envelope path: $envelope_path — read this file directly with the Read tool; do not use \`find\`)
+EOF
 }
 
 # Phase 7 — cancel envelope detection. A cancel envelope is one whose
@@ -380,20 +399,68 @@ record_owner() {
   fi
 }
 
-# Derive a session-id (UUID) from a worktree path: the newest JSONL basename
-# under the encoded claude project dir. ASSUMPTION (thread #151 refinement
-# #2): one claude session per worktree — true for the single-purpose dispatch
-# worktrees maw creates. If a human ran several claude sessions in the same
-# worktree this picks the most recent; a future debugger chasing a wrong
-# --resume target should start here.
+# Find newest Codex rollout JSONL whose session_meta.cwd equals `cwd`.
+find_latest_codex_jsonl() {
+  local cwd=$1 file file_cwd
+  [ -n "$cwd" ] || return 1
+  [ -d "$CODEX_SESSIONS" ] || return 1
+  while IFS= read -r file; do
+    [ -f "$file" ] || continue
+    file_cwd=$(head -n 1 "$file" 2>/dev/null \
+      | jq -r 'select(.type == "session_meta") | .payload.cwd // empty' 2>/dev/null)
+    [ "$file_cwd" = "$cwd" ] && { echo "$file"; return 0; }
+  done < <(find "$CODEX_SESSIONS" -name 'rollout-*.jsonl' -type f 2>/dev/null \
+    | sort -r | head -"$CODEX_SESSION_SCAN_LIMIT")
+  return 1
+}
+
+codex_session_id_from_jsonl() {
+  local jsonl=$1
+  [ -f "$jsonl" ] || return 1
+  head -n 1 "$jsonl" 2>/dev/null \
+    | jq -r 'select(.type == "session_meta") | .payload.id // empty' 2>/dev/null
+}
+
+# Match a Codex rollout that already includes the watcher's routed task marker:
+# event_msg.user_message contains "inbox: <fname>".
+codex_jsonl_has_prompt() {
+  local jsonl=$1 fname=$2 marker
+  [ -f "$jsonl" ] || return 1
+  marker="inbox: $fname"
+  jq -e --arg marker "$marker" \
+    'select(
+      .type == "event_msg"
+      and .payload.type == "user_message"
+      and ((.payload.message // "") | contains($marker))
+    )' \
+    "$jsonl" >/dev/null 2>&1
+}
+
+# Derive a session-id (UUID) from a worktree path:
+# - Claude: newest JSONL basename under ~/.claude/projects/<encoded-cwd>/
+# - Codex:  session_meta.payload.id from newest rollout matching cwd
+# Assumption (thread #151 refinement #2) still holds: one active campaign
+# session per worktree. If humans run multiple sessions in one worktree this
+# picks newest by timestamp and should be the first debug point.
 derive_session_id() {
-  local wt=$1 proj jsonl
+  local wt=$1 proj jsonl sid
   [ -z "$wt" ] && return 1
+
+  # Claude path
   proj="$CLAUDE_PROJECTS/$(encode_cwd "$wt")"
-  [ -d "$proj" ] || return 1
-  jsonl=$(ls -t "$proj"/*.jsonl 2>/dev/null | head -1)
-  [ -z "$jsonl" ] && return 1
-  basename "$jsonl" .jsonl
+  if [ -d "$proj" ]; then
+    jsonl=$(ls -t "$proj"/*.jsonl 2>/dev/null | head -1)
+    if [ -n "$jsonl" ]; then
+      basename "$jsonl" .jsonl
+      return 0
+    fi
+  fi
+
+  # Codex path
+  jsonl=$(find_latest_codex_jsonl "$wt") || return 1
+  sid=$(codex_session_id_from_jsonl "$jsonl") || return 1
+  [ -n "$sid" ] || return 1
+  printf '%s\n' "$sid"
 }
 
 # Scan an envelope for parent_thread + parent_session; if both are present,
@@ -837,7 +904,8 @@ fire_wake() {
   # `inbox: $fname` substring preserves T1 verification (jsonl_has_prompt,
   # line ~143) which greps for exactly that marker.
   local envelope_path="$INBOX_BASE/for-$oracle/$fname"
-  local task_prompt="inbox: $fname (envelope path: $envelope_path — read this file directly with the Read tool; do not use \`find\`)"
+  local task_prompt
+  task_prompt=$(build_task_prompt "$oracle" "$fname" "$envelope_path")
 
   # Capture maw wake output to extract the resolved worktree path.
   if [ -n "${resume_sid:-}" ]; then
@@ -880,16 +948,18 @@ fire_wake() {
 verify_delivery() {
   local sf=$1
   read_state "$sf" || return 0
-  local now age proj_dir jsonl sid sids_dir key
+  local now age proj_dir jsonl sid sids_dir key engine
   now=$(date +%s)
   age=$((now - fired_at))
 
   if [ -n "${wt_path:-}" ]; then
+    # Claude delivery path
     proj_dir=$CLAUDE_PROJECTS/$(encode_cwd "$wt_path")
     if [ -d "$proj_dir" ]; then
       jsonl=$(ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
       if [ -n "$jsonl" ] && jsonl_has_prompt "$jsonl" "$fname"; then
         sid=$(basename "$jsonl" .jsonl)
+        engine="claude"
         # Capture the session under the WAKE KEY (parent_thread for any
         # fan-out sub-task, else thread) so later same-campaign sub-threads
         # resume this session instead of spawning a sibling (§11f/§11k).
@@ -902,7 +972,29 @@ verify_delivery() {
         set_state_field "$sf" status verified
         set_state_field "$sf" verified_at "$now"
         set_state_field "$sf" session_id "$sid"
-        log "[$oracle] $fname VERIFIED (sid=$sid, thread=$thread_id, age=${age}s)"
+        set_state_field "$sf" session_engine "$engine"
+        log "[$oracle] $fname VERIFIED (engine=$engine sid=$sid, thread=$thread_id, age=${age}s)"
+        return 0
+      fi
+    fi
+
+    # Codex delivery path
+    jsonl=$(find_latest_codex_jsonl "$wt_path") || jsonl=""
+    if [ -n "$jsonl" ] && codex_jsonl_has_prompt "$jsonl" "$fname"; then
+      sid=$(codex_session_id_from_jsonl "$jsonl")
+      if [ -n "$sid" ]; then
+        engine="codex"
+        key=${wake_key:-$thread_id}
+        if [ -n "$key" ]; then
+          sids_dir=$STATE_DIR/sessions/$oracle
+          mkdir -p "$sids_dir"
+          printf '%s\n' "$sid" >"$sids_dir/thread-$key.session-id"
+        fi
+        set_state_field "$sf" status verified
+        set_state_field "$sf" verified_at "$now"
+        set_state_field "$sf" session_id "$sid"
+        set_state_field "$sf" session_engine "$engine"
+        log "[$oracle] $fname VERIFIED (engine=$engine sid=$sid, thread=$thread_id, age=${age}s)"
         return 0
       fi
     fi
@@ -1004,7 +1096,7 @@ fire_transient_resume() {
   sid=${session_id:-${resume_sid:-}}
   wt_suffix=$(basename "$wt_path" | sed 's/^[^.]*\.wt-[0-9]*-//')
   envelope_path="$INBOX_BASE/for-$oracle/$fname"
-  task_prompt="inbox: $fname (envelope path: $envelope_path — read this file directly with the Read tool; do not use \`find\`)"
+  task_prompt=$(build_task_prompt "$oracle" "$fname" "$envelope_path")
   log "[$oracle] $fname → TRANSIENT-RETRY #$(( ${retry_count:-0} + 1 )) (resume sid=${sid:-?}, wt_suffix=$wt_suffix, last_error=${last_error:-?})"
   wake_out=$($MAW_BIN wake "$oracle" --resume "$sid" --wt "$wt_suffix" --no-attach \
     --task "$task_prompt" 2>&1) || {
@@ -1506,7 +1598,7 @@ fire_to_owner() {
 
   thread_id=$(grep '^thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
   envelope_path="$INBOX_BASE/for-$oracle/$fname"
-  task_prompt="inbox: $fname (envelope path: $envelope_path — read this file directly with the Read tool; do not use \`find\`)"
+  task_prompt=$(build_task_prompt "$oracle" "$fname" "$envelope_path")
   wake_ts=$(date +%s)
 
   if [ "$(owner_state "$owner_wt")" = "idle" ]; then
