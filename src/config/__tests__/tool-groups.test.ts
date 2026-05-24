@@ -5,8 +5,8 @@ describe('tool-groups', () => {
   it('defines 5 groups with correct tool counts', () => {
     expect(Object.keys(TOOL_GROUPS)).toHaveLength(5);
     expect(TOOL_GROUPS.search).toHaveLength(4);
-    expect(TOOL_GROUPS.knowledge).toHaveLength(3);
-    expect(TOOL_GROUPS.session).toHaveLength(2);
+    expect(TOOL_GROUPS.knowledge).toHaveLength(4);
+    expect(TOOL_GROUPS.session).toHaveLength(4);
     expect(TOOL_GROUPS.forum).toHaveLength(4);
     expect(TOOL_GROUPS.trace).toHaveLength(6);
   });

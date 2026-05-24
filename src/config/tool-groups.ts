@@ -14,8 +14,8 @@ import { ORACLE_DATA_DIR } from '../config.ts';
 
 export const TOOL_GROUPS = {
   search: ['arra_search', 'arra_read', 'arra_list', 'arra_concepts'],
-  knowledge: ['arra_learn', 'arra_stats', 'arra_supersede'],
-  session: ['arra_handoff', 'arra_inbox'],
+  knowledge: ['arra_learn', 'arra_stats', 'arra_supersede', 'arra_verify'],
+  session: ['arra_handoff', 'arra_inbox', 'arra_schedule_add', 'arra_schedule_list'],
   forum: ['arra_thread', 'arra_threads', 'arra_thread_read', 'arra_thread_update'],
   trace: ['arra_trace', 'arra_trace_list', 'arra_trace_get', 'arra_trace_link', 'arra_trace_unlink', 'arra_trace_chain'],
 } as const;

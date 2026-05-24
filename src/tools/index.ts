@@ -15,6 +15,9 @@ export type {
   OracleSupersededInput,
   OracleHandoffInput,
   OracleInboxInput,
+  OracleVerifyInput,
+  OracleScheduleAddInput,
+  OracleScheduleListInput,
   OracleReadInput,
 } from './types.ts';
 
@@ -55,6 +58,17 @@ export { handoffToolDef, handleHandoff } from './handoff.ts';
 // Inbox
 export { inboxToolDef, handleInbox } from './inbox.ts';
 
+// Verify
+export { verifyToolDef, handleVerify } from './verify.ts';
+
+// Schedule
+export {
+  scheduleAddToolDef,
+  scheduleListToolDef,
+  handleScheduleAdd,
+  handleScheduleList,
+} from './schedule.ts';
+
 // Read
 export { readToolDef, handleRead } from './read.ts';
 
@@ -83,4 +97,3 @@ export {
   handleTraceUnlink,
   handleTraceChain,
 } from './trace.ts';
-

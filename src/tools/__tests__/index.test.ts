@@ -15,6 +15,9 @@ describe('tools barrel export', () => {
     expect(tools.supersedeToolDef).toBeDefined();
     expect(tools.handoffToolDef).toBeDefined();
     expect(tools.inboxToolDef).toBeDefined();
+    expect(tools.verifyToolDef).toBeDefined();
+    expect(tools.scheduleAddToolDef).toBeDefined();
+    expect(tools.scheduleListToolDef).toBeDefined();
   });
 
   it('exports core handlers', () => {
@@ -26,6 +29,9 @@ describe('tools barrel export', () => {
     expect(typeof tools.handleSupersede).toBe('function');
     expect(typeof tools.handleHandoff).toBe('function');
     expect(typeof tools.handleInbox).toBe('function');
+    expect(typeof tools.handleVerify).toBe('function');
+    expect(typeof tools.handleScheduleAdd).toBe('function');
+    expect(typeof tools.handleScheduleList).toBe('function');
   });
 
   it('exports forum tool defs and handlers', () => {

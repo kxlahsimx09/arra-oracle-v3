@@ -35,6 +35,8 @@ import {
   supersedeToolDef, handleSupersede,
   handoffToolDef, handleHandoff,
   inboxToolDef, handleInbox,
+  verifyToolDef, handleVerify,
+  scheduleAddToolDef, scheduleListToolDef, handleScheduleAdd, handleScheduleList,
   readToolDef, handleRead,
   forumToolDefs,
   handleThread, handleThreads, handleThreadRead, handleThreadUpdate,
@@ -51,6 +53,9 @@ import type {
   OracleSupersededInput,
   OracleHandoffInput,
   OracleInboxInput,
+  OracleVerifyInput,
+  OracleScheduleAddInput,
+  OracleScheduleListInput,
   OracleReadInput,
   OracleThreadInput,
   OracleThreadsInput,
@@ -72,6 +77,8 @@ const WRITE_TOOLS = [
   'arra_trace',
   'arra_supersede',
   'arra_handoff',
+  'arra_verify',
+  'arra_schedule_add',
 ];
 
 class OracleMCPServer {
@@ -188,6 +195,9 @@ class OracleMCPServer {
         listToolDef,
         statsToolDef,
         conceptsToolDef,
+        verifyToolDef,
+        scheduleAddToolDef,
+        scheduleListToolDef,
         // Forum tools (from src/tools/forum.ts)
         ...forumToolDefs,
         // Trace tools (from src/tools/trace.ts)
@@ -253,6 +263,12 @@ class OracleMCPServer {
             return await handleHandoff(ctx, request.params.arguments as unknown as OracleHandoffInput);
           case 'arra_inbox':
             return await handleInbox(ctx, request.params.arguments as unknown as OracleInboxInput);
+          case 'arra_verify':
+            return await handleVerify(ctx, request.params.arguments as unknown as OracleVerifyInput);
+          case 'arra_schedule_add':
+            return await handleScheduleAdd(ctx, request.params.arguments as unknown as OracleScheduleAddInput);
+          case 'arra_schedule_list':
+            return await handleScheduleList(ctx, request.params.arguments as unknown as OracleScheduleListInput);
           // Forum tools (delegated to src/tools/forum.ts)
           case 'arra_thread':
             return await handleThread(request.params.arguments as unknown as OracleThreadInput);
