@@ -44,7 +44,13 @@ find "$HOOK_STATE" -name '*.blocks' -mtime +2 -delete 2>/dev/null || true
 
 # --- read the Stop-hook payload from stdin -----------------------------------
 payload=$(cat 2>/dev/null || true)
-sid=$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null || true)
+# Runtime payloads vary:
+# - Claude hooks commonly include top-level `.session_id`
+# - Codex rollout/session payloads use `.payload.id` (session UUID)
+# Keep this tolerant and fail-open.
+sid=$(printf '%s' "$payload" \
+  | jq -r '.session_id // .payload.session_id // .payload.id // .id // empty' 2>/dev/null || true)
+[ -z "$sid" ] && sid=${ARRA_SESSION_ID:-${SESSION_ID:-}}
 [ -z "$sid" ] && allow
 
 # --- identify the oracle this session belongs to -----------------------------

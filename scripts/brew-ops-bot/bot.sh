@@ -506,16 +506,35 @@ detect_engine_for_target() {
 }
 
 start_engine_in_pane() {
-  local pane="$1" engine="$2" cmd
+  local pane="$1" engine="$2" cmd pane_cmd attempts=0
   case "$engine" in
     codex)  cmd="codex --dangerously-bypass-approvals-and-sandbox" ;;
     *)      cmd="claude --dangerously-skip-permissions" ;;
   esac
-  tmux send-keys -t "$pane" C-c 2>/dev/null
-  sleep 0.2
+
+  # Drain any live agent process first. Typing the new engine command while
+  # the previous engine is still running injects a stray user turn instead of
+  # restarting the pane process.
+  while :; do
+    pane_cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null)
+    [ -z "$pane_cmd" ] && return 1
+    is_agent_cmd "$pane_cmd" || break
+    attempts=$((attempts + 1))
+    tmux send-keys -t "$pane" C-c 2>/dev/null
+    sleep 0.4
+    [ "$attempts" -ge 4 ] && break
+  done
+
+  pane_cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null)
+  if is_agent_cmd "$pane_cmd"; then
+    log "start_engine_in_pane: unable to stop prior agent cmd=$pane_cmd pane=$pane"
+    return 1
+  fi
+
   tmux send-keys -t "$pane" -- "$cmd" 2>/dev/null
   sleep 0.3
   tmux send-keys -t "$pane" Enter 2>/dev/null
+  return 0
 }
 
 send_role_bootstrap_prompt() {
@@ -866,26 +885,34 @@ status:
   fi
   # Wait for maw's template to settle, then enforce desired engine in pane.
   sleep 3
-  local pane_cmd target_engine
+  local pane_cmd target_engine restarted=0
   target_engine=$(normalize_engine "$engine")
   local chat_key="$role/$slug"
   set_chat_engine "$chat_key" "$target_engine"
   pane_cmd=$(tmux list-panes -t "$pane" -F "#{pane_current_command}" 2>/dev/null | head -1)
   if echo "$pane_cmd" | grep -qE '^(zsh|bash|sh|fish)$'; then
     log "/new $role/$slug — pane at $pane_cmd, starting $target_engine"
-    start_engine_in_pane "$pane" "$target_engine"
+    if ! start_engine_in_pane "$pane" "$target_engine"; then
+      send_tg "❌ start $target_engine failed for <code>$chat_key</code> (pane=$pane, cmd=$pane_cmd)"
+      return
+    fi
+    restarted=1
     sleep 3
   elif { [ "$target_engine" = "claude" ] && is_codex "$pane_cmd"; } || \
        { [ "$target_engine" = "codex" ] && is_claude "$pane_cmd"; }; then
     log "/new $role/$slug — pane has $pane_cmd, switching to $target_engine"
-    start_engine_in_pane "$pane" "$target_engine"
+    if ! start_engine_in_pane "$pane" "$target_engine"; then
+      send_tg "❌ switch to $target_engine failed for <code>$chat_key</code> (pane=$pane, cmd=$pane_cmd)"
+      return
+    fi
+    restarted=1
     sleep 3
   else
     log "/new $role/$slug — pane already running $pane_cmd (engine=$target_engine), skip restart"
   fi
   echo "$chat_key" > "$(active_chat_file "$tg_chat")"
   start_watcher_for "$pane" "$chat_key" "$target_engine"
-  send_role_bootstrap_prompt "$pane" "$role" "$target_engine"
+  [ "$restarted" = "1" ] && send_role_bootstrap_prompt "$pane" "$role" "$target_engine"
   send_tg "✓ created <code>$chat_key</code> ($pane, engine=$target_engine)
 ✓ now active chat
 🔔 auto-push เปิดอยู่
@@ -1167,7 +1194,10 @@ cmd_relaunch() {
     return
   fi
   audit "/relaunch $target pane=$pane prev_cmd=$pane_cmd engine=$engine"
-  start_engine_in_pane "$pane" "$engine"
+  if ! start_engine_in_pane "$pane" "$engine"; then
+    send_tg "❌ relaunch $engine failed in <code>$target</code> (pane=$pane, cmd=<code>${pane_cmd:-?}</code>)"
+    return
+  fi
   start_watcher_for "$pane" "$target" "$engine"
   send_tg "🔄 relaunch $engine ใน <code>$target</code> (was <code>${pane_cmd:-?}</code>) — รอสักครู่ให้ขึ้น แล้วลองส่งข้อความใหม่"
 }
