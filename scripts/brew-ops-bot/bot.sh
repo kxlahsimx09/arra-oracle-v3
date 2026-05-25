@@ -513,7 +513,7 @@ detect_engine_for_target() {
 }
 
 start_engine_in_pane() {
-  local pane="$1" engine="$2" cmd pane_cmd attempts=0
+  local pane="$1" engine="$2" cmd pane_cmd attempts=0 max_attempts=20
   case "$engine" in
     codex)  cmd="codex --dangerously-bypass-approvals-and-sandbox" ;;
     *)      cmd="claude --dangerously-skip-permissions" ;;
@@ -527,9 +527,9 @@ start_engine_in_pane() {
     [ -z "$pane_cmd" ] && return 1
     is_agent_cmd "$pane_cmd" || break
     attempts=$((attempts + 1))
-    tmux send-keys -t "$pane" C-c 2>/dev/null
-    sleep 0.4
-    [ "$attempts" -ge 4 ] && break
+    [ "$attempts" -le 4 ] && tmux send-keys -t "$pane" C-c 2>/dev/null
+    sleep 0.5
+    [ "$attempts" -ge "$max_attempts" ] && break
   done
 
   pane_cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null)
