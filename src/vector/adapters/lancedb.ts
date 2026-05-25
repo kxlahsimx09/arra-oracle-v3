@@ -58,13 +58,13 @@ export class LanceDBAdapter implements VectorStoreAdapter {
 
     const lancedb = await import('@lancedb/lancedb');
     this.db = await lancedb.connect(this.dbPath);
-    console.log(`[LanceDB] Connected at ${this.dbPath}`);
+    console.error(`[LanceDB] Connected at ${this.dbPath}`);
   }
 
   async close(): Promise<void> {
     this.db = null;
     this.table = null;
-    console.log('[LanceDB] Closed');
+    console.error('[LanceDB] Closed');
   }
 
   /**
@@ -119,7 +119,7 @@ export class LanceDBAdapter implements VectorStoreAdapter {
       }, 'createCollection');
     }
 
-    console.log(`[LanceDB] Collection '${this.collectionName}' ready`);
+    console.error(`[LanceDB] Collection '${this.collectionName}' ready`);
   }
 
   async deleteCollection(): Promise<void> {
@@ -130,9 +130,9 @@ export class LanceDBAdapter implements VectorStoreAdapter {
       // operator rebuild while arra_learn is mid-write) — hold the lock.
       await this.writeLock.withLock(() => this.db.dropTable(this.collectionName), 'dropCollection');
       this.table = null;
-      console.log(`[LanceDB] Collection '${this.collectionName}' deleted`);
+      console.error(`[LanceDB] Collection '${this.collectionName}' deleted`);
     } catch (e) {
-      console.warn('[LanceDB] deleteCollection failed:', e instanceof Error ? e.message : String(e));
+      console.error('[LanceDB] deleteCollection failed:', e instanceof Error ? e.message : String(e));
     }
   }
 
@@ -163,7 +163,7 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     // critical section is just the manifest-mutating append. The lock crosses
     // process boundaries; writeChain still serializes our own callers.
     await this.writeLock.withLock(() => this.table.add(rows), 'addDocuments');
-    console.log(`[LanceDB] Added ${docs.length} documents`);
+    console.error(`[LanceDB] Added ${docs.length} documents`);
   }
 
   async query(text: string, limit: number = 10, where?: Record<string, any>): Promise<VectorQueryResult> {
