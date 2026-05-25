@@ -307,12 +307,19 @@ start_watcher_for() {
   stop_watcher_for "$chat_id"  # idempotent — kill any prior watcher first
   local watcher_script
   watcher_script=$(watcher_script_for_engine "$engine")
-  if [ ! -x "$watcher_script" ]; then
-    log "watcher script not executable: $watcher_script (engine=$engine)"
-    return
+  if [ ! -r "$watcher_script" ]; then
+    log "watcher script not readable: $watcher_script (engine=$engine)"
+    return 1
   fi
   nohup bash "$watcher_script" "$pane" "$chat_id" </dev/null >/dev/null 2>&1 &
+  local watcher_pid=$!
   disown
+  sleep 0.2
+  if ! kill -0 "$watcher_pid" 2>/dev/null; then
+    log "watcher exited immediately: $watcher_script (engine=$engine)"
+    return 1
+  fi
+  return 0
 }
 
 # Boot recovery: scan all live chats and spawn watchers that aren't running.
@@ -788,13 +795,17 @@ cmd_chat() {
   # /chat just routes plain messages — doesn't toggle the watcher.
   # If pane's watcher isn't running (e.g. after bot restart), spawn it.
   if [ ! -f "$(watch_pid_file "$chat_key")" ] || ! kill -0 "$(cat "$(watch_pid_file "$chat_key")" 2>/dev/null)" 2>/dev/null; then
-    start_watcher_for "$pane" "$chat_key" "$engine"
+    watch_note=""
+    if ! start_watcher_for "$pane" "$chat_key" "$engine"; then
+      watch_note="
+⚠️ watcher start failed — ใช้ /watch on <code>$chat_key</code> หลังตรวจ log"
+    fi
   fi
   local al; al=$(chat_alias "$chat_key")
   local al_label; [ -n "$al" ] && al_label=" (<b>$al</b>)" || al_label=""
   send_tg "✓ active chat: <code>$chat_key</code>${al_label} ($pane, cmd=$cmd, engine=$engine)
 ส่งข้อความตอนนี้ → ไป chat นี้
-/watch ดู watcher status, /look /history ดูเนื้อหา"
+/watch ดู watcher status, /look /history ดูเนื้อหา${watch_note:-}"
   update_status "$tg_chat"
 }
 
@@ -911,11 +922,16 @@ status:
     log "/new $role/$slug — pane already running $pane_cmd (engine=$target_engine), skip restart"
   fi
   echo "$chat_key" > "$(active_chat_file "$tg_chat")"
-  start_watcher_for "$pane" "$chat_key" "$target_engine"
+  local watch_msg
+  if start_watcher_for "$pane" "$chat_key" "$target_engine"; then
+    watch_msg="🔔 auto-push เปิดอยู่"
+  else
+    watch_msg="⚠️ auto-push start ไม่สำเร็จ — ใช้ /watch on <code>$chat_key</code> หลังตรวจ log"
+  fi
   [ "$restarted" = "1" ] && send_role_bootstrap_prompt "$pane" "$role" "$target_engine"
   send_tg "✓ created <code>$chat_key</code> ($pane, engine=$target_engine)
 ✓ now active chat
-🔔 auto-push เปิดอยู่
+$watch_msg
 ส่งข้อความเริ่มคุย หรือ /look ดู splash"
   update_status "$tg_chat"
 }
@@ -1198,8 +1214,13 @@ cmd_relaunch() {
     send_tg "❌ relaunch $engine failed in <code>$target</code> (pane=$pane, cmd=<code>${pane_cmd:-?}</code>)"
     return
   fi
-  start_watcher_for "$pane" "$target" "$engine"
-  send_tg "🔄 relaunch $engine ใน <code>$target</code> (was <code>${pane_cmd:-?}</code>) — รอสักครู่ให้ขึ้น แล้วลองส่งข้อความใหม่"
+  local watch_msg
+  if start_watcher_for "$pane" "$target" "$engine"; then
+    watch_msg="watcher started"
+  else
+    watch_msg="watcher start failed"
+  fi
+  send_tg "🔄 relaunch $engine ใน <code>$target</code> (was <code>${pane_cmd:-?}</code>, $watch_msg) — รอสักครู่ให้ขึ้น แล้วลองส่งข้อความใหม่"
 }
 
 cmd_watch() {
@@ -1238,7 +1259,10 @@ cmd_watch() {
       canon=$(canonical_chat_from_target "$target")
       local pane engine; pane=$(echo "$resolved" | cut -d'|' -f1)
       engine=$(get_chat_engine "$canon")
-      start_watcher_for "$pane" "$canon" "$engine"
+      if ! start_watcher_for "$pane" "$canon" "$engine"; then
+        send_tg "❌ watcher start failed for <code>$canon</code> ($pane, engine=$engine) — ดู <code>~/.cache/brew-ops-bot/*watcher.log</code>"
+        return
+      fi
       send_tg "✓ watcher on for <code>$canon</code> ($pane, engine=$engine)"
       ;;
     off)
