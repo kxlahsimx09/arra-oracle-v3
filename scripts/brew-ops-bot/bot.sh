@@ -512,6 +512,38 @@ detect_engine_for_target() {
   echo "claude"
 }
 
+expected_engine_running() {
+  local pane_cmd="$1" engine="$2"
+  case "$engine" in
+    codex) is_codex "$pane_cmd" ;;
+    *)     is_claude "$pane_cmd" ;;
+  esac
+}
+
+codex_trust_prompt_visible() {
+  local pane="$1" pane_text
+  pane_text=$(tmux capture-pane -p -t "$pane" 2>/dev/null)
+  printf '%s' "$pane_text" | grep -q 'Do you trust the contents of this directory'
+}
+
+ensure_codex_project_trusted() {
+  local pane="$1" auto="${CODEX_AUTO_TRUST_REPOS:-1}" cwd repo cfg
+  [ "$auto" = "1" ] || return 0
+  cwd=$(tmux display-message -p -t "$pane" "#{pane_current_path}" 2>/dev/null)
+  [ -n "$cwd" ] || return 0
+  repo=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null) || return 0
+  cfg="${CODEX_HOME:-$HOME/.codex}/config.toml"
+  mkdir -p "$(dirname "$cfg")" 2>/dev/null || return 0
+  touch "$cfg" 2>/dev/null || return 0
+  if ! grep -Fq "[projects.\"$repo\"]" "$cfg" 2>/dev/null; then
+    {
+      printf '\n[projects."%s"]\n' "$repo"
+      printf '%s\n' 'trust_level = "trusted"'
+    } >> "$cfg"
+    log "ensure_codex_project_trusted: added trusted project repo=$repo pane=$pane"
+  fi
+}
+
 start_engine_in_pane() {
   local pane="$1" engine="$2" cmd pane_cmd attempts=0 max_attempts=20
   case "$engine" in
@@ -538,10 +570,41 @@ start_engine_in_pane() {
     return 1
   fi
 
+  [ "$engine" = "codex" ] && ensure_codex_project_trusted "$pane"
   tmux send-keys -t "$pane" -- "$cmd" 2>/dev/null
   sleep 0.3
   tmux send-keys -t "$pane" Enter 2>/dev/null
-  return 0
+
+  local launch_checks=0 ok_checks=0
+  while [ "$launch_checks" -lt 20 ]; do
+    sleep 0.5
+    launch_checks=$((launch_checks + 1))
+    pane_cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null)
+    [ -z "$pane_cmd" ] && return 1
+    if [ "$engine" = "codex" ] && codex_trust_prompt_visible "$pane"; then
+      log "start_engine_in_pane: codex trust prompt visible pane=$pane"
+      return 2
+    fi
+    if expected_engine_running "$pane_cmd" "$engine"; then
+      ok_checks=$((ok_checks + 1))
+      [ "$ok_checks" -ge 4 ] && return 0
+    else
+      ok_checks=0
+    fi
+  done
+
+  log "start_engine_in_pane: $engine did not stay running pane=$pane cmd=${pane_cmd:-?}"
+  return 1
+}
+
+send_engine_start_failed() {
+  local action="$1" engine="$2" chat_key="$3" pane="$4" pane_cmd="$5" rc="$6"
+  if [ "$engine" = "codex" ] && [ "$rc" = "2" ]; then
+    send_tg "❌ $action codex failed for <code>$chat_key</code> (pane=$pane)
+Codex ติด trust prompt — เพิ่ม trust ใน <code>~/.codex/config.toml</code> หรือเปิด pane เลือก Yes แล้วใช้ <code>/relaunch $chat_key</code>"
+  else
+    send_tg "❌ $action $engine failed for <code>$chat_key</code> (pane=$pane, cmd=<code>${pane_cmd:-?}</code>)"
+  fi
 }
 
 send_role_bootstrap_prompt() {
@@ -935,8 +998,10 @@ status:
   pane_cmd=$(tmux list-panes -t "$pane" -F "#{pane_current_command}" 2>/dev/null | head -1)
   if echo "$pane_cmd" | grep -qE '^(zsh|bash|sh|fish)$'; then
     log "/new $role/$slug — pane at $pane_cmd, starting $target_engine"
-    if ! start_engine_in_pane "$pane" "$target_engine"; then
-      send_tg "❌ start $target_engine failed for <code>$chat_key</code> (pane=$pane, cmd=$pane_cmd)"
+    start_engine_in_pane "$pane" "$target_engine"
+    local start_rc=$?
+    if [ "$start_rc" -ne 0 ]; then
+      send_engine_start_failed "start" "$target_engine" "$chat_key" "$pane" "$pane_cmd" "$start_rc"
       return
     fi
     restarted=1
@@ -944,8 +1009,10 @@ status:
   elif { [ "$target_engine" = "claude" ] && is_codex "$pane_cmd"; } || \
        { [ "$target_engine" = "codex" ] && is_claude "$pane_cmd"; }; then
     log "/new $role/$slug — pane has $pane_cmd, switching to $target_engine"
-    if ! start_engine_in_pane "$pane" "$target_engine"; then
-      send_tg "❌ switch to $target_engine failed for <code>$chat_key</code> (pane=$pane, cmd=$pane_cmd)"
+    start_engine_in_pane "$pane" "$target_engine"
+    local switch_rc=$?
+    if [ "$switch_rc" -ne 0 ]; then
+      send_engine_start_failed "switch to" "$target_engine" "$chat_key" "$pane" "$pane_cmd" "$switch_rc"
       return
     fi
     restarted=1
@@ -1238,12 +1305,17 @@ cmd_relaunch() {
     return
   fi
   if [ "$engine" = "codex" ] && is_codex "$pane_cmd"; then
-    send_tg "✓ codex รันอยู่แล้วใน <code>$target</code> (cmd=<code>$pane_cmd</code>) — ไม่ต้อง relaunch"
-    return
+    if ! codex_trust_prompt_visible "$pane"; then
+      send_tg "✓ codex รันอยู่แล้วใน <code>$target</code> (cmd=<code>$pane_cmd</code>) — ไม่ต้อง relaunch"
+      return
+    fi
+    log "/relaunch $target — codex trust prompt visible, restarting"
   fi
   audit "/relaunch $target pane=$pane prev_cmd=$pane_cmd engine=$engine"
-  if ! start_engine_in_pane "$pane" "$engine"; then
-    send_tg "❌ relaunch $engine failed in <code>$target</code> (pane=$pane, cmd=<code>${pane_cmd:-?}</code>)"
+  start_engine_in_pane "$pane" "$engine"
+  local relaunch_rc=$?
+  if [ "$relaunch_rc" -ne 0 ]; then
+    send_engine_start_failed "relaunch" "$engine" "$target" "$pane" "$pane_cmd" "$relaunch_rc"
     return
   fi
   local watch_msg
@@ -1679,6 +1751,11 @@ cmd_send_to_chat() {
   if ! is_agent_cmd "$pane_cmd"; then
     send_tg "❌ ไม่มี agent CLI รันใน <code>$target</code> (pane cmd=<code>${pane_cmd:-?}</code>) — ข้อความจะตกใน shell, ไม่ส่งให้
 รีเริ่ม: <code>/relaunch</code> (active chat) หรือ <code>/relaunch $target</code>"
+    return
+  fi
+  if is_codex "$pane_cmd" && codex_trust_prompt_visible "$pane"; then
+    send_tg "❌ codex ใน <code>$target</code> ยังติด trust prompt — ข้อความจะตกใน prompt ไม่ส่งให้ agent
+เปิด pane เลือก Yes หรือใช้ <code>/relaunch $target</code> หลังเพิ่ม trust แล้ว"
     return
   fi
   # Mark "user just sent" so the watcher's quiet-window kicks in (avoids
