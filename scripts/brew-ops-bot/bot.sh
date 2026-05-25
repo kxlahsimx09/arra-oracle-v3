@@ -582,6 +582,38 @@ find_codex_jsonl() {
   done < <(find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' -type f 2>/dev/null | sort -r | head -200)
 }
 
+codex_config_value() {
+  local key="$1" cfg="$HOME/.codex/config.toml"
+  [ -f "$cfg" ] || return
+  grep -E "^${key}[[:space:]]*=" "$cfg" 2>/dev/null \
+    | head -1 \
+    | sed -E 's/^[^=]+=[[:space:]]*//; s/^"//; s/"$//'
+}
+
+codex_pane_model_effort() {
+  local pane="$1"
+  [ -n "$pane" ] || return
+  tmux capture-pane -p -t "$pane" -S -30 2>/dev/null \
+    | sed -nE \
+      -e 's/.*model:[[:space:]]+([^[:space:]]+)[[:space:]]+([^[:space:]\/]+).*/\1 \2/p' \
+      -e 's/^[[:space:]]*([[:alnum:]._-]+)[[:space:]]+([[:alnum:]_-]+)[[:space:]]+·.*/\1 \2/p' \
+    | tail -1
+}
+
+codex_model_cache_info() {
+  local model="$1" cache="$HOME/.codex/models_cache.json"
+  [ -n "$model" ] && [ -f "$cache" ] || return
+  jq -r --arg model "$model" '
+    (.models // [])[]
+    | select(.slug == $model)
+    | [
+        ((.context_window // .max_context_window // 0) | tostring),
+        ((.effective_context_window_percent // 0) | tostring)
+      ]
+    | join("\t")
+  ' "$cache" 2>/dev/null | head -1
+}
+
 # ── Phase 1 read-only ──────────────────────────────────────────────────────
 
 cmd_help() {
@@ -1467,8 +1499,11 @@ cmd_ctx() {
   fi
   [ -n "$pane" ] && cwd=$(tmux display-message -p -t "$pane" "#{pane_current_path}" 2>/dev/null)
   [ -z "$cwd" ] && cwd="$repo"
-  local usage_all tokens out_tokens model max_ctx ctx_max
+  local usage_all tokens out_tokens model effort max_ctx ctx_max raw_ctx effective_pct
   model=""
+  effort=""
+  raw_ctx=""
+  effective_pct=""
   if [ "$engine" = "codex" ]; then
     jsonl=$(find_codex_jsonl "$cwd")
     if [ -z "$jsonl" ] && [ "$slug" = "oracle" -o "$slug" = "main" ]; then
@@ -1489,6 +1524,15 @@ cmd_ctx() {
     out_tokens=$(printf '%s' "$last_codex" | cut -f2)
     ctx_max=$(printf '%s' "$last_codex" | cut -f3)
     [ -z "$ctx_max" ] || [ "$ctx_max" -le 0 ] && ctx_max=200000
+    local pane_model cache_info
+    pane_model=$(codex_pane_model_effort "$pane")
+    model=$(printf '%s' "$pane_model" | awk '{print $1}')
+    effort=$(printf '%s' "$pane_model" | awk '{print $2}')
+    [ -z "$model" ] && model=$(codex_config_value model)
+    [ -z "$effort" ] && effort=$(codex_config_value model_reasoning_effort)
+    cache_info=$(codex_model_cache_info "$model")
+    raw_ctx=$(printf '%s' "$cache_info" | cut -f1)
+    effective_pct=$(printf '%s' "$cache_info" | cut -f2)
   else
     jsonl=$(find_jsonl "$cwd")
     [ -z "$jsonl" ] && { send_tg "❌ ไม่เจอ claude JSONL session ของ <code>$target</code>"; return; }
@@ -1526,14 +1570,25 @@ cmd_ctx() {
 
   local al; al=$(chat_alias "$target")
   [ -n "$al" ] && al=" ($al)"
-  local model_line=""
-  [ -n "$model" ] && model_line="
-model: <code>$model</code>"
+  local model_line="" window_line="" ctx_label="$engine"
+  if [ -n "$model" ]; then
+    local model_display="$model"
+    [ -n "$effort" ] && model_display="$model_display $effort"
+    model_line="
+model:  <code>$model_display</code>"
+  fi
+  if [ "$engine" = "codex" ]; then
+    ctx_label="codex usable"
+    if [ -n "$raw_ctx" ] && [ "$raw_ctx" -gt "$ctx_max" ] 2>/dev/null; then
+      window_line="
+window: <code>$ctx_max</code> usable / <code>$raw_ctx</code> raw${effective_pct:+ (${effective_pct}%)}"
+    fi
+  fi
 
   send_tg "📊 <b>${target}${al}</b>
 ${bar} <b>${pct}%</b>
-ctx:    <code>$tokens</code> / <code>$ctx_max</code> (${engine})${out_tokens:+    output: <code>$out_tokens</code>}
-left:   <code>$remaining</code> tokens${model_line}"
+ctx:    <code>$tokens</code> / <code>$ctx_max</code> (${ctx_label})${out_tokens:+    output: <code>$out_tokens</code>}
+left:   <code>$remaining</code> tokens${model_line}${window_line}"
 }
 
 # ── /quota — Claude Code usage window / reset estimate ────────────────────────
