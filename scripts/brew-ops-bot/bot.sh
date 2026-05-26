@@ -1554,10 +1554,20 @@ cmd_ctx() {
     tokens=$(printf '%s' "$last_line" | cut -f1)
     out_tokens=$(printf '%s' "$last_line" | cut -f2)
     model=$(printf '%s' "$last_line" | cut -f3)
-    # Infer context-window tier from the high-water mark across the session.
+    # Context-window tier by model. The fleet launches `claude` with no --model,
+    # so it inherits the account default — opus-4.6/4.7 and sonnet-4.x resolve to
+    # the 1M variant (claude-*[1m]). But the JSONL records the model *without* the
+    # [1m] suffix and carries no window field, so the name alone can't prove 1M —
+    # map known-1M model families here instead of defaulting everything to 200k.
     max_ctx=$(printf '%s' "$usage_all" | awk -F'\t' 'BEGIN{m=0} {if($1+0>m) m=$1+0} END{print m+0}')
-    ctx_max=200000
-    [ "$max_ctx" -gt 200000 ] && ctx_max=1000000
+    case "$model" in
+      claude-opus-4-7*|claude-opus-4-6*) ctx_max=1000000 ;;
+      claude-sonnet-4-*)                 ctx_max=1000000 ;;  # sonnet 1m default
+      *)                                 ctx_max=200000 ;;
+    esac
+    # Safety floor: a session can never load more than its real window, so an
+    # observed peak above the mapped tier proves a 1M window — bump to it.
+    [ "$max_ctx" -gt "$ctx_max" ] && ctx_max=1000000
   fi
 
   local pct=$((tokens * 100 / ctx_max))
