@@ -18,7 +18,7 @@ import {
   performGracefulShutdown,
 } from './process-manager/index.ts';
 
-import { PORT, ORACLE_DATA_DIR } from './config.ts';
+import { PORT, ORACLE_DATA_DIR, VECTOR_URL } from './config.ts';
 import { MCP_SERVER_NAME } from './const.ts';
 import { db, sqlite, closeDb, indexingStatus } from './db/index.ts';
 import { seedMenuItems, type HasRoutes as SeedHasRoutes } from './db/seeders/menu-seeder.ts';
@@ -30,7 +30,7 @@ import { feedRoutes } from './routes/feed/index.ts';
 import { healthRoutes } from './routes/health/index.ts';
 import { dashboardRoutes } from './routes/dashboard/index.ts';
 import { searchRoutes } from './routes/search/index.ts';
-import { compareRoutes } from './routes/compare/index.ts';
+import { vectorRoutes } from './routes/vector/index.ts';
 import { knowledgeRoutes } from './routes/knowledge/index.ts';
 import { supersedeRoutes } from './routes/supersede/index.ts';
 import { forumApi } from './routes/forum/index.ts';
@@ -41,8 +41,16 @@ import { pluginsRouter } from './routes/plugins/index.ts';
 import { oraclenetRoutes } from './routes/oraclenet/index.ts';
 import { sessionsRoutes } from './routes/sessions/index.ts';
 import { vaultRoutes } from './routes/vault/index.ts';
-import { indexerRoutes } from './routes/indexer/index.ts';
 import { createMenuRoutes } from './routes/menu/index.ts';
+
+// Indexer routes are optional — MCP server works without them
+let indexerRoutes: any = null;
+try {
+  indexerRoutes = (await import('./routes/indexer/index.ts')).indexerRoutes;
+} catch {
+  console.log('[Indexer] Routes not loaded — indexer is optional');
+}
+import { gatewayPlugin } from './gateway/index.ts';
 
 import pkg from '../package.json' with { type: 'json' };
 
@@ -52,6 +60,8 @@ try {
 } catch (e) {
   // table might not exist yet — fine on first boot
 }
+
+console.log('[Vector] mode:', VECTOR_URL ? 'proxy → ' + VECTOR_URL : 'local');
 
 try {
   const bt = sqlite.prepare('PRAGMA busy_timeout').get();
@@ -151,7 +161,11 @@ const app = new Elysia()
     set.headers['X-XSS-Protection'] = '1; mode=block';
     set.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin';
   })
-  .onError(({ error, set }) => {
+  .onError(({ code, error, set }) => {
+    if (code === 'NOT_FOUND') {
+      set.status = 404;
+      return { error: 'Not found' };
+    }
     const msg = (error as any)?.message ?? String(error);
     const isDbLock = msg.includes('disk I/O') || msg.includes('database is locked') || msg.includes('SQLITE_BUSY');
     if (isDbLock) {
@@ -173,6 +187,7 @@ const app = new Elysia()
       },
     }),
   )
+  .use(gatewayPlugin(ORACLE_DATA_DIR, VECTOR_URL || undefined))
   .get('/', () => ({
     server: MCP_SERVER_NAME,
     version: pkg.version,
@@ -188,7 +203,7 @@ const apiModules = [
   healthRoutes,
   dashboardRoutes,
   searchRoutes,
-  compareRoutes,
+  vectorRoutes,
   knowledgeRoutes,
   supersedeRoutes,
   forumApi,
@@ -199,7 +214,7 @@ const apiModules = [
   oraclenetRoutes,
   sessionsRoutes,
   vaultRoutes,
-  indexerRoutes,
+  ...(indexerRoutes ? [indexerRoutes] : []),
 ];
 
 try {

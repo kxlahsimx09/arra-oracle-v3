@@ -35,7 +35,7 @@ export const DB_PATH = process.env.ORACLE_DB_PATH || path.join(ORACLE_DATA_DIR, 
 //   4. ORACLE_DATA_DIR — default (will be empty initially)
 //
 // Data dir wins over project root so that accidental ψ/ folders in a source
-// checkout (e.g. from arra_learn writing with no vault configured) don't
+// checkout (e.g. from muninn_learn writing with no vault configured) don't
 // override the real indexed data at ~/.arra-oracle-v2/ψ/.
 export const REPO_ROOT = process.env.ORACLE_REPO_ROOT ||
   (fs.existsSync(path.join(ORACLE_DATA_DIR, '\u03c8')) ? ORACLE_DATA_DIR :
@@ -53,3 +53,11 @@ export const CHROMADB_DIR = path.join(HOME_DIR, C.CHROMADB_DIR_NAME);
 if (!fs.existsSync(ORACLE_DATA_DIR)) {
   fs.mkdirSync(ORACLE_DATA_DIR, { recursive: true });
 }
+
+// Vector layer routing (#1071 phase 1.2)
+//   VECTOR_URL       — if set, vector calls proxy to this base URL (e.g. http://vector.local:8080)
+//                      if empty, the local vector adapter is used (backward compat).
+//   VECTOR_FALLBACK  — what to do when proxy is unreachable. 'fts5' = serve FTS5-only
+//                      results with vectorAvailable: false. (Future: 'cache', 'fail'.)
+export const VECTOR_URL = process.env.VECTOR_URL || '';
+export const VECTOR_FALLBACK = process.env.VECTOR_FALLBACK || 'fts5';
