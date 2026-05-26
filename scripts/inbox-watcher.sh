@@ -69,6 +69,11 @@
 #   ├── sessions/<oracle>/thread-<K>.session-id  (per-wake-key session capture;
 #   │                                      K = parent_thread for any fan-out
 #   │                                      sub-task, else the envelope's thread)
+#   ├── sessions/<oracle>/thread-<K>.session-engine  (claude|codex runtime;
+#   │                                      first verified session wins for
+#   │                                      later same-campaign resumes)
+#   ├── sessions/<oracle>/thread-<K>.session-model
+#   ├── sessions/<oracle>/thread-<K>.session-reasoning-effort
 #   └── sessions/<oracle>/thread-<K>.owner       (§151 campaign owner — the
 #                                          dispatcher's worktree path, learned
 #                                          from the dispatch envelope's
@@ -95,6 +100,11 @@
 #   INBOX_RETRY_MAX             4         transient re-resume attempts before escalate
 #   INBOX_RETRY_VERIFY_WINDOW   =T1       (s) post-final-attempt recovery window
 #   MAW_BIN                     auto-detect (`maw` on PATH, else local cli.ts)
+#
+# Optional envelope runtime fields:
+#   engine: claude|codex
+#   model: <engine model alias/name>
+#   reasoning_effort: low|medium|high|xhigh|max
 
 set -u
 exec </dev/null   # detach from any inherited tty (defensive — see w2-watcher)
@@ -209,6 +219,70 @@ encode_cwd() { printf '%s' "$1" | sed 's|[/.]|-|g'; }
 
 state_path() { printf '%s/state/%s/%s.state' "$STATE_DIR" "$1" "$2"; }
 
+session_ref_path() { printf '%s/sessions/%s/thread-%s.%s' "$STATE_DIR" "$1" "$2" "$3"; }
+
+frontmatter_field() {
+  local file=$1 key=$2
+  awk -v k="$key" '
+    /^---[[:space:]]*$/ { n++; if (n == 1) next; if (n == 2) exit }
+    n == 1 && $0 ~ "^" k "[[:space:]]*:" {
+      sub("^[^:]*:[[:space:]]*", "")
+      sub("^[\"'\'' ]*", "")
+      sub("[\"'\'' ]*$", "")
+      print
+      exit
+    }
+  ' "$file" 2>/dev/null
+}
+
+normalize_engine() {
+  case "$1" in
+    claude|codex) printf '%s' "$1" ;;
+    "") ;;
+    *) log "runtime: ignoring unsupported engine '$1' (expected claude|codex)" ;;
+  esac
+}
+
+envelope_engine() { normalize_engine "$(frontmatter_field "$1" engine)"; }
+envelope_model() { frontmatter_field "$1" model; }
+envelope_reasoning_effort() {
+  local v
+  v=$(frontmatter_field "$1" reasoning_effort)
+  [ -n "$v" ] || v=$(frontmatter_field "$1" reasoning-effort)
+  [ -n "$v" ] || v=$(frontmatter_field "$1" effort)
+  printf '%s' "$v"
+}
+
+read_session_field() {
+  local f
+  f=$(session_ref_path "$1" "$2" "$3")
+  [ -f "$f" ] || return 1
+  head -1 "$f"
+}
+
+write_session_ref() {
+  local oracle=$1 key=$2 sid=$3 engine=${4:-} model=${5:-} effort=${6:-}
+  [ -z "$key" ] && return 0
+  local dir="$STATE_DIR/sessions/$oracle"
+  mkdir -p "$dir"
+  [ -n "$sid" ] && printf '%s\n' "$sid" >"$(session_ref_path "$oracle" "$key" session-id)"
+  if [ -n "$engine" ]; then
+    printf '%s\n' "$engine" >"$(session_ref_path "$oracle" "$key" session-engine)"
+  else
+    rm -f "$(session_ref_path "$oracle" "$key" session-engine)"
+  fi
+  if [ -n "$model" ]; then
+    printf '%s\n' "$model" >"$(session_ref_path "$oracle" "$key" session-model)"
+  else
+    rm -f "$(session_ref_path "$oracle" "$key" session-model)"
+  fi
+  if [ -n "$effort" ]; then
+    printf '%s\n' "$effort" >"$(session_ref_path "$oracle" "$key" session-reasoning-effort)"
+  else
+    rm -f "$(session_ref_path "$oracle" "$key" session-reasoning-effort)"
+  fi
+}
+
 read_state() {
   local f=$1
   [ -f "$f" ] || return 1
@@ -287,6 +361,25 @@ claude_pids_at() {
   done
 }
 
+codex_pids_at() {
+  local wt=$1
+  [ -z "$wt" ] && return
+  pgrep -f "codex" 2>/dev/null | while read -r pid; do
+    local pcwd
+    pcwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    [ "$pcwd" = "$wt" ] && echo "$pid"
+  done
+}
+
+agent_pids_at() {
+  local wt=$1 engine=${2:-}
+  case "$engine" in
+    claude) claude_pids_at "$wt" ;;
+    codex) codex_pids_at "$wt" ;;
+    *) { claude_pids_at "$wt"; codex_pids_at "$wt"; } | awk 'NF && !seen[$0]++' ;;
+  esac
+}
+
 # Phase 7 — pre-empt all claude processes at wt (used when a cancel
 # envelope races with an active wake on the same thread). TERM first,
 # then KILL stragglers after a grace period long enough for a single
@@ -300,9 +393,14 @@ claude_pids_at() {
 PREEMPT_GRACE_SEC=${PREEMPT_GRACE_SEC:-10}
 preempt_claude_at() {
   local wt=$1
+  preempt_agent_at "$wt" claude
+}
+
+preempt_agent_at() {
+  local wt=$1 engine=${2:-}
   [ -z "$wt" ] && return 0
   local pids
-  pids=$(claude_pids_at "$wt")
+  pids=$(agent_pids_at "$wt" "$engine")
   [ -z "$pids" ] && return 0
 
   # Diagnostic: log JSONL recency so an operator can tell whether the
@@ -318,13 +416,13 @@ preempt_claude_at() {
 
   for pid in $pids; do
     if kill -TERM "$pid" 2>/dev/null; then
-      log "  TERM pid=$pid (cwd=$wt) — grace ${PREEMPT_GRACE_SEC}s"
+      log "  TERM pid=$pid (engine=${engine:-any}, cwd=$wt) — grace ${PREEMPT_GRACE_SEC}s"
     fi
   done
   sleep "$PREEMPT_GRACE_SEC"
   for pid in $pids; do
     if kill -0 "$pid" 2>/dev/null; then
-      kill -9 "$pid" 2>/dev/null && log "  KILL pid=$pid (still alive after ${PREEMPT_GRACE_SEC}s grace)"
+      kill -9 "$pid" 2>/dev/null && log "  KILL pid=$pid (engine=${engine:-any}, still alive after ${PREEMPT_GRACE_SEC}s grace)"
     fi
   done
 }
@@ -463,6 +561,40 @@ derive_session_id() {
   printf '%s\n' "$sid"
 }
 
+derive_session_id_for_engine() {
+  local wt=$1 engine=${2:-} proj jsonl sid
+  [ -z "$wt" ] && return 1
+  case "$engine" in
+    claude)
+      proj="$CLAUDE_PROJECTS/$(encode_cwd "$wt")"
+      [ -d "$proj" ] || return 1
+      jsonl=$(ls -t "$proj"/*.jsonl 2>/dev/null | head -1)
+      [ -n "$jsonl" ] || return 1
+      basename "$jsonl" .jsonl
+      ;;
+    codex)
+      jsonl=$(find_latest_codex_jsonl "$wt") || return 1
+      sid=$(codex_session_id_from_jsonl "$jsonl") || return 1
+      [ -n "$sid" ] || return 1
+      printf '%s\n' "$sid"
+      ;;
+    *) derive_session_id "$wt" ;;
+  esac
+}
+
+derive_session_engine() {
+  local wt=$1 proj jsonl
+  [ -z "$wt" ] && return 1
+  proj="$CLAUDE_PROJECTS/$(encode_cwd "$wt")"
+  if [ -d "$proj" ] && ls "$proj"/*.jsonl >/dev/null 2>&1; then
+    printf '%s\n' claude
+    return 0
+  fi
+  jsonl=$(find_latest_codex_jsonl "$wt") || return 1
+  [ -n "$jsonl" ] || return 1
+  printf '%s\n' codex
+}
+
 # Scan an envelope for parent_thread + parent_session; if both are present,
 # record the campaign owner under parent_oracle. Called for every envelope in
 # scan_inbox — cheap, idempotent, and learns ownership from the OUTBOUND
@@ -488,8 +620,8 @@ record_owner_from_envelope() {
 owner_state() {
   local wt=$1
   { [ -z "$wt" ] || [ ! -d "$wt" ]; } && { echo gone; return; }
-  if [ -n "$(claude_pids_at "$wt")" ]; then
-    if claude_alive_at "$wt"; then echo busy; else echo idle; fi
+  if [ -n "$(agent_pids_at "$wt")" ]; then
+    if agent_alive_at "$wt"; then echo busy; else echo idle; fi
   else
     echo resumable
   fi
@@ -619,6 +751,46 @@ claude_alive_at() {
   return 0
 }
 
+codex_alive_at() {
+  local wt=$1
+  [ -z "$wt" ] && return 1
+  local found_pid=""
+  while read -r pid; do
+    local pcwd
+    pcwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    if [ "$pcwd" = "$wt" ]; then
+      found_pid=$pid
+      break
+    fi
+  done < <(pgrep -f "codex" 2>/dev/null)
+  [ -z "$found_pid" ] && return 1
+
+  local jsonl newest_mtime now age
+  jsonl=$(find_latest_codex_jsonl "$wt") || jsonl=""
+  if [ -z "$jsonl" ]; then
+    log "codex_alive_at($wt) → pid=$found_pid alive but no rollout JSONL; STUCK"
+    return 1
+  fi
+  newest_mtime=$(stat -f %m "$jsonl" 2>/dev/null)
+  [ -n "$newest_mtime" ] || return 1
+  now=$(date +%s)
+  age=$((now - newest_mtime))
+  if [ "$age" -gt "$CLAUDE_STUCK_TIMEOUT" ]; then
+    log "codex_alive_at($wt) → pid=$found_pid alive but JSONL idle ${age}s > ${CLAUDE_STUCK_TIMEOUT}s; STUCK (resume OK)"
+    return 1
+  fi
+  return 0
+}
+
+agent_alive_at() {
+  local wt=$1 engine=${2:-}
+  case "$engine" in
+    claude) claude_alive_at "$wt" ;;
+    codex) codex_alive_at "$wt" ;;
+    *) claude_alive_at "$wt" || codex_alive_at "$wt" ;;
+  esac
+}
+
 # Stricter gate used by the retire/prune paths (#1191). claude_alive_at returns
 # 0 only for "active" (JSONL within CLAUDE_STUCK_TIMEOUT); a live pid sitting
 # idle at its prompt is "STUCK (resume OK)" and returns 1 — but that's exactly
@@ -631,6 +803,12 @@ claude_present_at() {
   local wt=$1
   [ -z "$wt" ] && return 1
   [ -n "$(claude_pids_at "$wt")" ]
+}
+
+agent_present_at() {
+  local wt=$1 engine=${2:-}
+  [ -z "$wt" ] && return 1
+  [ -n "$(agent_pids_at "$wt" "$engine")" ]
 }
 
 # ─── Fan-out dedup fallback (§11k + §153) ──────────────────────────────────
@@ -667,9 +845,10 @@ parent_session_busy() {
 
   local sid_file="$STATE_DIR/sessions/$oracle/thread-$key.session-id"
   if [ -f "$sid_file" ]; then
-    local prior_wt
+    local prior_wt runtime_engine
     prior_wt=$(find_prior_wt_for_key "$oracle" "$key")
-    [ -n "$prior_wt" ] && [ -d "$prior_wt" ] && claude_alive_at "$prior_wt" && return 0
+    runtime_engine=$(read_session_field "$oracle" "$key" session-engine 2>/dev/null) || runtime_engine=""
+    [ -n "$prior_wt" ] && [ -d "$prior_wt" ] && agent_alive_at "$prior_wt" "$runtime_engine" && return 0
   fi
   return 1
 }
@@ -707,9 +886,10 @@ deferred_ready_to_fire() {
   # No blocking sibling — last gate: any prior claude must be idle/dead.
   local sid_file="$STATE_DIR/sessions/$oracle/thread-$key.session-id"
   if [ -f "$sid_file" ]; then
-    local prior_wt
+    local prior_wt runtime_engine
     prior_wt=$(find_prior_wt_for_key "$oracle" "$key")
-    [ -n "$prior_wt" ] && [ -d "$prior_wt" ] && claude_alive_at "$prior_wt" && return 1
+    runtime_engine=$(read_session_field "$oracle" "$key" session-engine 2>/dev/null) || runtime_engine=""
+    [ -n "$prior_wt" ] && [ -d "$prior_wt" ] && agent_alive_at "$prior_wt" "$runtime_engine" && return 1
   fi
   return 0
 }
@@ -804,7 +984,9 @@ backoff_at() {
 fire_wake() {
   local oracle=$1 file=$2 fname=$3
   local thread_id wkey wake_ts wt_suffix sf wake_out wt_path
-  local sid_file prior_sid prior_wt resume_sid wt_arg
+  local sid_file prior_sid prior_wt resume_sid
+  local requested_engine requested_model requested_effort
+  local runtime_engine runtime_model runtime_effort
 
   thread_id=$(grep '^thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
   # Wake key — parent_thread for any fan-out sub-task envelope, else thread.
@@ -814,6 +996,12 @@ fire_wake() {
   wake_ts=$(date +%s)
   wt_suffix=inbox-$wake_ts
   sf=$(state_path "$oracle" "$fname")
+  requested_engine=$(envelope_engine "$file")
+  requested_model=$(envelope_model "$file")
+  requested_effort=$(envelope_reasoning_effort "$file")
+  runtime_engine=$requested_engine
+  runtime_model=$requested_model
+  runtime_effort=$requested_effort
 
   # Phase 7 — cancel pre-emption. Cancel envelopes are priority-1: if
   # there's an active claude in a prior worktree for the same thread, kill
@@ -833,12 +1021,13 @@ fire_wake() {
   # needed — it just closes the thread and archives) so the prior session
   # being killed here doesn't matter.
   if [ -n "$thread_id" ] && is_cancel_envelope "$file"; then
-    local cancel_prior_wt
+    local cancel_prior_wt cancel_engine
     cancel_prior_wt=$(find_prior_wt_for_key "$oracle" "$wkey")
+    cancel_engine=$(read_session_field "$oracle" "$wkey" session-engine 2>/dev/null) || cancel_engine=""
     if [ -n "$cancel_prior_wt" ] && [ -d "$cancel_prior_wt" ] \
-       && [ -n "$(claude_pids_at "$cancel_prior_wt")" ]; then
-      log "[$oracle] CANCEL PRE-EMPT — terminating claude(s) at $cancel_prior_wt for thread $thread_id"
-      preempt_claude_at "$cancel_prior_wt"
+       && [ -n "$(agent_pids_at "$cancel_prior_wt" "$cancel_engine")" ]; then
+      log "[$oracle] CANCEL PRE-EMPT — terminating agent(s) at $cancel_prior_wt for thread $thread_id"
+      preempt_agent_at "$cancel_prior_wt" "$cancel_engine"
     fi
   fi
 
@@ -856,9 +1045,12 @@ fire_wake() {
     sid_file="$STATE_DIR/sessions/$oracle/thread-$wkey.session-id"
     if [ -f "$sid_file" ]; then
       prior_sid=$(cat "$sid_file")
+      runtime_engine=$(read_session_field "$oracle" "$wkey" session-engine 2>/dev/null) || runtime_engine=$requested_engine
+      runtime_model=$(read_session_field "$oracle" "$wkey" session-model 2>/dev/null) || runtime_model=$requested_model
+      runtime_effort=$(read_session_field "$oracle" "$wkey" session-reasoning-effort 2>/dev/null) || runtime_effort=$requested_effort
       prior_wt=$(find_prior_wt_for_key "$oracle" "$wkey")
       if [ -n "$prior_sid" ] && [ -n "$prior_wt" ] && [ -d "$prior_wt" ] \
-         && ! claude_alive_at "$prior_wt"; then
+         && ! agent_alive_at "$prior_wt" "$runtime_engine"; then
         resume_sid=$prior_sid
         # Re-use the existing wt_suffix so maw attaches to the same worktree
         # window. We extract it from the prior wt path: `<repo>.wt-<N>-<suffix>`.
@@ -890,10 +1082,16 @@ fire_wake() {
     "thread_id=$thread_id" \
     "wake_key=$wkey" \
     "wt_suffix=$wt_suffix" \
+    "requested_engine=$requested_engine" \
+    "requested_model=$requested_model" \
+    "requested_reasoning_effort=$requested_effort" \
+    "runtime_engine=$runtime_engine" \
+    "runtime_model=$runtime_model" \
+    "runtime_reasoning_effort=$runtime_effort" \
     "status=fired"
   [ -n "${resume_sid:-}" ] && set_state_field "$sf" resume_sid "$resume_sid"
 
-  log "[$oracle] $fname → fire (thread=$thread_id, suffix=$wt_suffix${resume_sid:+, RESUME sid=$resume_sid})"
+  log "[$oracle] $fname → fire (thread=$thread_id, suffix=$wt_suffix${resume_sid:+, RESUME sid=$resume_sid}${runtime_engine:+, engine=$runtime_engine}${runtime_model:+, model=$runtime_model}${runtime_effort:+, reasoning=$runtime_effort})"
 
   # Build prompt with FULL envelope path embedded. Without the path, fresh
   # subagents respond to `inbox: <fname>` by running `find / -name <fname>`,
@@ -908,17 +1106,26 @@ fire_wake() {
   task_prompt=$(build_task_prompt "$oracle" "$fname" "$envelope_path")
 
   # Capture maw wake output to extract the resolved worktree path.
+  local maw_args
   if [ -n "${resume_sid:-}" ]; then
-    wake_out=$($MAW_BIN wake "$oracle" --resume "$resume_sid" --wt "$wt_suffix" --no-attach \
-      --task "$task_prompt" 2>&1) || {
+    maw_args=(wake "$oracle" --resume "$resume_sid")
+    [ -n "$runtime_engine" ] && maw_args+=(--engine "$runtime_engine")
+    [ -n "$runtime_model" ] && maw_args+=(--model "$runtime_model")
+    [ -n "$runtime_effort" ] && maw_args+=(--reasoning-effort "$runtime_effort")
+    maw_args+=(--wt "$wt_suffix" --no-attach --task "$task_prompt")
+    wake_out=$($MAW_BIN "${maw_args[@]}" 2>&1) || {
       set_state_field "$sf" status fire_failed
       set_state_field "$sf" failed_at "$(date +%s)"
       alert "[$oracle] maw wake --resume exit nonzero for $fname: $(printf '%s' "$wake_out" | tail -3 | tr '\n' ' ')"
       return 1
     }
   else
-    wake_out=$($MAW_BIN wake "$oracle" --fresh --wt "$wt_suffix" --no-attach \
-      --task "$task_prompt" 2>&1) || {
+    maw_args=(wake "$oracle" --fresh)
+    [ -n "$runtime_engine" ] && maw_args+=(--engine "$runtime_engine")
+    [ -n "$runtime_model" ] && maw_args+=(--model "$runtime_model")
+    [ -n "$runtime_effort" ] && maw_args+=(--reasoning-effort "$runtime_effort")
+    maw_args+=(--wt "$wt_suffix" --no-attach --task "$task_prompt")
+    wake_out=$($MAW_BIN "${maw_args[@]}" 2>&1) || {
       set_state_field "$sf" status fire_failed
       set_state_field "$sf" failed_at "$(date +%s)"
       alert "[$oracle] maw wake exit nonzero for $fname: $(printf '%s' "$wake_out" | tail -3 | tr '\n' ' ')"
@@ -948,7 +1155,7 @@ fire_wake() {
 verify_delivery() {
   local sf=$1
   read_state "$sf" || return 0
-  local now age proj_dir jsonl sid sids_dir key engine
+  local now age proj_dir jsonl sid key engine
   now=$(date +%s)
   age=$((now - fired_at))
 
@@ -964,11 +1171,7 @@ verify_delivery() {
         # fan-out sub-task, else thread) so later same-campaign sub-threads
         # resume this session instead of spawning a sibling (§11f/§11k).
         key=${wake_key:-$thread_id}
-        if [ -n "$key" ]; then
-          sids_dir=$STATE_DIR/sessions/$oracle
-          mkdir -p "$sids_dir"
-          printf '%s\n' "$sid" >"$sids_dir/thread-$key.session-id"
-        fi
+        write_session_ref "$oracle" "$key" "$sid" "$engine" "${runtime_model:-${requested_model:-}}" "${runtime_reasoning_effort:-${requested_reasoning_effort:-}}"
         set_state_field "$sf" status verified
         set_state_field "$sf" verified_at "$now"
         set_state_field "$sf" session_id "$sid"
@@ -985,11 +1188,7 @@ verify_delivery() {
       if [ -n "$sid" ]; then
         engine="codex"
         key=${wake_key:-$thread_id}
-        if [ -n "$key" ]; then
-          sids_dir=$STATE_DIR/sessions/$oracle
-          mkdir -p "$sids_dir"
-          printf '%s\n' "$sid" >"$sids_dir/thread-$key.session-id"
-        fi
+        write_session_ref "$oracle" "$key" "$sid" "$engine" "${runtime_model:-${requested_model:-}}" "${runtime_reasoning_effort:-${requested_reasoning_effort:-}}"
         set_state_field "$sf" status verified
         set_state_field "$sf" verified_at "$now"
         set_state_field "$sf" session_id "$sid"
@@ -1051,7 +1250,7 @@ maybe_enter_transient_retry() {
   read_state "$sf" || return 1
   [ -z "${wt_path:-}" ] && return 1
   [ ! -d "$wt_path" ] && return 1
-  claude_alive_at "$wt_path" && return 1   # still working → not a stall
+  agent_alive_at "$wt_path" "${session_engine:-${runtime_engine:-}}" && return 1   # still working → not a stall
 
   local tail kind code class now
   tail=$(inspect_jsonl_tail "$wt_path")
@@ -1093,13 +1292,24 @@ fire_transient_resume() {
   local sf=$1
   read_state "$sf" || return 1
   local sid wt_suffix envelope_path task_prompt wake_out
+  local cached_engine cached_model cached_effort use_engine use_model use_effort
   sid=${session_id:-${resume_sid:-}}
   wt_suffix=$(basename "$wt_path" | sed 's/^[^.]*\.wt-[0-9]*-//')
   envelope_path="$INBOX_BASE/for-$oracle/$fname"
   task_prompt=$(build_task_prompt "$oracle" "$fname" "$envelope_path")
-  log "[$oracle] $fname → TRANSIENT-RETRY #$(( ${retry_count:-0} + 1 )) (resume sid=${sid:-?}, wt_suffix=$wt_suffix, last_error=${last_error:-?})"
-  wake_out=$($MAW_BIN wake "$oracle" --resume "$sid" --wt "$wt_suffix" --no-attach \
-    --task "$task_prompt" 2>&1) || {
+  cached_engine=$(read_session_field "$oracle" "${wake_key:-$thread_id}" session-engine 2>/dev/null) || cached_engine=""
+  cached_model=$(read_session_field "$oracle" "${wake_key:-$thread_id}" session-model 2>/dev/null) || cached_model=""
+  cached_effort=$(read_session_field "$oracle" "${wake_key:-$thread_id}" session-reasoning-effort 2>/dev/null) || cached_effort=""
+  use_engine=${session_engine:-${runtime_engine:-$cached_engine}}
+  use_model=${runtime_model:-$cached_model}
+  use_effort=${runtime_reasoning_effort:-$cached_effort}
+  log "[$oracle] $fname → TRANSIENT-RETRY #$(( ${retry_count:-0} + 1 )) (resume sid=${sid:-?}, wt_suffix=$wt_suffix, last_error=${last_error:-?}${use_engine:+, engine=$use_engine})"
+  local maw_args=(wake "$oracle" --resume "$sid")
+  [ -n "$use_engine" ] && maw_args+=(--engine "$use_engine")
+  [ -n "$use_model" ] && maw_args+=(--model "$use_model")
+  [ -n "$use_effort" ] && maw_args+=(--reasoning-effort "$use_effort")
+  maw_args+=(--wt "$wt_suffix" --no-attach --task "$task_prompt")
+  wake_out=$($MAW_BIN "${maw_args[@]}" 2>&1) || {
     alert "[$oracle] $fname transient-retry maw wake --resume nonzero: $(printf '%s' "$wake_out" | tail -3 | tr '\n' ' ')"
   }
   printf '%s\n' "$wake_out" >>"$LOG_FILE"
@@ -1185,7 +1395,7 @@ reconsider_transient_retry() {
   fi
 
   # Live claude → a retry is spinning up or work is ongoing. Wait.
-  if claude_alive_at "$wt_path"; then
+  if agent_alive_at "$wt_path" "${session_engine:-${runtime_engine:-}}"; then
     local age
     age=$((now - ${transient_detected_at:-now}))
     [ "$age" -ge "$T2_PROCESSING_DEADLINE" ] && \
@@ -1339,7 +1549,7 @@ safe_to_retire() {
   # "actively-writing" one. claude_alive_at would treat an idle-prompt orchestrator
   # as "STUCK (resume OK)" and let retire proceed, deleting the worktree out from
   # under a session that's just waiting for its next reply.
-  claude_present_at "$wt_path" && { echo "claude-pid-at-wt"; return 1; }
+  agent_present_at "$wt_path" "${session_engine:-${runtime_engine:-}}" && { echo "agent-pid-at-wt"; return 1; }
 
   other_state_references_wt "$sf" "$wt_path" && { echo "wt-shared-by-other-envelope"; return 1; }
 
@@ -1416,6 +1626,9 @@ evict_session_id() {
   local sid_file="$STATE_DIR/sessions/$oracle/thread-$key.session-id"
   if [ -f "$sid_file" ]; then
     rm -f "$sid_file"
+    rm -f "$(session_ref_path "$oracle" "$key" session-engine)" \
+          "$(session_ref_path "$oracle" "$key" session-model)" \
+          "$(session_ref_path "$oracle" "$key" session-reasoning-effort)"
     log "[$oracle] evicted session-id thread-$key (campaign retired)"
   fi
 }
@@ -1495,6 +1708,9 @@ gc_evict_stale_sessions() {
     age_days=$(( (now - mtime) / 86400 ))
     if [ "$age_days" -ge "$SESSION_TTL_DAYS" ]; then
       rm -f "$sid_file"
+      rm -f "${sid_file%.session-id}.session-engine" \
+            "${sid_file%.session-id}.session-model" \
+            "${sid_file%.session-id}.session-reasoning-effort"
       log "gc: evicted stale session-id ${sid_file#"$STATE_DIR/sessions/"} (idle ${age_days}d ≥ ${SESSION_TTL_DAYS}d TTL)"
     fi
   done
@@ -1532,7 +1748,7 @@ gc_try_prune_worktree() {
   [ -n "$suffix" ] && printf '%s' "$maw_windows" | grep -q "$suffix" && return 0
   # #1191 — same stricter gate as safe_to_retire: a live claude pid at the
   # worktree (even one idle at its prompt) keeps the worktree.
-  claude_present_at "$wt" && return 0
+  agent_present_at "$wt" && return 0
   dirty=$(git -C "$wt" status --short 2>/dev/null \
     | grep -vE '^\?\? \.(agent|DS_Store)/?$' | head -1)
   [ -n "$dirty" ] && { log "gc: keep orphan-candidate $wt (dirty)"; return 0; }
@@ -1595,17 +1811,30 @@ fire_to_owner() {
   local oracle=$1 file=$2 fname=$3 sf=$4 wkey=$5 owner_wt=$6
   local thread_id envelope_path task_prompt wake_ts
   local resume_sid wt_suffix wake_out
+  local requested_engine requested_model requested_effort
+  local runtime_engine runtime_model runtime_effort
 
   thread_id=$(grep '^thread:' "$file" 2>/dev/null | head -1 | awk '{print $2}')
   envelope_path="$INBOX_BASE/for-$oracle/$fname"
   task_prompt=$(build_task_prompt "$oracle" "$fname" "$envelope_path")
   wake_ts=$(date +%s)
+  requested_engine=$(envelope_engine "$file")
+  requested_model=$(envelope_model "$file")
+  requested_effort=$(envelope_reasoning_effort "$file")
+  runtime_engine=$(read_session_field "$oracle" "$wkey" session-engine 2>/dev/null) || runtime_engine=""
+  [ -n "$runtime_engine" ] || runtime_engine=$(derive_session_engine "$owner_wt" 2>/dev/null) || runtime_engine=$requested_engine
+  runtime_model=$(read_session_field "$oracle" "$wkey" session-model 2>/dev/null) || runtime_model=$requested_model
+  runtime_effort=$(read_session_field "$oracle" "$wkey" session-reasoning-effort 2>/dev/null) || runtime_effort=$requested_effort
 
   if [ "$(owner_state "$owner_wt")" = "idle" ]; then
     # Write state BEFORE delivering so a racing scan can't double-fire.
     write_state "$sf" \
       "fired_at=$wake_ts" "oracle=$oracle" "fname=$fname" \
       "thread_id=$thread_id" "wake_key=$wkey" "wt_path=$owner_wt" \
+      "requested_engine=$requested_engine" "requested_model=$requested_model" \
+      "requested_reasoning_effort=$requested_effort" \
+      "runtime_engine=$runtime_engine" "runtime_model=$runtime_model" \
+      "runtime_reasoning_effort=$runtime_effort" \
       "route=owner_send_keys" "status=delivered_to_owner"
     if deliver_to_owner "$owner_wt" "$task_prompt"; then
       # thread #151 refinement #1 — log every send-keys into a session the
@@ -1620,7 +1849,8 @@ fire_to_owner() {
   fi
 
   # resumable — owner process is down; --resume its session in its worktree.
-  resume_sid=$(derive_session_id "$owner_wt") || resume_sid=""
+  resume_sid=$(read_session_field "$oracle" "$wkey" session-id 2>/dev/null) || resume_sid=""
+  [ -n "$resume_sid" ] || resume_sid=$(derive_session_id_for_engine "$owner_wt" "$runtime_engine") || resume_sid=""
   if [ -z "$resume_sid" ]; then
     log "[$oracle] $fname → owner $owner_wt resumable but no session-id derivable; --fresh fallback"
     fire_wake "$oracle" "$file" "$fname"
@@ -1631,10 +1861,18 @@ fire_to_owner() {
     "fired_at=$wake_ts" "oracle=$oracle" "fname=$fname" \
     "thread_id=$thread_id" "wake_key=$wkey" "wt_suffix=$wt_suffix" \
     "wt_path=$owner_wt" "route=owner_resume" "resume_sid=$resume_sid" \
+    "requested_engine=$requested_engine" "requested_model=$requested_model" \
+    "requested_reasoning_effort=$requested_effort" \
+    "runtime_engine=$runtime_engine" "runtime_model=$runtime_model" \
+    "runtime_reasoning_effort=$runtime_effort" \
     "status=fired"
-  log "[$oracle] $fname → fire (RESUME owner sid=$resume_sid, wt=$owner_wt)"
-  wake_out=$($MAW_BIN wake "$oracle" --resume "$resume_sid" --wt "$wt_suffix" --no-attach \
-    --task "$task_prompt" 2>&1) || {
+  log "[$oracle] $fname → fire (RESUME owner sid=$resume_sid, wt=$owner_wt${runtime_engine:+, engine=$runtime_engine}${runtime_model:+, model=$runtime_model})"
+  local maw_args=(wake "$oracle" --resume "$resume_sid")
+  [ -n "$runtime_engine" ] && maw_args+=(--engine "$runtime_engine")
+  [ -n "$runtime_model" ] && maw_args+=(--model "$runtime_model")
+  [ -n "$runtime_effort" ] && maw_args+=(--reasoning-effort "$runtime_effort")
+  maw_args+=(--wt "$wt_suffix" --no-attach --task "$task_prompt")
+  wake_out=$($MAW_BIN "${maw_args[@]}" 2>&1) || {
     set_state_field "$sf" status fire_failed
     set_state_field "$sf" failed_at "$(date +%s)"
     alert "[$oracle] maw wake --resume (owner) exit nonzero for $fname: $(printf '%s' "$wake_out" | tail -3 | tr '\n' ' ')"
@@ -1994,7 +2232,12 @@ case ${1:-loop} in
     echo "session-id mappings:"
     if [ -d "$STATE_DIR/sessions" ]; then
       find "$STATE_DIR/sessions" -name 'thread-*.session-id' -type f 2>/dev/null | while read -r f; do
-        printf '  %s → %s\n' "${f#"$STATE_DIR/sessions/"}" "$(cat "$f")"
+        base=${f%.session-id}
+        engine=$(cat "$base.session-engine" 2>/dev/null)
+        model=$(cat "$base.session-model" 2>/dev/null)
+        effort=$(cat "$base.session-reasoning-effort" 2>/dev/null)
+        printf '  %s → %s%s%s%s\n' "${f#"$STATE_DIR/sessions/"}" "$(cat "$f")" \
+          "${engine:+ engine=$engine}" "${model:+ model=$model}" "${effort:+ reasoning=$effort}"
       done
     fi
     echo
