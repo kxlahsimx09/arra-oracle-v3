@@ -13,10 +13,15 @@
 #
 # Tuning (env override):
 #   POLL_INTERVAL          (default 2s)   — how often we check JSONL for new lines
-#   JSONL_WAIT_SECONDS     (default 180s) — how long to wait for claude's first
-#                          JSONL write before bailing. Bumped from 30s after
-#                          chats with large CLAUDE.md kept missing the window
-#                          and never recovered (no auto-respawn).
+#   JSONL_WAIT_SECONDS     (default 480s) — how long to wait for the engine's
+#                          first JSONL write before bailing. Was 30s → 180s →
+#                          480s (2026-05-26): a claude chat with a large
+#                          CLAUDE.md wrote its first JSONL at +7min, past the
+#                          180s window, so the watcher bailed and — with no
+#                          auto-respawn — the chat went silent. bot.sh now also
+#                          re-runs recover_watchers periodically
+#                          (WATCHER_RECOVER_INTERVAL) as a backstop for any
+#                          watcher that still bails.
 #
 # State files:
 #   $STATE_DIR/watch.<chat>.pid       — watcher pid
@@ -45,7 +50,7 @@ PID_FILE=$STATE_DIR/watch.$SAFE.pid
 LINE_STATE_FILE=$STATE_DIR/last-line.$SAFE
 
 POLL_INTERVAL=${POLL_INTERVAL:-2}
-JSONL_WAIT_SECONDS=${JSONL_WAIT_SECONDS:-180}
+JSONL_WAIT_SECONDS=${JSONL_WAIT_SECONDS:-480}
 # Idle-prompt alert: JSONL quiet this long + pane shows claude's TUI
 # selection cursor (`❯ `) → one-time Telegram nudge. Reset on next JSONL line.
 IDLE_PROMPT_SECONDS=${IDLE_PROMPT_SECONDS:-30}
