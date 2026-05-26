@@ -26,6 +26,12 @@ LOG_FILE=${LOG_FILE:-$STATE_DIR/bot.log}
 AUDIT_FILE=$STATE_DIR/audit.log
 LAST_UPDATE_ID_FILE=$STATE_DIR/last-update-id
 ACTIVE_CHAT_FILE_PREFIX=$STATE_DIR/active-chat
+# How often (seconds) the main loop re-runs recover_watchers to respawn any
+# chat-watcher that bailed mid-session (e.g. an engine cold-start that exceeded
+# chat-watcher.sh's JSONL_WAIT_SECONDS). The startup recover_watchers runs only
+# once, so without this a bailed watcher stayed dead until a bot restart or a
+# manual /watch all. Set 0 to disable the periodic sweep.
+WATCHER_RECOVER_INTERVAL=${WATCHER_RECOVER_INTERVAL:-300}
 
 # Repos in scope for blockers/pending markers + orphan-worktree sweep.
 # Populated at boot by load_roles from fleet configs — every repo with at
@@ -1750,7 +1756,17 @@ main() {
   update_status "$CHAT"
   local last_id=0
   [ -f "$LAST_UPDATE_ID_FILE" ] && last_id=$(cat "$LAST_UPDATE_ID_FILE")
+  local last_recover; last_recover=$(date +%s)  # boot recover_watchers just ran
   while true; do
+    # Periodic backstop: respawn any chat-watcher that bailed mid-session.
+    # The boot-time recover_watchers runs once; this re-runs it every
+    # WATCHER_RECOVER_INTERVAL so a watcher that exited (e.g. engine cold-start
+    # exceeded JSONL_WAIT_SECONDS) is picked back up without a bot restart.
+    if [ "${WATCHER_RECOVER_INTERVAL:-0}" -gt 0 ] && \
+       [ "$(( $(date +%s) - last_recover ))" -ge "$WATCHER_RECOVER_INTERVAL" ]; then
+      recover_watchers
+      last_recover=$(date +%s)
+    fi
     local resp
     resp=$(curl -sf --max-time 35 "https://api.telegram.org/bot${TOKEN}/getUpdates?offset=$((last_id + 1))&timeout=30" 2>/dev/null) || { sleep 5; continue; }
     local n; n=$(echo "$resp" | jq '.result | length' 2>/dev/null)
