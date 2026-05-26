@@ -640,6 +640,7 @@ cmd_help() {
 
 <b>Active chat I/O:</b>
 &lt;plain msg&gt;               → send to current chat
+/key [role/slug] &lt;keys…&gt;   ⌨️ TUI nav: up down enter esc … (stuck-menu)
 /look [N|full]            tmux scrollback (default 25)
 /end                      clear active chat (no kill)
 /watch list|on|off|all    🔔 manage per-chat auto-push
@@ -1712,6 +1713,79 @@ cmd_send_to_chat() {
   send_tg "→ <code>$target</code> sent. 🔔 watcher จะ push ตอน agent ตอบเสร็จ"
 }
 
+# ── send TUI navigation keys to a chat's pane ───────────────────────────────
+# For when an agent is stuck in a TUI selection (e.g. claude's permission menu)
+# and a plain message can't drive it — send Up/Down to highlight, Enter to pick.
+# Navigation only (no ctrl combos), so a stray /key can never kill an agent.
+# Friendly alias → tmux key name; each token may carry a *N repeat (down*3).
+# Default target = active chat; a role/slug first arg overrides it.
+key_alias() {
+  case "$1" in
+    up)              echo Up ;;
+    down)            echo Down ;;
+    left)            echo Left ;;
+    right)           echo Right ;;
+    enter|cr|return) echo Enter ;;
+    esc|escape)      echo Escape ;;
+    tab)             echo Tab ;;
+    space)           echo Space ;;
+    bs|backspace)    echo BSpace ;;
+    pgup|pageup)     echo PageUp ;;
+    pgdn|pagedown)   echo PageDown ;;
+    home)            echo Home ;;
+    end)             echo End ;;
+    y|n|[0-9])       echo "$1" ;;
+    *)               echo "" ;;
+  esac
+}
+
+KEY_USAGE='usage: <code>/key [role/slug] &lt;keys…&gt;</code>
+คีย์: up down left right enter esc tab space pgup pgdn home end y n 0-9 (ซ้ำ: <code>down*3</code>)
+เช่น <code>/key down down enter</code> · <code>/key down*2 enter</code> · <code>/key esc</code>'
+
+cmd_key() {
+  local tg_chat="$1"; shift
+  local target pane
+  case "${1:-}" in
+    */*) target="$1"; shift ;;                       # explicit role/slug
+    *)
+      local f; f=$(active_chat_file "$tg_chat")
+      [ ! -f "$f" ] && { send_tg "❌ ไม่มี active chat — /chat &lt;role&gt; ก่อน หรือระบุ target: <code>/key &lt;role/slug&gt; &lt;keys&gt;</code>"; return; }
+      target=$(cat "$f") ;;
+  esac
+  [ "$#" -eq 0 ] && { send_tg "$KEY_USAGE"; return; }
+
+  pane=$(resolve_chat "$target" | cut -d'|' -f1)
+  [ -z "$pane" ] && { send_tg "❌ ไม่เจอ pane ของ <code>$target</code> (chat ตาย/ชื่อกำกวม) — /chats ดู"; return; }
+
+  # Expand tokens → tmux keys; reject any unknown token up-front so we never
+  # send a partial sequence into the wrong place.
+  local -a keys=(); local tok base rep k i
+  for tok in "$@"; do
+    base="${tok%%\**}"; rep="${tok#*\*}"
+    [ "$rep" = "$tok" ] && rep=1                      # no '*' → once
+    case "$rep" in ""|*[!0-9]*) rep=1 ;; esac
+    [ "$rep" -lt 1 ] && rep=1
+    [ "$rep" -gt 20 ] && rep=20                       # cap runaway repeats
+    k=$(key_alias "$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')")
+    [ -z "$k" ] && { send_tg "❌ ปุ่มไม่รู้จัก: <code>$base</code>
+$KEY_USAGE"; return; }
+    for ((i=0; i<rep; i++)); do keys+=("$k"); done
+  done
+
+  local pane_cmd; pane_cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null)
+  # Mark user-send so the watcher's quiet window suppresses echo of our own keys.
+  date +%s > "$(user_send_marker "$target")"
+  # One key per send-keys with a short gap; Enter gets a longer lead so the TUI
+  # commits the highlighted item before we confirm (same rationale as text path).
+  for k in "${keys[@]}"; do
+    if [ "$k" = "Enter" ]; then sleep 0.3; else sleep 0.05; fi
+    tmux send-keys -t "$pane" "$k" 2>/dev/null
+  done
+  audit "→ key chat=$target pane=$pane keys=${keys[*]}"
+  send_tg "⌨️ <code>$target</code> ← <code>${keys[*]}</code> (pane=<code>${pane_cmd:-?}</code>)"
+}
+
 # ── dispatcher ─────────────────────────────────────────────────────────────
 
 dispatch() {
@@ -1733,6 +1807,7 @@ dispatch() {
     /relaunch)    cmd_relaunch "$chat_id" "${2:-}" ;;
     /close)       cmd_close "${2:-}" "${3:-}" ;;
     /look)        cmd_look "$chat_id" "${2:-25}" ;;
+    /key)         shift; cmd_key "$chat_id" "$@" ;;
     /end)         cmd_end "$chat_id" ;;
     /watch)       cmd_watch "${2:-list}" "${3:-}" ;;
     /history)     cmd_history "$chat_id" "${2:-}" "${3:-20}" ;;

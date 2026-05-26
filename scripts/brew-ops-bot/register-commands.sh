@@ -21,6 +21,7 @@ curl -sf "https://api.telegram.org/bot${TOKEN}/setMyCommands" \
       {"command":"new",      "description":"➕ spawn new chat: /new <role> [slug]"},
       {"command":"close",    "description":"✖️ close chat: /close <role/slug>"},
       {"command":"look",     "description":"👁️ tmux scrollback (default 25, /look full)"},
+      {"command":"key",      "description":"⌨️ TUI nav keys: /key [chat] up down enter esc"},
       {"command":"end",      "description":"clear active chat (ไม่ kill)"},
       {"command":"watch",    "description":"🔔 watcher: /watch list|on|off|all [chat]"},
       {"command":"history",  "description":"📜 claude JSONL turns: /history [target] [N]"},
