@@ -266,7 +266,11 @@ write_session_ref() {
   local dir="$STATE_DIR/sessions/$oracle"
   mkdir -p "$dir"
   [ -n "$sid" ] && printf '%s\n' "$sid" >"$(session_ref_path "$oracle" "$key" session-id)"
-  [ -n "$engine" ] && printf '%s\n' "$engine" >"$(session_ref_path "$oracle" "$key" session-engine)"
+  if [ -n "$engine" ]; then
+    printf '%s\n' "$engine" >"$(session_ref_path "$oracle" "$key" session-engine)"
+  else
+    rm -f "$(session_ref_path "$oracle" "$key" session-engine)"
+  fi
   if [ -n "$model" ]; then
     printf '%s\n' "$model" >"$(session_ref_path "$oracle" "$key" session-model)"
   else

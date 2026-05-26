@@ -18,6 +18,7 @@ let stateDir: string;
 let codexSessions: string;
 let mawLog: string;
 let wtPath: string;
+let binDir: string;
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "iw-runtime-"));
@@ -26,10 +27,14 @@ beforeEach(() => {
   codexSessions = join(root, "codex-sessions");
   mawLog = join(root, "maw-calls.log");
   wtPath = join(root, "fake.wt-1-runtime");
+  binDir = join(root, "bin");
   mkdirSync(join(inboxBase, "for-brew-ops"), { recursive: true });
   mkdirSync(codexSessions, { recursive: true });
   mkdirSync(wtPath, { recursive: true });
+  mkdirSync(binDir, { recursive: true });
   writeFileSync(mawLog, "");
+  writeFileSync(join(binDir, "pgrep"), "#!/usr/bin/env bash\nexit 1\n", { mode: 0o755 });
+  writeFileSync(join(binDir, "lsof"), "#!/usr/bin/env bash\nexit 1\n", { mode: 0o755 });
 
   const stub = join(root, "maw-stub.sh");
   writeFileSync(
@@ -71,6 +76,7 @@ function scanOnce() {
       CODEX_SESSIONS: codexSessions,
       MAW_BIN: process.env.__IW_MAW,
       INBOX_POLL_INTERVAL: "1",
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
     },
     encoding: "utf8",
   });
