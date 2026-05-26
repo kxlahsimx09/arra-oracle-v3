@@ -137,6 +137,13 @@ INBOX_GC_INTERVAL=${INBOX_GC_INTERVAL:-600}
 # backstop — assume the campaign is cold). Retire-driven eviction handles the
 # common case; the TTL covers campaigns whose thread never formally closed.
 SESSION_TTL_DAYS=${SESSION_TTL_DAYS:-30}
+# A terminal envelope state file this many days old is deleted once it no
+# longer pins a reclaimable worktree (thread #224). Without this, `completed`
+# / failed states whose worktree is already gone (or was owner-routed into a
+# foreign wt) are re-scanned by gc_retire_terminal on EVERY sweep — they only
+# ever log "retire SKIPPED", never get removed, and the pile grows without
+# bound (555 such files fd-starved the watcher into a crash on 2026-05-16).
+STATE_TTL_DAYS=${STATE_TTL_DAYS:-14}
 ORACLE_API=${ORACLE_API:-http://localhost:47778/api}
 MAW_BIN=${MAW_BIN:-bun /Users/dev01/Code/github.com/Soul-Brews-Studio/maw-js/src/cli.ts}
 # Phase 6 — claude_alive_at heuristic. A claude process is "active" only if
@@ -1651,6 +1658,10 @@ evict_session_id() {
 #   (2) session-id cache files accumulate. Retire-driven eviction
 #       (evict_session_id) handles closed campaigns; gc_evict_stale_sessions
 #       is the 30-day TTL backstop for campaigns whose thread never closed.
+#  (2b) terminal state files accumulate. A `completed`/failed envelope whose
+#       worktree is already gone or was owner-routed only ever logs "retire
+#       SKIPPED" — gc_evict_terminal_state reaps these past STATE_TTL_DAYS so
+#       gc_retire_terminal's per-sweep scan stays bounded (thread #224).
 #   (3) Worktrees orphaned by crashes / manual tmux kills sit on disk forever
 #       — no tmux window, no live claude, not referenced by any envelope
 #       state. gc_prune_orphan_worktrees removes them under the same
@@ -1713,6 +1724,49 @@ gc_evict_stale_sessions() {
             "${sid_file%.session-id}.session-reasoning-effort"
       log "gc: evicted stale session-id ${sid_file#"$STATE_DIR/sessions/"} (idle ${age_days}d ≥ ${SESSION_TTL_DAYS}d TTL)"
     fi
+  done
+}
+
+# (2b) Delete terminal state files past STATE_TTL_DAYS that no longer pin a
+# reclaimable worktree. gc_retire_terminal re-evaluates EVERY terminal state
+# every sweep; for ones whose worktree is already gone (`wt-already-gone`) or
+# was owner-routed into a foreign wt (`owner-routed-foreign-wt`) that work is a
+# permanent no-op — the state lingers forever and each sweep re-scans it,
+# forking git/lsof per file. 555 such files accumulated by thread #224 and the
+# growing sweep fd-starved the watcher into a crash (2026-05-16). This reaps
+# them once cold, so sweep cost stays bounded.
+#
+# A terminal state is kept (never deleted here) while it still owns a live
+# worktree pending retire — status terminal, not yet retired, wt_path present
+# on disk, not owner-routed — so gc_retire_terminal can still reclaim it once
+# the thread closes. The inbox-file guard is load-bearing: deleting a state
+# whose source envelope is still queued would re-fire it on the next scan.
+gc_evict_terminal_state() {
+  local now sf mtime age_days oracle fname
+  now=$(date +%s)
+  for sf in "$STATE_DIR"/state/*/*.state; do
+    [ -f "$sf" ] || continue
+    unset status retired_at wt_path route
+    # shellcheck disable=SC1090
+    source "$sf"
+    case "${status:-}" in
+      completed|failed_no_prompt|failed_stuck|fire_failed) ;;
+      *) continue ;;
+    esac
+    # Still owns a reclaimable worktree → leave it for gc_retire_terminal.
+    if [ -z "${retired_at:-}" ] && [ -n "${wt_path:-}" ] && [ -d "${wt_path:-}" ] \
+       && [ "${route:-}" != "owner_send_keys" ] && [ "${route:-}" != "owner_resume" ]; then
+      continue
+    fi
+    oracle=$(basename "$(dirname "$sf")")
+    fname=$(basename "$sf" .state)
+    # Source envelope still queued → deleting state would re-fire it.
+    [ -f "$INBOX_BASE/for-$oracle/$fname" ] && continue
+    mtime=$(stat -f %m "$sf" 2>/dev/null) || continue
+    age_days=$(( (now - mtime) / 86400 ))
+    [ "$age_days" -ge "$STATE_TTL_DAYS" ] || continue
+    rm -f "$sf"
+    log "gc: evicted terminal state ${sf#"$STATE_DIR/state/"} (${status}, idle ${age_days}d ≥ ${STATE_TTL_DAYS}d TTL)"
   done
 }
 
@@ -1791,6 +1845,7 @@ gc_sweep() {
   log "gc-sweep start"
   gc_retire_terminal
   gc_evict_stale_sessions
+  gc_evict_terminal_state
   gc_prune_orphan_worktrees
   log "gc-sweep done"
   return 0

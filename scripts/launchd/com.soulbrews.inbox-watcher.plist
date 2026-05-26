@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Dedicated launchd supervisor for the directed-inbox watcher.
+
+  Rendered by scripts/install-inbox-watcher-supervisor.sh (__ARRA__ / __HOME__
+  are substituted at install time). Do NOT load this file directly.
+
+  Why a dedicated job: start-soul-brews.sh starts the watcher at login and
+  verifies it 5s later, then exits 0. A death AFTER that window — the
+  2026-05-16 fd-storm, or thread #224's ever-heavier gc sweep — was invisible
+  to launchd and left directed-inbox dispatch silently offline (~24h on
+  2026-05-25). KeepAlive=true restarts on ANY exit; ThrottleInterval spaces
+  restarts so a genuine crash-loop backs off rather than busy-spinning.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.soulbrews.inbox-watcher</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__ARRA__/scripts/inbox-watcher.sh</string>
+        <string>start</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on ANY exit (clean or crash) — this is the post-startup
+         self-heal that the boot-only 5s check could never provide. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- 30s between respawns: a crash-loop backs off instead of busy-spinning
+         (matches com.soulbrews.start.plist). -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>WorkingDirectory</key>
+    <string>__ARRA__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.bun/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.cache/soul-brews-startup/inbox-watcher.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.cache/soul-brews-startup/inbox-watcher.launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
