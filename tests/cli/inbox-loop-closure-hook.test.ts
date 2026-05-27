@@ -15,7 +15,7 @@
 // Hermetic: a stub Oracle API serves thread statuses; temp inbox + watcher state.
 
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Server } from "bun";
@@ -303,4 +303,91 @@ test("orchestrator: needs_response archived w/o reply for a SIBLING campaign →
   orchOwner(305, SIBLING_WT);
   archivedOrchConsult({ from: "pg-writer", thread: 5003, parentThread: 305 });
   expect((await runOrchHook(MY_WT, apiUrl())).code).toBe(0);
+});
+
+// --- thread #248: circuit-breaker escalation envelope must carry parent_thread
+//
+// When the breaker gives up (consecutive blocks > MAX_BLOCKS) it writes a
+// priority:high notify to for-orchestrator/. Pre-#248 that envelope (and the
+// unhandled/reply-gap listings feeding it) carried only `thread:<sub-thread>`,
+// never `parent_thread:<campaign>`. The inbox-watcher keys an orchestrator wake
+// on wake_key = parent_thread || thread, so a missing parent_thread mis-keyed
+// the escalation onto the SUB-thread and ghost-spawned a fresh orchestrator
+// session instead of resuming the campaign owner (observed 2026-05-27: a 15-07
+// escalation emitted thread:232 with no parent_thread:231 → ghost wt-29). The
+// breaker now carries the triggering envelope's parent_thread through.
+
+/** Unhandled inbound consult in for-next-architect/ root (trips the breaker). */
+function unhandledInbound(opts: { thread: number; parentThread: number }) {
+  writeFileSync(
+    join(
+      inboxBase, "for-next-architect",
+      `2026-05-27_15-00_from-orchestrator_thread-${opts.thread}_consult.md`,
+    ),
+    ["---", "from: orchestrator", "to: next-architect", "type: consult",
+      `thread: ${opts.thread}`, `parent_thread: ${opts.parentThread}`,
+      "parent_oracle: orchestrator", "needs_response: true",
+      "created: 2026-05-27T15:00:00+07:00", "---", "", "do the work"].join("\n"),
+  );
+}
+
+/** Run the hook with INBOX_LOOP_MAX_BLOCKS overridden so the breaker trips. */
+async function runHookMaxBlocks(maxBlocks: number) {
+  const proc = Bun.spawn(["bash", HOOK], {
+    stdin: new TextEncoder().encode(JSON.stringify({ session_id: SID })),
+    env: {
+      ...process.env,
+      INBOX_BASE: inboxBase,
+      INBOX_WATCHER_STATE: watcherState,
+      INBOX_LOOP_HOOK_STATE: hookState,
+      ORACLE_API: apiUrl(),
+      INBOX_LOOP_MAX_BLOCKS: String(maxBlocks),
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const stderr = await new Response(proc.stderr).text();
+  const code = await proc.exited;
+  return { code, stderr };
+}
+
+function orchestratorNotify(): string {
+  const dir = join(inboxBase, "for-orchestrator");
+  const files = readdirSync(dir).filter((f) => f.endsWith("_notify.md"));
+  expect(files.length).toBe(1);
+  return readFileSync(join(dir, files[0]), "utf8");
+}
+
+test("breaker escalation carries parent_thread (campaign), not the sub-thread", async () => {
+  unhandledInbound({ thread: 232, parentThread: 231 });
+  // MAX_BLOCKS=0 → the first block (bc=1) already exceeds it, tripping the breaker.
+  const r = await runHookMaxBlocks(0);
+  expect(r.code).toBe(0); // breaker escalates then ALLOWS the stop
+  expect(r.stderr).toContain("orchestrator notified");
+
+  const body = orchestratorNotify();
+  // The fix: watcher wake_key resolves to the CAMPAIGN, not the sub-thread.
+  expect(body).toContain("parent_thread: 231");
+  expect(body).toContain("parent_oracle: orchestrator");
+  // The sub-thread is still recorded (and is what the filename keys on).
+  expect(body).toMatch(/^thread: 232$/m);
+});
+
+test("breaker escalation omits parent_thread when the envelope has none", async () => {
+  // A standalone consult (thread == campaign, no parent_thread) must not gain a
+  // spurious parent_thread line — wake_key should fall back to thread.
+  writeFileSync(
+    join(
+      inboxBase, "for-next-architect",
+      "2026-05-27_15-00_from-pg-writer_thread-77_consult.md",
+    ),
+    ["---", "from: pg-writer", "to: next-architect", "type: consult",
+      "thread: 77", "needs_response: true",
+      "created: 2026-05-27T15:00:00+07:00", "---", "", "standalone"].join("\n"),
+  );
+  expect((await runHookMaxBlocks(0)).code).toBe(0);
+
+  const body = orchestratorNotify();
+  expect(body).not.toContain("parent_thread:");
+  expect(body).toMatch(/^thread: 77$/m);
 });
