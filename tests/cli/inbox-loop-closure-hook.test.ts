@@ -186,3 +186,121 @@ test("API unreachable + no handled_note → BLOCKS (cannot confirm moot)", async
   archivedConsult({ thread: 148 });
   expect((await runHook("http://127.0.0.1:9/api")).code).toBe(2);
 });
+
+// --- thread #238: orchestrator gate is scoped by §151 OWNERSHIP, not whole-dir
+//
+// The orchestrator is the multi-campaign hub: ONE session spans many wake_keys,
+// so §214's single-wake_key scoping cannot apply. Pre-#238 it stayed whole-dir,
+// which false-blocked CONCURRENT orchestrator sessions (#181) on envelopes owned
+// by a sibling session. The hook now scopes the orchestrator by the inbox-watcher
+// §151 owner map: an envelope is this session's iff
+// sessions/orchestrator/thread-<wake_key>.owner == this session's worktree.
+// Unattributable scope (no owner record / no wake_key) falls back to gating.
+
+const ORCH_SID = "test-orch-0002";
+const MY_WT = "/wt/orch-mine";
+const SIBLING_WT = "/wt/orch-sibling";
+
+/** Reverse-map ORCH_SID → oracle "orchestrator" (the watcher's session_id capture). */
+function orchState(sid: string) {
+  const d = join(watcherState, "state", "orchestrator");
+  mkdirSync(d, { recursive: true });
+  writeFileSync(
+    join(d, "dispatch.state"),
+    ["oracle=orchestrator", `session_id=${sid}`, "status=verified"].join("\n") + "\n",
+  );
+}
+
+/** Ensure sessions/orchestrator/ exists so scope_owner engages (even with no .owner). */
+function orchSessionsDir() {
+  mkdirSync(join(watcherState, "sessions", "orchestrator"), { recursive: true });
+}
+
+/** Record §151 campaign ownership: sessions/orchestrator/thread-<wakeKey>.owner = wt. */
+function orchOwner(wakeKey: number, wt: string) {
+  orchSessionsDir();
+  writeFileSync(join(watcherState, "sessions", "orchestrator", `thread-${wakeKey}.owner`), wt + "\n");
+}
+
+/** Unhandled inbound reply envelope in for-orchestrator/ root (Check 1: archive-gap). */
+function unhandledOrchReply(opts: { from: string; thread: number; parentThread: number }) {
+  writeFileSync(
+    join(inboxBase, "for-orchestrator", `2026-05-26_10-00_from-${opts.from}_thread-${opts.thread}_reply.md`),
+    ["---", `from: ${opts.from}`, "to: orchestrator", "type: notify",
+      `thread: ${opts.thread}`, `parent_thread: ${opts.parentThread}`, "parent_oracle: orchestrator",
+      "needs_response: false", "created: 2026-05-26T10:00:00+07:00", "---", "", "sub-task done"].join("\n"),
+  );
+}
+
+/** Archived needs_response envelope in for-orchestrator/handled/ (Check 2: reply-gap). */
+function archivedOrchConsult(opts: { from: string; thread: number; parentThread: number }) {
+  const dir = join(inboxBase, "for-orchestrator", "handled", "2026-05");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, `2026-05-26_09-00_from-${opts.from}_thread-${opts.thread}_consult.md`),
+    ["---", `from: ${opts.from}`, "to: orchestrator", "type: consult",
+      `thread: ${opts.thread}`, `parent_thread: ${opts.parentThread}`,
+      "needs_response: true", "created: 2026-05-26T09:00:00+07:00",
+      "handled_at: 2026-05-26T09:30:00+07:00", `handled_by_thread: ${opts.thread}`,
+      "---", "", "needs a reply"].join("\n"),
+  );
+}
+
+/** Run the hook as the orchestrator session, passing cwd (= this session's worktree). */
+async function runOrchHook(cwd: string, oracleApi: string) {
+  const proc = Bun.spawn(["bash", HOOK], {
+    stdin: new TextEncoder().encode(JSON.stringify({ session_id: ORCH_SID, cwd })),
+    env: {
+      ...process.env,
+      INBOX_BASE: inboxBase,
+      INBOX_WATCHER_STATE: watcherState,
+      INBOX_LOOP_HOOK_STATE: hookState,
+      ORACLE_API: oracleApi,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const stderr = await new Response(proc.stderr).text();
+  const code = await proc.exited;
+  return { code, stderr };
+}
+
+test("orchestrator: unhandled envelope for a campaign THIS session owns → BLOCKS", async () => {
+  orchState(ORCH_SID);
+  orchOwner(300, MY_WT);
+  unhandledOrchReply({ from: "pg-writer", thread: 3001, parentThread: 300 });
+  const r = await runOrchHook(MY_WT, apiUrl());
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain("INBOX LOOP NOT CLOSED");
+  expect(r.stderr).toContain("thread-3001_reply.md");
+});
+
+test("orchestrator: unhandled envelope for a SIBLING session's campaign → ALLOWS", async () => {
+  orchState(ORCH_SID);
+  orchOwner(301, SIBLING_WT);            // owned by a different orchestrator worktree
+  unhandledOrchReply({ from: "pg-tester", thread: 3011, parentThread: 301 });
+  expect((await runOrchHook(MY_WT, apiUrl())).code).toBe(0);
+});
+
+test("orchestrator: unhandled envelope with NO owner record → BLOCKS (safe fallback)", async () => {
+  orchState(ORCH_SID);
+  orchSessionsDir();                     // scope_owner engages, but no .owner for 302
+  unhandledOrchReply({ from: "next-impl", thread: 3021, parentThread: 302 });
+  expect((await runOrchHook(MY_WT, apiUrl())).code).toBe(2);
+});
+
+test("orchestrator: needs_response archived w/o reply for an OWNED campaign → BLOCKS", async () => {
+  threadStatus = { "5002": "active" };
+  orchState(ORCH_SID);
+  orchOwner(304, MY_WT);
+  archivedOrchConsult({ from: "pg-writer", thread: 5002, parentThread: 304 });
+  expect((await runOrchHook(MY_WT, apiUrl())).code).toBe(2);
+});
+
+test("orchestrator: needs_response archived w/o reply for a SIBLING campaign → ALLOWS", async () => {
+  threadStatus = { "5003": "active" };
+  orchState(ORCH_SID);
+  orchOwner(305, SIBLING_WT);
+  archivedOrchConsult({ from: "pg-writer", thread: 5003, parentThread: 305 });
+  expect((await runOrchHook(MY_WT, apiUrl())).code).toBe(0);
+});

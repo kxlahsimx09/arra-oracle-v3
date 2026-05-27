@@ -91,27 +91,45 @@ fm_field() {  # $1=file $2=field
   ' "$1" 2>/dev/null
 }
 
-# --- campaign scoping (thread #214) ------------------------------------------
+# --- per-session scoping (thread #214 wake_key + thread #238 owner) -----------
 # With concurrent sessions of one oracle (the #181 parallel-sessions-same-role
 # pattern), for-{oracle}/ holds envelopes for SIBLING sessions' campaigns too.
-# Gate THIS session only on its OWN campaign — keyed by wake_key
-# (parent_thread || thread), the same key §11f and the inbox-watcher use. Derive
-# my wake_key(s) from the watcher state files that name my session_id.
+# Gate THIS session only on the envelopes it actually owns; leave a sibling's
+# envelopes in place (archiving them would corrupt the sibling's audit trail).
+# Two scoping schemes, by oracle kind:
 #
-#   EXCEPTION — the orchestrator is the multi-campaign hub: for-orchestrator/
-#   legitimately receives replies from ALL the campaigns it owns, and one hub
-#   session spans many wake_keys (verified thread #214: sid 6812815d owned
-#   wake_keys 162/167/168/170). Scoping it would blind it to its other
-#   campaigns' loops, so the orchestrator stays whole-dir — explicitly, not by
-#   relying on the undeterminable-fallback being hit.
+#   • Non-orchestrator (thread #214): a session owns exactly ONE campaign, keyed
+#     by wake_key (parent_thread || thread) — the same key §11f and the
+#     inbox-watcher use. Derive my wake_key(s) from the watcher state files that
+#     name my session_id; gate only on envelopes whose wake_key matches.
 #
-# Undeterminable wake_key (cache evicted / unknown sid) → fall back to whole-dir:
-# over-blocking is safe (the §11i T2 failed_stuck watcher gate is the backstop);
-# silently missing a sibling's leak is not what we want, but a missed gap on a
-# cold session is preferable to cross-campaign contamination on a warm one.
+#   • Orchestrator (thread #238): the multi-campaign hub. ONE session legitimately
+#     spans MANY wake_keys, so wake_key scoping would blind it to its own other
+#     campaigns. But under #181 there can be CONCURRENT orchestrator sessions
+#     (e.g. wt-20/21/22 on 2026-05-26), each owning a DIFFERENT subset of
+#     campaigns — so the old whole-dir gate false-blocked each session on its
+#     siblings' envelopes (re-hit ~5× during campaign #228/#234/#237). Scope by
+#     §151 OWNERSHIP instead: an envelope is mine iff the inbox-watcher recorded
+#     THIS session's worktree as the owner of its campaign
+#     (sessions/orchestrator/thread-<wake_key>.owner == my worktree). This is the
+#     same "scope the gate the way the work is scoped" move as §214, using the
+#     per-session discriminator (worktree) that fits a multi-campaign hub — where
+#     §214's single-wake_key key does not.
+#
+# Undeterminable scope (cache evicted / unknown sid / no owner record / no
+# wake_key) → fall back to gating (whole-dir): over-blocking is safe — the §11i
+# T2 failed_stuck watcher gate is the backstop — whereas silently skipping a
+# genuinely-owned envelope would re-open the #140 silent-stall class.
+my_wt=$(printf '%s' "$payload" | jq -r '.cwd // .payload.cwd // .payload.session_meta.cwd // empty' 2>/dev/null || true)
+[ -z "$my_wt" ] && my_wt=$PWD
+my_wt=${my_wt%/}
+
 scope_campaign=0
+scope_owner=0
 my_wake_keys=""
-if [ "$oracle" != "orchestrator" ] && [ -d "$WATCHER_STATE/state/$oracle" ]; then
+if [ "$oracle" = "orchestrator" ]; then
+  [ -n "$my_wt" ] && [ -d "$WATCHER_STATE/sessions/$oracle" ] && scope_owner=1
+elif [ -d "$WATCHER_STATE/state/$oracle" ]; then
   my_wake_keys=$(grep -lF "session_id=$sid" "$WATCHER_STATE/state/$oracle"/*.state 2>/dev/null \
     | while IFS= read -r sf; do
         wk=$(sed -n 's/^wake_key=//p' "$sf" 2>/dev/null | head -1 || true)
@@ -129,10 +147,24 @@ env_wake_key() {  # $1=file
   fm_field "$1" thread
 }
 
-# is this envelope in THIS session's campaign? (true when scoping is off)
-in_scope() {  # $1=file → 0 = in scope, 1 = sibling campaign (skip)
-  [ "$scope_campaign" = 1 ] || return 0
-  local wk
+# §151 owner worktree recorded by the inbox-watcher for a campaign (orchestrator
+# owner-scoping). Empty when no .owner file exists for the wake_key.
+owner_wt() {  # $1=wake_key → prints owner worktree path or empty
+  local f="$WATCHER_STATE/sessions/$oracle/thread-$1.owner"
+  [ -f "$f" ] && head -1 "$f"
+}
+
+# is this envelope THIS session's to close? (true when no scoping is active)
+in_scope() {  # $1=file → 0 = in scope (gate), 1 = sibling-owned (skip)
+  local wk owner
+  if [ "$scope_owner" = 1 ]; then          # thread #238: orchestrator by §151 owner
+    wk=$(env_wake_key "$1")
+    [ -n "$wk" ] || return 0               # unattributable wake_key → gate (safe)
+    owner=$(owner_wt "$wk")
+    [ -n "$owner" ] || return 0            # no owner record → gate (safe)
+    [ "${owner%/}" = "$my_wt" ] && return 0 || return 1
+  fi
+  [ "$scope_campaign" = 1 ] || return 0    # thread #214: non-orchestrator by wake_key
   wk=$(env_wake_key "$1")
   [ -n "$wk" ] || return 0   # no thread/parent_thread → don't skip (be safe)
   if printf '%s\n' "$my_wake_keys" | grep -qxF "$wk"; then return 0; else return 1; fi
@@ -262,8 +294,10 @@ thread→session ownership). As of thread #214 this gate is campaign-scoped — 
 lists ONLY envelopes whose wake_key (parent_thread || thread) matches the
 campaign this session was spawned to handle, so a sibling same-oracle session's
 envelopes are NOT shown here and are NOT yours to close. Handle the one(s)
-listed and the gate clears. (The orchestrator hub is the exception — it sees all
-its campaigns whole-dir, by design.)"
+listed and the gate clears. (The orchestrator hub scopes this by §151 campaign
+OWNERSHIP instead of wake_key — thread #238 — so you see only campaigns whose
+owner worktree is this session's; a sibling orchestrator session's campaigns are
+not shown and are not yours to close.)"
 
 if [ -n "$unhandled" ]; then
   msg+="
