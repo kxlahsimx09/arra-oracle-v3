@@ -179,10 +179,11 @@ for f in "$inbox_dir"/*.md; do
   in_scope "$f" || continue          # thread #214: skip sibling-campaign envelopes
   from=$(fm_field "$f" from)
   thr=$(fm_field "$f" thread)
+  pt=$(fm_field "$f" parent_thread)   # campaign key — carried into the breaker escalation (thread #248)
   nr=$(fm_field "$f" needs_response)
   po=$(fm_field "$f" parent_oracle)
   reply_to=${po:-$from}
-  unhandled+="  • $bn"$'\n'"      from=$from thread=${thr:-none} needs_response=${nr:-false} → reply to for-${reply_to}/"$'\n'
+  unhandled+="  • $bn"$'\n'"      from=$from thread=${thr:-none} parent_thread=${pt:-none} needs_response=${nr:-false} → reply to for-${reply_to}/"$'\n'
 done
 
 # --- thread status via the Oracle API (mirrors inbox-watcher's thread_status)
@@ -233,6 +234,7 @@ for f in "$inbox_dir"/handled/*/*.md; do
   [ "$mt" -lt "$cutoff" ] && continue
   [ "$(fm_field "$f" needs_response)" = "true" ] || continue
   from=$(fm_field "$f" from); thr=$(fm_field "$f" thread)
+  pt=$(fm_field "$f" parent_thread)   # campaign key — carried into the breaker escalation (thread #248)
   po=$(fm_field "$f" parent_oracle); reply_to=${po:-$from}
   # Loop closed: the reply envelope artifact exists.
   reply_envelope_exists "$reply_to" "$thr" && continue
@@ -242,7 +244,7 @@ for f in "$inbox_dir"/handled/*/*.md; do
   # API unreachable (empty status): degrade to the pre-fix moot escape so a
   # transient outage cannot wedge a session on a legitimately-mooted envelope.
   [ -z "$st" ] && [ -n "$(fm_field "$f" handled_note)" ] && continue
-  reply_gap+="  • handled/$(basename "$(dirname "$f")")/$(basename "$f")"$'\n'"      from=$from thread=${thr:-none} status=${st:-unreachable} → reply to for-${reply_to}/"$'\n'
+  reply_gap+="  • handled/$(basename "$(dirname "$f")")/$(basename "$f")"$'\n'"      from=$from thread=${thr:-none} parent_thread=${pt:-none} status=${st:-unreachable} → reply to for-${reply_to}/"$'\n'
 done
 
 # --- clean? let the session stop ---------------------------------------------
@@ -264,11 +266,24 @@ if [ "$bc" -gt "$MAX_BLOCKS" ]; then
     >>"$HOOK_STATE/escalations.log" 2>/dev/null || true
   # Make the give-up VISIBLE: notify the orchestrator (a silent give-up would
   # re-introduce the exact bug this hook exists to kill).
-  thr=$(printf '%s' "$unhandled$reply_gap" | grep -oE 'thread=[0-9]+' | head -1 | cut -d= -f2)
+  #
+  # thread #248: carry the triggering envelope's parent_thread (the CAMPAIGN)
+  # into this escalation envelope. The inbox-watcher keys an orchestrator wake on
+  # wake_key = parent_thread || thread; without parent_thread it mis-keys on the
+  # sub-thread and ghost-spawns a fresh orchestrator instead of resuming the
+  # campaign owner (observed: thread:232 w/o parent_thread:231 → ghost wt-29).
+  # The leading-space anchor keeps the thread= grep from matching INSIDE the new
+  # `parent_thread=` token in the listings above.
+  # `|| true`: a no-match grep exits non-zero and, under pipefail + the ERR trap,
+  # would exit 0 here and SKIP the notify entirely — losing the escalation for
+  # any envelope without a numeric parent_thread (the common standalone case).
+  thr=$(printf '%s' "$unhandled$reply_gap" | grep -oE '[[:space:]]thread=[0-9]+' | head -1 | cut -d= -f2 || true)
+  pt=$(printf '%s' "$unhandled$reply_gap" | grep -oE 'parent_thread=[0-9]+' | head -1 | cut -d= -f2 || true)
   notify="$INBOX_BASE/for-orchestrator/$(date +%Y-%m-%d_%H-%M)_from-${oracle}${thr:+_thread-$thr}_notify.md"
   if [ -d "$INBOX_BASE/for-orchestrator" ]; then
     { printf -- '---\nfrom: %s\nto: orchestrator\ntype: notify\n' "$oracle"
       [ -n "$thr" ] && printf 'thread: %s\n' "$thr"
+      [ -n "$pt" ] && printf 'parent_thread: %s\nparent_oracle: orchestrator\n' "$pt"
       printf 'subject: loop-closure FAILED — %s could not close its inbox after %s attempts\n' "$oracle" "$MAX_BLOCKS"
       printf 'needs_response: false\npriority: high\ncreated: %s\n---\n\n' "$(date +%Y-%m-%dT%H:%M:%S%z)"
       printf 'The inbox-loop-closure Stop hook blocked %s %s times but the loop is still open.\n\n' "$oracle" "$MAX_BLOCKS"
