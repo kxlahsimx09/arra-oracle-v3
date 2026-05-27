@@ -215,6 +215,9 @@ describe('validateProjectInput (the guard)', () => {
     expect(() => validateProjectInput('github.com/kokarat/mobiz-payment-gateway')).not.toThrow();
     expect(() => validateProjectInput('github.com/soul-brews-studio/arra-oracle-v3')).not.toThrow();
   });
+  it('passes for p2p-hub (registered via baseline — greenfield, no fleet JSON, thread #251)', () => {
+    expect(() => validateProjectInput('github.com/kxlahsimx09/p2p-hub')).not.toThrow();
+  });
   it('rejects cbank-bot typo with bank-bot suggestion', () => {
     expect(() => validateProjectInput('github.com/kokarat/cbank-bot')).toThrow(/Did you mean: github\.com\/kokarat\/bank-bot/);
   });

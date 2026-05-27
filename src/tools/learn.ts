@@ -121,6 +121,11 @@ export const KNOWN_PROJECTS = new Set<string>([
   'github.com/kokarat/mobiz-payment-gateway',
   'github.com/kokarat/bank-bot',
   'github.com/kxlahsimx09/mb_agent_oracle_memory',
+  // Greenfield P2P matching-hub. Registered via baseline (not fleet JSON)
+  // because it hosts no maw agent of its own — learnings about it are filed
+  // by agents based in mb-next-payment-gateway (campaigns #231, #250). When/if
+  // p2p-hub gets its own oracle, a fleet JSON supersedes this entry harmlessly.
+  'github.com/kxlahsimx09/p2p-hub',
 ]);
 
 /**
