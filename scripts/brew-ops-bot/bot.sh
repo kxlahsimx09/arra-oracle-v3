@@ -340,9 +340,19 @@ is_session_alive_for() {
   [ -z "$pane" ] && return 1
   cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null) || return 1
   [ -z "$cmd" ] && return 1
+  # Allow-list of known agent process names. Claude Code reports its CLI
+  # `pane_current_command` as its OWN VERSION STRING (e.g. `2.1.150`,
+  # `2.1.156`) rather than `claude` or `node` — observed live 2026-05-29
+  # across panes %157/%158 (2.1.150), %216 (2.1.156), %0/%20/%4 (2.1.143).
+  # Without the version-pattern arm, the first deploy of this guard treated
+  # 9-of-13 live claude sessions as DEAD and dropped their watcher state.
+  # Be explicit on "dead" (known shells) and permissive elsewhere so a future
+  # Claude Code version bump won't re-trigger this regression.
   case "$cmd" in
     claude*|codex*|node*|bun*) return 0 ;;
-    *) return 1 ;;
+    [0-9]*.[0-9]*.[0-9]*) return 0 ;;     # claude version-string form
+    sh|bash|zsh|fish|tcsh|csh|ksh|dash) return 1 ;;  # known shells = session ended
+    *) return 1 ;;                         # unknown — treat as dead, fail safe
   esac
 }
 
