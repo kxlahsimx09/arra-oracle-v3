@@ -160,6 +160,44 @@ latest_jsonl() {
   ls -t "$dir"/*.jsonl 2>/dev/null | head -1
 }
 
+# Deterministic resolution of the JSONL for the claude session running in
+# $PANE — fixes the "two oracles in same cwd → wrong sibling's JSONL"
+# collision (#114 single-owner lock prevented the double-relay symptom but
+# locked the loser out forever instead of giving it its own JSONL).
+#
+# Mechanism: claude 2.x writes a per-process mapping file at
+#   ~/.claude/sessions/<pid>.json   (keyed by claude's own PID)
+# whose `sessionId` field is the basename of THIS session's JSONL in $dir.
+# We BFS the pane's foreground-process tree (root_pid + descendants),
+# stop at the first PID that owns a sessions/<pid>.json, read its
+# sessionId, and return `$dir/<sessionId>.jsonl`. Returns 1 (empty
+# stdout) if the mapping can't be resolved — caller decides between
+# waiting and the legacy `latest_jsonl` fallback.
+resolve_pane_jsonl() {
+  local pane="$1" dir="$2" root_pid sid pid kid
+  root_pid=$(tmux display-message -p -t "$pane" "#{pane_pid}" 2>/dev/null)
+  [ -z "$root_pid" ] && return 1
+  local -a queue=("$root_pid")
+  local seen=" $root_pid "
+  while [ "${#queue[@]}" -gt 0 ]; do
+    pid="${queue[0]}"
+    queue=("${queue[@]:1}")
+    if [ -f "$HOME/.claude/sessions/$pid.json" ]; then
+      sid=$(jq -r '.sessionId // empty' "$HOME/.claude/sessions/$pid.json" 2>/dev/null)
+      if [ -n "$sid" ]; then
+        echo "$dir/$sid.jsonl"
+        return 0
+      fi
+    fi
+    for kid in $(pgrep -P "$pid" 2>/dev/null); do
+      case "$seen" in *" $kid "*) continue ;; esac
+      seen="$seen$kid "
+      queue+=("$kid")
+    done
+  done
+  return 1
+}
+
 # Extract assistant text content from one JSONL line; "" if not text-bearing.
 extract_text() {
   jq -r 'select(.type == "assistant") |
@@ -177,14 +215,24 @@ trap 'log "shutting down"; release_jsonl; rm -f "$PID_FILE"; exit 0' INT TERM
 
 log "starting (pane=$PANE)"
 
-# Discover JSONL location. Wait up to JSONL_WAIT_SECONDS for it to exist
-# (claude with a large CLAUDE.md can take >30s before its first JSONL write).
+# Discover JSONL location. Wait up to JSONL_WAIT_SECONDS for both the dir
+# (claude with a large CLAUDE.md can take >30s before its first JSONL write)
+# AND the specific session file for THIS pane to appear. Waiting for the
+# pane-specific file matters when sibling oracles share the cwd: picking
+# `latest_jsonl` early would grab the sibling's file and the lock would
+# exit us out permanently (the original orchestrator/oracle bug).
 JSONL_DIR=""
+current_jsonl=""
 jsonl_attempts=$(( JSONL_WAIT_SECONDS / POLL_INTERVAL ))
 [ "$jsonl_attempts" -lt 1 ] && jsonl_attempts=1
 for _ in $(seq 1 "$jsonl_attempts"); do
-  JSONL_DIR=$(resolve_jsonl_dir)
-  [ -n "$JSONL_DIR" ] && [ -d "$JSONL_DIR" ] && break
+  if [ -z "$JSONL_DIR" ] || [ ! -d "$JSONL_DIR" ]; then
+    JSONL_DIR=$(resolve_jsonl_dir)
+  fi
+  if [ -n "$JSONL_DIR" ] && [ -d "$JSONL_DIR" ]; then
+    current_jsonl=$(resolve_pane_jsonl "$PANE" "$JSONL_DIR")
+    [ -n "$current_jsonl" ] && [ -f "$current_jsonl" ] && break
+  fi
   sleep "$POLL_INTERVAL"
 done
 
@@ -195,11 +243,19 @@ if [ -z "$JSONL_DIR" ] || [ ! -d "$JSONL_DIR" ]; then
 fi
 log "JSONL dir: $JSONL_DIR"
 
+# Fallback to legacy newest-in-dir when pane-specific resolution never
+# yielded a real file within the wait window — preserves pre-fix behaviour
+# for non-claude engines (codex) and edge cases where the sessions/<pid>.json
+# mapping isn't available. The single-owner lock still prevents double-relay.
+if [ -z "$current_jsonl" ] || [ ! -f "$current_jsonl" ]; then
+  current_jsonl=$(latest_jsonl "$JSONL_DIR")
+  [ -n "$current_jsonl" ] && log "pane-specific JSONL unresolved within ${JSONL_WAIT_SECONDS}s — fell back to legacy newest-in-dir: $current_jsonl"
+fi
+
 # Prime: prefer persistent state if it points to the current JSONL — this
 # resumes after bot restart without losing claude responses that landed
 # between shutdown and startup. Else fall back to current EOL (first run
 # of this chat — don't replay full history).
-current_jsonl=$(latest_jsonl "$JSONL_DIR")
 # Acquire single-owner lock on the resolved JSONL. If another live watcher
 # already owns it (same-cwd collision), exit before we duplicate every relay.
 if [ -n "$current_jsonl" ] && ! claim_jsonl "$current_jsonl"; then
@@ -236,13 +292,14 @@ while true; do
     break
   fi
 
-  # Detect rotation: claude may start a new session file (e.g. on /clear).
-  newest=$(latest_jsonl "$JSONL_DIR")
-  if [ -z "$newest" ]; then
-    sleep "$POLL_INTERVAL"; continue
-  fi
-  if [ "$newest" != "$current_jsonl" ]; then
-    log "JSONL rotated: $current_jsonl → $newest"
+  # Detect rotation: claude may start a new session file (e.g. on /clear)
+  # which updates THIS pane's sessions/<pid>.json with a new sessionId.
+  # Pane-aware lookup keeps sibling oracles creating new sessions in the
+  # same cwd from triggering a false rotation here (the legacy
+  # `latest_jsonl` would have flapped to the sibling's file).
+  newest=$(resolve_pane_jsonl "$PANE" "$JSONL_DIR")
+  if [ -n "$newest" ] && [ "$newest" != "$current_jsonl" ]; then
+    log "JSONL rotated: ${current_jsonl:-(none)} → $newest"
     current_jsonl="$newest"
     last_line_count=0
     # Re-acquire the lock for the rotated file. Release the old one first so a
@@ -254,6 +311,12 @@ while true; do
       rm -f "$PID_FILE"
       break
     fi
+  fi
+  # Nothing to tail yet (cold start, mapping not readable, or file not
+  # written) — keep waiting; the rotation block above will pick it up the
+  # moment pane-aware resolution + file existence both succeed.
+  if [ -z "$current_jsonl" ] || [ ! -f "$current_jsonl" ]; then
+    sleep "$POLL_INTERVAL"; continue
   fi
 
   cur_count=$(wc -l < "$current_jsonl" 2>/dev/null | tr -d ' ')
