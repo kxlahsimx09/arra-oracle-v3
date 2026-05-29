@@ -49,6 +49,31 @@ PID_FILE=$STATE_DIR/watch.$SAFE.pid
 # prior shutdown and this startup. Format: <jsonl_path>|<line_count>
 LINE_STATE_FILE=$STATE_DIR/last-line.$SAFE
 
+# Single-owner lock per resolved JSONL path. Two chats whose panes share a cwd
+# (e.g. `maw wake` placed a second oracle into an existing oracle's worktree)
+# resolve to the SAME JSONL and would otherwise both relay every assistant turn
+# — the user sees every message twice with two different chat tags. The lock
+# file holds the PID of the watcher that owns this JSONL; rivals see it, find
+# the owner alive, and exit cleanly. Filed by thread #260 with reproduction.
+CLAIMED_LOCK=""
+jsonl_lock_for(){ echo "$STATE_DIR/jsonl-owner.$(printf '%s' "$1"|shasum 2>/dev/null|cut -c1-16)"; }
+claim_jsonl(){
+  local jf="$1" lock owner
+  [ -z "$jf" ] && return 0
+  lock=$(jsonl_lock_for "$jf")
+  if [ -f "$lock" ]; then
+    owner=$(cat "$lock" 2>/dev/null)
+    [ -n "$owner" ] && [ "$owner" != "$$" ] && kill -0 "$owner" 2>/dev/null && return 1
+  fi
+  echo "$$" >"$lock"
+  CLAIMED_LOCK="$lock"
+  return 0
+}
+release_jsonl(){
+  [ -n "$CLAIMED_LOCK" ] && rm -f "$CLAIMED_LOCK"
+  CLAIMED_LOCK=""
+}
+
 POLL_INTERVAL=${POLL_INTERVAL:-2}
 JSONL_WAIT_SECONDS=${JSONL_WAIT_SECONDS:-480}
 # Idle-prompt alert: JSONL quiet this long + pane shows claude's TUI
@@ -148,7 +173,7 @@ extract_text() {
 
 # write own pid for cmd_end / cmd_close to find
 echo $$ > "$PID_FILE"
-trap 'log "shutting down"; rm -f "$PID_FILE"; exit 0' INT TERM
+trap 'log "shutting down"; release_jsonl; rm -f "$PID_FILE"; exit 0' INT TERM
 
 log "starting (pane=$PANE)"
 
@@ -175,6 +200,13 @@ log "JSONL dir: $JSONL_DIR"
 # between shutdown and startup. Else fall back to current EOL (first run
 # of this chat — don't replay full history).
 current_jsonl=$(latest_jsonl "$JSONL_DIR")
+# Acquire single-owner lock on the resolved JSONL. If another live watcher
+# already owns it (same-cwd collision), exit before we duplicate every relay.
+if [ -n "$current_jsonl" ] && ! claim_jsonl "$current_jsonl"; then
+  log "JSONL $current_jsonl already owned by a live watcher — exiting (avoid double-relay)"
+  rm -f "$PID_FILE"
+  exit 0
+fi
 last_line_count=0
 if [ -n "$current_jsonl" ]; then
   if [ -s "$LINE_STATE_FILE" ]; then
@@ -213,6 +245,15 @@ while true; do
     log "JSONL rotated: $current_jsonl → $newest"
     current_jsonl="$newest"
     last_line_count=0
+    # Re-acquire the lock for the rotated file. Release the old one first so a
+    # successor can pick it up, then try to claim the new one. If a peer already
+    # owns the new JSONL, exit — the same-cwd-double-relay guard applies here too.
+    release_jsonl
+    if ! claim_jsonl "$current_jsonl"; then
+      log "rotated JSONL $current_jsonl owned by another watcher — exiting"
+      rm -f "$PID_FILE"
+      break
+    fi
   fi
 
   cur_count=$(wc -l < "$current_jsonl" 2>/dev/null | tr -d ' ')
