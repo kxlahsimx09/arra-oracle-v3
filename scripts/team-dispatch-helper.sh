@@ -117,8 +117,13 @@ maw team create "$CAMPAIGN" >/dev/null 2>&1 || true
 spawn_out=$(maw team spawn "$CAMPAIGN" "$ROLE" --model "$MODEL" --prompt "$PROMPT" 2>&1) \
   || die "maw team spawn failed:
 $spawn_out"
-# The team plugin prints `  Run: <claude cmd>` when --exec is omitted.
-CMD=$(printf '%s\n' "$spawn_out" | sed -n 's/^  Run: //p' | head -1)
+# The team plugin prints `  Run: <claude cmd>` when --exec is omitted, with ANSI
+# color escapes around `Run:` (cyan). Strip CSI sequences before parsing — the
+# raw bytes are `\033[36mRun:\033[0m`, which a literal `^  Run:` regex misses
+# entirely. Found 2026-05-29 (thread #257; orchestrator's diagnosis attributed
+# this to maw-js's missing `./oracle-members` import — that is a separate bug
+# in `members`/`delete`, not in `spawn`).
+CMD=$(printf '%s\n' "$spawn_out" | LC_ALL=C sed $'s/\x1b\\[[0-9;]*m//g' | sed -n 's/^  Run: //p' | head -1)
 [ -n "$CMD" ] || die "could not extract claude cmd from spawn output:
 $spawn_out"
 

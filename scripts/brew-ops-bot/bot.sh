@@ -348,6 +348,38 @@ recover_watchers() {
   done <<< "$(all_roles)"
 }
 
+# Kill chat-watcher processes whose tmux pane no longer exists. The bot's
+# cmd_close path already reaps synchronously via stop_watcher_for; this is
+# the safety net for orphans created by mass cleanup that bypasses cmd_close
+# (e.g. `tmux kill-window` run by hand). Observed 2026-05-29 fleet cleanup
+# (thread #257 P2): 39 watchers / 14 live windows → ~25 transient orphans
+# that only self-exited after their next poll cycle noticed the dead pane.
+# Called periodically alongside recover_watchers + once at the tail of
+# cmd_close_all so the same sweep that closes also reaps.
+reap_orphan_watchers() {
+  local live_panes pid cmd pane chat reaped=0
+  live_panes=$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null | tr '\n' ' ')
+  # If we can't enumerate panes (no tmux), don't blindly kill — bail.
+  [ -z "$live_panes" ] && return 0
+  while IFS= read -r pid; do
+    [ -z "$pid" ] && continue
+    cmd=$(ps -p "$pid" -o command= 2>/dev/null) || continue
+    # chat-watcher.sh invocation: `bash <path>/chat-watcher.sh %<id> <role>/<slug>`
+    pane=$(printf '%s' "$cmd" | awk '{print $3}')
+    chat=$(printf '%s' "$cmd" | awk '{print $4}')
+    # Guard against malformed lines — pane must look like a tmux pane id.
+    case "$pane" in '%'[0-9]*) ;; *) continue ;; esac
+    if [[ " $live_panes " != *" $pane "* ]]; then
+      log "reap_orphan_watchers: chat=$chat pid=$pid pane=$pane → pane gone, killing"
+      kill "$pid" 2>/dev/null
+      [ -n "$chat" ] && rm -f "$(watch_pid_file "$chat")" 2>/dev/null
+      reaped=$((reaped + 1))
+    fi
+  done < <(pgrep -f "chat-watcher.sh" 2>/dev/null)
+  [ "$reaped" -gt 0 ] && log "reap_orphan_watchers: reaped $reaped orphan(s)"
+  return 0
+}
+
 # Role registry lookups
 role_session() {
   local role="$1" line
@@ -1094,6 +1126,7 @@ cmd_close_all() {
 
   sweep_orphan_worktrees
   sweep_orphan_aliases
+  reap_orphan_watchers   # final pass: any pane killed out-of-band mid-loop
 
   local summary="✅ <b>/close all${mode:+ $mode}</b> — closed: <b>$closed</b>"
   [ -n "$kept" ] && summary+="
@@ -1839,6 +1872,7 @@ main() {
     # exceeded JSONL_WAIT_SECONDS) is picked back up without a bot restart.
     if [ "${WATCHER_RECOVER_INTERVAL:-0}" -gt 0 ] && \
        [ "$(( $(date +%s) - last_recover ))" -ge "$WATCHER_RECOVER_INTERVAL" ]; then
+      reap_orphan_watchers   # reap before respawn so we don't double-spawn live ones
       recover_watchers
       last_recover=$(date +%s)
     fi
