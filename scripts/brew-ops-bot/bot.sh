@@ -328,14 +328,57 @@ start_watcher_for() {
   return 0
 }
 
+# Returns 0 if the pane exists AND currently runs the claude/codex CLI (or its
+# `node`/`bun` host). Returns 1 if the pane has reverted to a shell after the
+# agent exited, or if the pane no longer exists at all. Used to gate watcher
+# (re)spawn — once the agent process is gone, the watcher has no JSONL to tail
+# and would just timeout + exit + respawn forever (observed 2026-05-29: chat
+# `orchestrator/arra-oracle-v3.wt-c-macosmigrate` respawned 6× over ~60min on
+# a pane that had reverted to zsh after the campaign ended).
+is_session_alive_for() {
+  local pane="$1" cmd
+  [ -z "$pane" ] && return 1
+  cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null) || return 1
+  [ -z "$cmd" ] && return 1
+  case "$cmd" in
+    claude*|codex*|node*|bun*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Tear down the bot's tracking of a chat whose pane has reverted to a shell.
+# Does NOT kill the pane — the user may want the zsh prompt there. Drops the
+# watcher (idempotent), aliases, runtime env, and clears the active-chat marker
+# if it pointed here. Worktree sweep is intentionally NOT called per-chat —
+# sweep_orphan_worktrees is heavier and is already invoked at the end of
+# cmd_close_all when the user explicitly mass-closes.
+cleanup_dead_chat() {
+  local chat="$1"
+  [ -z "$chat" ] && return
+  stop_watcher_for "$chat"
+  remove_aliases_for_chat "$chat" 2>/dev/null || true
+  remove_runtime_for_chat "$chat" 2>/dev/null || true
+  local af; af=$(active_chat_file "$CHAT")
+  [ -s "$af" ] && [ "$(cat "$af" 2>/dev/null)" = "$chat" ] && rm -f "$af"
+}
+
 # Boot recovery: scan all live chats and spawn watchers that aren't running.
 # Called once on bot startup so chats survive a bot restart with auto-push intact.
+# Periodically called from the main loop alongside reap_orphan_watchers.
 recover_watchers() {
   local role
   while IFS= read -r role; do
     while IFS='|' read -r pane sess win cmd slug; do
       [ -z "$pane" ] && continue
       local chat="$role/$slug" engine
+      # Session-alive guard: if the pane has reverted to a shell, the agent
+      # exited (or the user `/exit`'d after a campaign). Stop respawning a
+      # watcher that can never find a JSONL — clean up bot state instead.
+      if ! is_session_alive_for "$pane"; then
+        log "recover_watchers: $chat — pane $pane no longer running an agent (cleaning up)"
+        cleanup_dead_chat "$chat"
+        continue
+      fi
       local pf; pf=$(watch_pid_file "$chat")
       if [ -f "$pf" ] && kill -0 "$(cat "$pf" 2>/dev/null)" 2>/dev/null; then
         continue  # already running
