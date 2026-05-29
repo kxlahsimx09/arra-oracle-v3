@@ -341,7 +341,14 @@ is_session_alive_for() {
   cmd=$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null) || return 1
   [ -z "$cmd" ] && return 1
   case "$cmd" in
-    claude*|codex*|node*|bun*) return 0 ;;
+    # claude's pane_current_command reports as the version string (e.g.
+    # `2.1.150`, `2.1.156`) on this fleet, not the literal `claude` — `2.*`
+    # matches that. Mirrors the existing is_claude pattern. Without this,
+    # every live claude pane falls through to the catch-all "no longer
+    # running" branch and recover_watchers wrongly cleanup_dead_chat's the
+    # whole fleet (observed 2026-05-29 18:49:18: all 15 live oracle/wt
+    # panes flagged "no longer running an agent" in one sweep).
+    2.*|claude*|codex*|node*|bun*) return 0 ;;
     *) return 1 ;;
   esac
 }
