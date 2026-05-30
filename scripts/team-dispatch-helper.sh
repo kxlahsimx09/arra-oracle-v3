@@ -127,15 +127,26 @@ CMD=$(printf '%s\n' "$spawn_out" | LC_ALL=C sed $'s/\x1b\\[[0-9;]*m//g' | sed -n
 [ -n "$CMD" ] || die "could not extract claude cmd from spawn output:
 $spawn_out"
 
-# --- 6. tmux split with cwd = worktree ---
-PANE=$(tmux split-window -h -c "$WT_PATH" -P -F '#{pane_id}' "$CMD") \
-  || die "tmux split-window failed"
-ok "spawned in pane $PANE (cwd: $WT_PATH)"
+# --- 6. tmux new-window with cwd = worktree ---
+# CRITICAL: a separate window, NOT split-window. The orchestrator-guard hook
+# self-gates on tmux window_name matching `orchestrator-*`. A teammate spawned
+# as a split-pane inside the orchestrator's own window inherits that window_name,
+# so its Edit/Write gets BLOCKED — the guard mistakes the teammate for the
+# orchestrator and the agent cannot do the very work it was dispatched to do.
+# A dedicated window named `<role>-<campaign>` keeps the guard a no-op for the
+# teammate, so it edits code/docs normally without bypassing the guard.
+# (Confirmed 2026-05-30: split-pane in `orchestrator-o1` → guard exit 2;
+#  separate window `next-writer-<slug>` → guard exit 0.)
+WINDOW_NAME="${ROLE}-${CAMPAIGN}"
+PANE=$(tmux new-window ${GROUP:+-t "$GROUP:"} -n "$WINDOW_NAME" -c "$WT_PATH" -P -F '#{pane_id}' "$CMD") \
+  || die "tmux new-window failed"
+ok "spawned in window '$WINDOW_NAME' pane $PANE (cwd: $WT_PATH)"
 
 # --- 7. summary ---
 cat <<EOF
 
 agent dispatched:
+  window   : $WINDOW_NAME
   pane     : $PANE
   campaign : $CAMPAIGN
   role     : $ROLE
