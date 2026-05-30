@@ -31,7 +31,7 @@
 #       --role     <role>          target agent role (brew-ops, pg-writer, …)
 #       --repo     <gh-path>       github.com/<owner>/<repo>
 #       --prompt   "<text>"        task body for the agent
-#       [--model   <model>]        default: sonnet
+#       [--model   <model>]        default: opus (resolves to opus 4.8)
 #       [--dry-run]                print actions, change nothing
 #
 # Owner: brew-ops. Source of truth: this file. Paired with
@@ -44,7 +44,7 @@ say() { printf '  %s\n' "$*"; }
 ok()  { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 
 # --- args ---
-CAMPAIGN=""; ROLE=""; REPO=""; PROMPT=""; MODEL="sonnet"; DRY_RUN=""
+CAMPAIGN=""; ROLE=""; REPO=""; PROMPT=""; MODEL="opus"; DRY_RUN=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --campaign) CAMPAIGN=${2:-}; shift 2 ;;
