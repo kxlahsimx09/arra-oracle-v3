@@ -68,14 +68,36 @@ If Ollama model changed or the vector index seems stale, run a full reindex:
 
 ```bash
 cd ~/Code/github.com/Soul-Brews-Studio/arra-oracle-v3
-ORACLE_DATA_DIR=~/.arra-oracle-v2 bun run reindex:full
+ORACLE_REPO_ROOT=~/Code/github.com/kxlahsimx09/mb_agent_oracle_memory \
+  ORACLE_DATA_DIR=~/.arra-oracle-v2 bun run reindex:full
 ```
 
+> **⚠️ Set `ORACLE_REPO_ROOT` to the vault repo, not the data dir.** Learnings
+> are stored **project-first** — most live under
+> `mb_agent_oracle_memory/github.com/<owner>/<repo>/ψ/memory/learnings/`, not in
+> the central `ψ/`. The indexer's `discoverProjectPsiDirs()` only finds them if
+> `ORACLE_REPO_ROOT` points at the repo root that has the `github.com/` tree
+> beside `ψ/`. If you let it default to `~/.arra-oracle-v2` (which only holds the
+> `ψ` symlink, no sibling `github.com/`), it silently indexes **only the ~98
+> central learnings and drops ~860 per-repo ones**. Also run from a checkout that
+> has the `_universal/ψ` discovery fix (commit `78933e3` or later) so the
+> `_universal` bucket isn't skipped too.
+
 `reindex:full` runs `src/indexer/cli.ts` then `src/scripts/index-model.ts bge-m3`.
-This can take several minutes on a large vault. Verify with:
+The vector step embeds every doc via Ollama `bge-m3` (~0.8 doc/s → ~80 min for a
+~4,300-doc vault). It calls `deleteCollection()` first, so **back up
+`lancedb/oracle_knowledge_bge_m3.lance/` before running** if you need search to
+stay available during the rebuild. Never run two `index-model.ts` at once —
+concurrent LanceDB writers corrupt the collection. Verify with:
 
 ```bash
-curl -s http://localhost:47778/api/stats | jq '{docs: .total, vectors: .vectors}'
+# total docs + per-model vector counts (bge-m3 should match total)
+curl -s http://localhost:47778/api/stats \
+  | jq '{docs: .total, bge_m3: (.vectors[] | select(.key=="bge-m3") | .count)}'
+
+# per-type breakdown — learning count should be in the ~950+ file range,
+# NOT ~98. A learning count near 98 means the repoRoot trap above bit you.
+curl -s http://localhost:47778/api/stats | jq '.by_type_files'
 ```
 
 ---
