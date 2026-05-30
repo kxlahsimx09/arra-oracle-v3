@@ -61,13 +61,15 @@ Register oracle MCP in `~/.claude.json` if not already copied from old server:
   "mcpServers": {
     "arra-oracle-v3": {
       "command": "bun",
-      "args": ["run", "/Users/dev01/Code/github.com/Soul-Brews-Studio/arra-oracle-v3/src/index.ts"]
+      "args": ["run", "<HOME>/Code/github.com/Soul-Brews-Studio/arra-oracle-v3/src/index.ts"]
     }
   }
 }
 ```
 
-> **Path note:** replace `/Users/dev01` with your actual `$HOME` if different.
+> **Use a literal absolute path.** Replace `<HOME>` with your actual home
+> (`echo $HOME`, e.g. `/Users/admin`). MCP config loaders do **not** expand
+> `$HOME`/`~`, so a tilde or env var here silently fails to resolve.
 
 In a Claude Code session, verify:
 ```
