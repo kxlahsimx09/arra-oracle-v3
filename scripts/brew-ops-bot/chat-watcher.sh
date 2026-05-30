@@ -217,40 +217,23 @@ extract_text() {
 
 # Classify one JSONL line for keepalive filtering (agent-teams):
 #   "ping" — a user turn that is an agent-teams idle/keepalive notification
-#            (content carries `idle_notification`). These poll the teammate when
-#            it has no work; the teammate answers with a throwaway status turn
-#            ("Idle.", "Standing by.", "รออยู่", …).
+#            (content carries `idle_notification`). Polls the teammate when it
+#            has no work; the teammate answers with throwaway status turns
+#            ("Idle.", "Standing by.", "รออยู่", … — any words, possibly several
+#            assistant turns per single ping).
+#   "user" — a REAL user turn (a genuine task / teammate-message with content,
+#            NOT an idle_notification). This is the signal that work resumed.
 #   "asst" — an assistant turn (candidate to push)
-#   ""     — anything else (system, user task, etc.)
-# Structural, NOT word-based: we suppress the ANSWER to a ping by keying on the
-# trigger, not the reply — so whatever word the agent picks gets filtered. A
-# teammate-message with real content (not idle_notification) is not a ping, so
-# genuine cross-agent replies still push.
+#   ""     — anything else (system, attachments, settings, etc.)
+# Structural, NOT word-based: once a ping is seen we enter "idle mode" and drop
+# EVERY assistant turn (an idle ping can draw 2–3 "Idle." turns) until a real
+# user turn proves work resumed. We key on the trigger, never the words.
 classify_line() {
   jq -r '
     if .type == "user"
        and ((.message.content // "") | tostring | test("idle_notification"))
     then "ping"
-    elif .type == "assistant" then "asst"
-    else "" end' 2>/dev/null
-}
-
-# Classify one JSONL line for keepalive filtering (agent-teams):
-#   "ping"  — a user turn that is an agent-teams idle/keepalive notification
-#             (content carries an `idle_notification` teammate-message). These
-#             poll the teammate when it has no work; the teammate answers with a
-#             throwaway status turn ("Idle.", "Standing by.", "รออยู่", …).
-#   "asst"  — an assistant turn (candidate to push)
-#   ""      — anything else (system, user task, etc.)
-# Structural, not word-based: we suppress the ANSWER to a ping regardless of
-# what words the agent chose, by keying on the trigger, not the reply. A real
-# teammate-message that carries actual content (not idle_notification) is NOT a
-# ping, so genuine cross-agent messages still get their reply pushed.
-classify_line() {
-  jq -r '
-    if .type == "user"
-       and ((.message.content // "") | tostring | test("idle_notification"))
-    then "ping"
+    elif .type == "user" then "user"
     elif .type == "assistant" then "asst"
     else "" end' 2>/dev/null
 }
@@ -378,14 +361,19 @@ while true; do
         # carries across lines via $KEEPALIVE_STATE (the subshell from the pipe
         # can't mutate parent vars, so we persist the flag to a file).
         kind=$(echo "$line" | classify_line)
-        if [ "$kind" = "ping" ]; then
-          echo 1 > "$KEEPALIVE_STATE"; continue
-        fi
+        # Idle-mode latch: a ping turns it ON; a REAL user turn (work resumed)
+        # turns it OFF. While ON, drop EVERY assistant turn — a single idle ping
+        # can draw several "Idle." replies, so clearing on the first reply (the
+        # earlier bug) let the 2nd/3rd leak. Only a genuine user turn re-opens
+        # the push gate.
+        case "$kind" in
+          ping) echo 1 > "$KEEPALIVE_STATE"; continue ;;
+          user) : > "$KEEPALIVE_STATE" ;;   # real work resumed — re-open gate
+        esac
         local_text=$(echo "$line" | extract_text)
         [ -z "$local_text" ] && continue
         if [ "$kind" = "asst" ] && [ "$(cat "$KEEPALIVE_STATE" 2>/dev/null)" = "1" ]; then
-          : > "$KEEPALIVE_STATE"   # clear; this assistant turn answered a ping
-          log "suppressed keepalive reply (${#local_text} chars): ${local_text:0:40}"
+          log "suppressed idle-mode assistant turn (${#local_text} chars): ${local_text:0:40}"
           continue
         fi
         push_turn "$local_text" "$CHAT_ID"
