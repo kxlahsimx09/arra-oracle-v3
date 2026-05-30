@@ -9,12 +9,19 @@
 #      within the same (campaign, repo) — see AGENTS.md §8b (locked 2026-05-29).
 #   3. Inject the .agent + .secrets symlinks the worktree needs (per §3a/§3b).
 #   4. `maw team create <slug>` (idempotent) + `maw team spawn <slug> <role>
-#      --model sonnet --prompt …` WITHOUT --exec — captures the claude command
-#      so we can split the tmux pane ourselves with `-c <wt>` (the team plugin's
-#      spawnTeammatePane has no cwd flag yet, layout-manager.ts L119; this
-#      wrapper closes that gap without patching maw-js).
-#   5. `tmux split-window -c <wt-path>` in the orchestrator's current window →
-#      the agent runs in its own pane, in its own worktree, cwd-correct.
+#      --model opus` (NO --prompt — see Step 5 note) WITHOUT --exec — captures
+#      the claude command so we can launch it ourselves with `-c <wt>` (the team
+#      plugin's spawnTeammatePane has no cwd flag yet, layout-manager.ts L119;
+#      this wrapper closes that gap without patching maw-js).
+#   5. `tmux new-window -c <wt-path>` (its OWN window, not a split-pane in the
+#      orchestrator's window — else the orchestrator-guard hook blocks the
+#      teammate's edits; see Step 6). The agent runs in its own window/worktree,
+#      cwd-correct, on opus 4.8.
+#   6.5 Deliver the task ($PROMPT) as the FIRST USER TURN via send-keys after the
+#      TUI is ready. The task must NOT go through --prompt: the team plugin folds
+#      --prompt into the system prompt, which makes the task background persona,
+#      not an actionable turn — the agent then idles into its role's standing
+#      agenda (observed 2026-05-30, gapqwin). System prompt = role identity only.
 #
 # Why this replaces the watcher dispatch path:
 #   • the watcher's silent-fail modes (delivered_to_owner ≠ delivered,
@@ -114,7 +121,14 @@ fi
 maw team create "$CAMPAIGN" >/dev/null 2>&1 || true
 
 # --- 5. capture spawn cmd (without --exec; we want to set cwd on the split) ---
-spawn_out=$(maw team spawn "$CAMPAIGN" "$ROLE" --model "$MODEL" --prompt "$PROMPT" 2>&1) \
+# NOTE: we do NOT pass --prompt here. The team plugin folds --prompt into the
+# --system-prompt-file (role identity), NOT a user turn — so a spawned claude
+# wakes with the task as "background persona" but no message to act on, and
+# drifts into its role's standing agenda instead (observed 2026-05-30, campaign
+# gapqwin: next-writer ran CF-gateway pointers instead of the dispatched task).
+# Fix: system prompt = role identity only (maw still writes "You are '<role>'…");
+# the task ($PROMPT) is delivered as the FIRST USER TURN in Step 6.5 below.
+spawn_out=$(maw team spawn "$CAMPAIGN" "$ROLE" --model "$MODEL" 2>&1) \
   || die "maw team spawn failed:
 $spawn_out"
 # The team plugin prints `  Run: <claude cmd>` when --exec is omitted, with ANSI
@@ -141,6 +155,36 @@ WINDOW_NAME="${ROLE}-${CAMPAIGN}"
 PANE=$(tmux new-window ${GROUP:+-t "$GROUP:"} -n "$WINDOW_NAME" -c "$WT_PATH" -P -F '#{pane_id}' "$CMD") \
   || die "tmux new-window failed"
 ok "spawned in window '$WINDOW_NAME' pane $PANE (cwd: $WT_PATH)"
+
+# --- 6.5. deliver the task as the FIRST USER TURN ---------------------------
+# The spawned claude has the role identity in its system prompt but no message
+# to act on yet. Send the dispatch contract ($PROMPT) as the kickoff turn so it
+# starts working instead of idling into its role's standing agenda.
+#
+# Two hard-won details:
+#  1. Wait for the TUI to be ready before send-keys — a fresh `claude` takes a
+#     few seconds to boot; keystrokes sent before the input box exists are lost.
+#     We poll capture-pane for the input affordance, with a timeout fallback.
+#  2. Bracketed-paste safety: send the text as one `-l` literal, sleep, THEN
+#     Enter as a SEPARATE send-keys. Text+Enter in one call lets the TUI's
+#     bracketed-paste swallow the newline → the line never submits (this was the
+#     22-minute stall on the first gapqwin spawn). Mirrors inbox-watcher.sh.
+KICKOFF_READY_TIMEOUT=${KICKOFF_READY_TIMEOUT:-45}
+KICKOFF_ENTER_DELAY=${KICKOFF_ENTER_DELAY:-1}
+ready=0
+for _ in $(seq 1 "$KICKOFF_READY_TIMEOUT"); do
+  # claude's input box / hint line appears when it's ready for a turn
+  if tmux capture-pane -t "$PANE" -p 2>/dev/null \
+       | grep -qiE 'shortcuts|│ >|╰|Try ".*"'; then
+    ready=1; break
+  fi
+  sleep 1
+done
+[ "$ready" = "1" ] || say "⚠ TUI readiness not detected after ${KICKOFF_READY_TIMEOUT}s — sending kickoff anyway"
+tmux send-keys -t "$PANE" -l -- "$PROMPT"
+sleep "$KICKOFF_ENTER_DELAY"
+tmux send-keys -t "$PANE" Enter
+ok "kickoff turn delivered ($([ "$ready" = 1 ] && echo 'TUI ready' || echo 'timeout fallback'))"
 
 # --- 7. summary ---
 cat <<EOF
