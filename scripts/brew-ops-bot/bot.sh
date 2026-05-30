@@ -23,6 +23,7 @@ CHAT=${BREW_OPS_BOT_CHAT:-}
 STATE_DIR=${STATE_DIR:-$HOME/.cache/brew-ops-bot}
 mkdir -p "$STATE_DIR"
 LOG_FILE=${LOG_FILE:-$STATE_DIR/bot.log}
+PID_FILE=${PID_FILE:-$STATE_DIR/bot.pid}
 AUDIT_FILE=$STATE_DIR/audit.log
 LAST_UPDATE_ID_FILE=$STATE_DIR/last-update-id
 ACTIVE_CHAT_FILE_PREFIX=$STATE_DIR/active-chat
@@ -1906,6 +1907,25 @@ dispatch() {
   esac
 }
 
+# Find other live supervisors of THIS script (singleton guard). Keys on
+# parent-dir + basename ("brew-ops-bot/bot.sh") so we never cross-kill
+# orchestrator-bot. Children of the current process (curl getUpdates,
+# subshells) are excluded via the PPID guard — they share the script name
+# but are not supervisors.
+find_other_daemons() {
+  local key
+  key=$(basename "$(dirname "$0")")/$(basename "$0")
+  local p ppid cmd out=""
+  for p in $(pgrep -f "$key" 2>/dev/null); do
+    [ "$p" = "$$" ] && continue
+    ppid=$(ps -p "$p" -o ppid= 2>/dev/null | tr -d ' ')
+    [ "$ppid" = "$$" ] && continue   # skip own subprocesses
+    cmd=$(ps -p "$p" -o command= 2>/dev/null)
+    case "$cmd" in *"$key"*) out="$out $p" ;; esac
+  done
+  echo "${out# }"
+}
+
 # ── main ───────────────────────────────────────────────────────────────────
 
 main() {
@@ -1965,4 +1985,61 @@ main() {
   done
 }
 
-main
+case "${1:-loop}" in
+  loop|start)
+    others=$(find_other_daemons)
+    if [ -n "$others" ]; then
+      echo "another $(basename "$0") is already running (pid=$others)" >&2
+      echo "stop it first: $0 stop  (or: kill $others)" >&2
+      exit 1
+    fi
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+      echo "already running: $(cat "$PID_FILE")" >&2
+      exit 1
+    fi
+    echo $$ > "$PID_FILE"
+    trap 'rm -f "$PID_FILE"' EXIT
+    trap 'rm -f "$PID_FILE"; exit 0' INT TERM
+    main
+    ;;
+  stop)
+    others=$(find_other_daemons)
+    [ -f "$PID_FILE" ] && others="$others $(cat "$PID_FILE" 2>/dev/null)"
+    others=$(printf '%s\n' $others | awk 'NF && !seen[$0]++' | tr '\n' ' ')
+    if [ -z "${others// /}" ]; then
+      echo "not running"
+      rm -f "$PID_FILE"
+      exit 0
+    fi
+    for p in $others; do
+      [ -z "$p" ] && continue
+      if kill -TERM "$p" 2>/dev/null; then
+        echo "stopped pid=$p"
+      else
+        echo "kill $p failed (process gone?)" >&2
+      fi
+    done
+    rm -f "$PID_FILE"
+    ;;
+  restart)
+    "$0" stop
+    sleep 1
+    exec "$0" start
+    ;;
+  status)
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+      echo "running: pid=$(cat "$PID_FILE")"
+    else
+      echo "stopped"
+    fi
+    ;;
+  test-send)
+    send_tg "${2:-test from brew-ops-bot}"
+    ;;
+  *)
+    cat <<USAGE >&2
+usage: $0 {loop|start|stop|restart|status|test-send <msg>}
+USAGE
+    exit 2
+    ;;
+esac

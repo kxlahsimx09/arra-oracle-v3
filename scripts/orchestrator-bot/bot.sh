@@ -848,12 +848,17 @@ case ${1:-loop} in
     echo "active thread: $(get_active_thread)"
     echo "known threads: $(wc -l < "$KNOWN_THREADS_FILE" 2>/dev/null || echo 0)"
     ;;
+  restart)
+    "$0" stop
+    sleep 1
+    exec "$0" start
+    ;;
   test-send)
     send_tg "${2:-test from orchestrator-bot}"
     ;;
   *)
     cat <<USAGE >&2
-usage: $0 {loop|start|stop|status|test-send <msg>}
+usage: $0 {loop|start|stop|restart|status|test-send <msg>}
 USAGE
     exit 2
     ;;
