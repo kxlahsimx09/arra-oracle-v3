@@ -1649,12 +1649,15 @@ cmd_ctx() {
     out_tokens=$(printf '%s' "$last_line" | cut -f2)
     model=$(printf '%s' "$last_line" | cut -f3)
     # Context-window tier by model. The fleet launches `claude` with no --model,
-    # so it inherits the account default — opus-4.6/4.7 and sonnet-4.x resolve to
-    # the 1M variant (claude-*[1m]). But the JSONL records the model *without* the
-    # [1m] suffix and carries no window field, so the name alone can't prove 1M —
-    # map known-1M model families here instead of defaulting everything to 200k.
+    # so it inherits the account default — opus-4.6/4.7/4.8 and sonnet-4.x resolve
+    # to the 1M variant. The JSONL usually records the model *without* the [1m]
+    # suffix and carries no window field, so the name alone can't prove 1M — match
+    # an explicit [1m]/-1m tag first, then map known-1M families by name. Anything
+    # unrecognised (e.g. haiku) defaults to the standard 200k window.
     max_ctx=$(printf '%s' "$usage_all" | awk -F'\t' 'BEGIN{m=0} {if($1+0>m) m=$1+0} END{print m+0}')
     case "$model" in
+      *\[1m\]|*-1m)                       ctx_max=1000000 ;;  # explicit 1M beta tag
+      claude-opus-4-8*)                  ctx_max=1000000 ;;  # opus 4.8 → 1M default
       claude-opus-4-7*|claude-opus-4-6*) ctx_max=1000000 ;;
       claude-sonnet-4-*)                 ctx_max=1000000 ;;  # sonnet 1m default
       *)                                 ctx_max=200000 ;;
