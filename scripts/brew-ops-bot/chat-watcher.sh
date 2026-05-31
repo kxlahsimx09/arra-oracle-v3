@@ -161,6 +161,43 @@ push_turn() {
 
 encode_cwd() { echo "$1" | sed 's|/|-|g; s|\.|-|g'; }
 
+# Resolve the owning orchestrator's tmux pane for the teammate in $PANE (§151).
+# Chain: teammate pane_pid → its `claude` proc's --system-prompt-file → that
+# path embeds the orchestrator's worktree (…/<orch-wt>/ψ/memory/mailbox/teams/…)
+# → the tmux pane whose cwd == that worktree. This binds the alert to the
+# orchestrator that ACTUALLY spawned this teammate, so it never misfires across
+# concurrent orchestrators (§181). Empty stdout if it can't be resolved.
+# Used instead of the team leader-inbox: that inbox is not polled by an
+# interactive orchestrator session (verified 2026-05-31 — a message written to
+# inboxes/leader.json stayed read:false and never reached the conversation; the
+# orchestrator monitors teammates via tmux capture-pane, not inbox files).
+resolve_owner_pane() {
+  local tpid spf owt p c
+  tpid=$(tmux display-message -p -t "$PANE" "#{pane_pid}" 2>/dev/null)
+  [ -z "$tpid" ] && return 1
+  # BFS the pane's process subtree for the claude proc carrying --system-prompt-file
+  local -a q=("$tpid"); local seen=" $tpid "
+  while [ "${#q[@]}" -gt 0 ]; do
+    p="${q[0]}"; q=("${q[@]:1}")
+    c=$(ps -o command= -p "$p" 2>/dev/null)
+    case "$c" in
+      *--system-prompt-file*)
+        spf=$(printf '%s' "$c" | grep -oE -- '--system-prompt-file [^ ]+' | awk '{print $2}')
+        break ;;
+    esac
+    local kid
+    for kid in $(pgrep -P "$p" 2>/dev/null); do
+      case "$seen" in *" $kid "*) continue ;; esac
+      seen="$seen$kid "; q+=("$kid")
+    done
+  done
+  [ -z "${spf:-}" ] && return 1
+  owt=${spf%%/ψ/*}                       # orchestrator worktree
+  [ "$owt" = "$spf" ] && return 1        # path didn't contain /ψ/ — bail
+  tmux list-panes -a -F '#{pane_id} #{pane_current_path}' 2>/dev/null \
+    | awk -v w="$owt" '$2==w {print $1; exit}'
+}
+
 # Resolve the pane's current cwd → claude's projects dir for this worktree.
 resolve_jsonl_dir() {
   local cwd
@@ -394,8 +431,24 @@ while true; do
           echo "$ic" > "$IDLE_COUNT_STATE"
           if [ "$ic" -ge "$IDLE_ALERT_THRESHOLD" ] && [ ! -s "$IDLE_ALERTED_STATE" ]; then
             echo 1 > "$IDLE_ALERTED_STATE"
-            send_tg "⏸ <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> idle ×${ic} — teammate looks done (no new work since its last report). Orchestrator: close the campaign (<code>team-dispatch-finish.sh --campaign &lt;slug&gt;</code>) if finished, or send it a task. (notify-only — not auto-closed)"
-            log "idle-alert sent (${ic} consecutive idle replies)"
+            # Notify the OWNING orchestrator directly in its conversation — the
+            # same send-keys channel the kickoff uses, which we know it reads.
+            # We never close the campaign ourselves; the orchestrator decides.
+            slug=${CHAT_ID#*/}
+            alert_msg="⏸ teammate [${CHAT_ID}] looks idle/done — it has answered ${ic} keepalive pings with no new work. If its campaign is finished, close it: team-dispatch-finish.sh --campaign ${slug} — otherwise send it the next task. (auto-detected by chat-watcher; nothing was closed)"
+            owner_pane=$(resolve_owner_pane)
+            if [ -n "$owner_pane" ]; then
+              # Bracketed-paste-safe: literal text via -l, settle, Enter separately.
+              tmux send-keys -t "$owner_pane" -l "$alert_msg" 2>/dev/null
+              sleep 0.4
+              tmux send-keys -t "$owner_pane" Enter 2>/dev/null
+              log "idle-alert → owner pane $owner_pane via send-keys (${ic} idle replies)"
+            else
+              # Owner pane unresolved (orchestrator pane closed / cwd mismatch) —
+              # fall back to Telegram so the alert is never silently dropped.
+              send_tg "⏸ <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> idle ×${ic} — teammate looks done; owner orchestrator pane not resolved. Close via <code>team-dispatch-finish.sh --campaign ${slug}</code> or send it a task. (notify-only — not auto-closed)"
+              log "idle-alert owner pane unresolved → telegram fallback (${ic} idle replies)"
+            fi
           fi
           continue
         fi
