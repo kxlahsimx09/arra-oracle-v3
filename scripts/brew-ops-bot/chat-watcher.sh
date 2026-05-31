@@ -54,6 +54,17 @@ LINE_STATE_FILE=$STATE_DIR/last-line.$SAFE
 # mutate parent shell vars. Reset at startup.
 KEEPALIVE_STATE=$STATE_DIR/keepalive.$SAFE
 : > "$KEEPALIVE_STATE"
+# Idle-run counter + one-shot alert flag. A teammate that finished its work but
+# whose session isn't shut down answers each agent-teams idle ping with a
+# throwaway turn, forever. After IDLE_ALERT_THRESHOLD consecutive idle replies
+# we send ONE Telegram alert so the orchestrator/human can decide whether to
+# close the campaign — we never close it ourselves (the teammate may yet get a
+# follow-up). Both reset when real work resumes. Files (pipe-subshell safe).
+IDLE_COUNT_STATE=$STATE_DIR/idle-count.$SAFE
+IDLE_ALERTED_STATE=$STATE_DIR/idle-alerted.$SAFE
+: > "$IDLE_COUNT_STATE"
+: > "$IDLE_ALERTED_STATE"
+IDLE_ALERT_THRESHOLD=${IDLE_ALERT_THRESHOLD:-10}
 
 # Single-owner lock per resolved JSONL path. Two chats whose panes share a cwd
 # (e.g. `maw wake` placed a second oracle into an existing oracle's worktree)
@@ -368,12 +379,24 @@ while true; do
         # the push gate.
         case "$kind" in
           ping) echo 1 > "$KEEPALIVE_STATE"; continue ;;
-          user) : > "$KEEPALIVE_STATE" ;;   # real work resumed — re-open gate
+          user)  # real work resumed — re-open gate + reset idle tracking
+            : > "$KEEPALIVE_STATE"
+            : > "$IDLE_COUNT_STATE"
+            : > "$IDLE_ALERTED_STATE" ;;
         esac
         local_text=$(echo "$line" | extract_text)
         [ -z "$local_text" ] && continue
         if [ "$kind" = "asst" ] && [ "$(cat "$KEEPALIVE_STATE" 2>/dev/null)" = "1" ]; then
           log "suppressed idle-mode assistant turn (${#local_text} chars): ${local_text:0:40}"
+          # Count consecutive idle replies; one-shot alert at the threshold so the
+          # orchestrator can decide to close (we never close it ourselves).
+          ic=$(( $(cat "$IDLE_COUNT_STATE" 2>/dev/null || echo 0) + 1 ))
+          echo "$ic" > "$IDLE_COUNT_STATE"
+          if [ "$ic" -ge "$IDLE_ALERT_THRESHOLD" ] && [ ! -s "$IDLE_ALERTED_STATE" ]; then
+            echo 1 > "$IDLE_ALERTED_STATE"
+            send_tg "⏸ <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> idle ×${ic} — teammate looks done (no new work since its last report). Orchestrator: close the campaign (<code>team-dispatch-finish.sh --campaign &lt;slug&gt;</code>) if finished, or send it a task. (notify-only — not auto-closed)"
+            log "idle-alert sent (${ic} consecutive idle replies)"
+          fi
           continue
         fi
         push_turn "$local_text" "$CHAT_ID"
