@@ -1,6 +1,6 @@
 # Arra Oracle - MCP Memory Layer
 
-[![CI](https://github.com/Soul-Brews-Studio/arra-oracle-v3/actions/workflows/ci.yml/badge.svg)](https://github.com/Soul-Brews-Studio/arra-oracle-v3/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-BUSL--1.1-blue)](./LICENSE) [![CalVer](https://img.shields.io/badge/calver-v26.4.20--alpha.7-blue)](https://calver.org) [![Bun](https://img.shields.io/badge/runtime-Bun%201.2%2B-f9f1e1)](https://bun.sh)
+[![CI](https://github.com/Soul-Brews-Studio/arra-oracle-v3/actions/workflows/ci.yml/badge.svg)](https://github.com/Soul-Brews-Studio/arra-oracle-v3/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-BUSL--1.1-blue)](./LICENSE) [![CalVer](https://img.shields.io/badge/calver-v26.6.1--alpha.1428-blue)](https://calver.org) [![Bun](https://img.shields.io/badge/runtime-Bun%201.2%2B-f9f1e1)](https://bun.sh)
 
 > "The Oracle Keeps the Human Human" - now queryable via MCP
 
@@ -9,11 +9,11 @@ Phukhao Oracle is landing here: https://phukhao.buildwithoracle.com/presentation
 | | |
 |---|---|
 | **Status** | Always Nightly |
-| **Version** | 26.4.19-alpha.7 |
+| **Version** | 26.6.1-alpha.1428 |
 | **Created** | 2025-12-29 |
-| **Updated** | 2026-04-19 |
+| **Updated** | 2026-06-01 |
 
-TypeScript MCP server for semantic search over Oracle philosophy — SQLite FTS5 + ChromaDB hybrid search, HTTP API, and vault CLI.
+TypeScript MCP server for semantic search over Oracle philosophy — SQLite FTS5 + LanceDB hybrid search, HTTP API, and vault CLI.
 
 See [docs/LOCAL-DEV.md](docs/LOCAL-DEV.md) for local development.
 For Docker MCP Toolkit / Gateway / n8n installs, see [docs/DOCKER-MCP-TOOLKIT.md](docs/DOCKER-MCP-TOOLKIT.md).
@@ -35,7 +35,7 @@ oracle-studio (separate repo)
 **Stack:**
 - **Bun** runtime (>=1.2.0)
 - **SQLite** + FTS5 for full-text search
-- **ChromaDB** for vector/semantic search
+- **LanceDB** for vector/semantic search
 - **Drizzle ORM** for type-safe queries
 - **Hono** for HTTP API
 - **MCP** protocol for Claude integration
@@ -105,18 +105,18 @@ curl -sSL https://raw.githubusercontent.com/Soul-Brews-Studio/arra-oracle-v3/mai
 | Problem | Fix |
 |---------|-----|
 | `bun: command not found` | `export PATH="$HOME/.bun/bin:$PATH"` |
-| ChromaDB hangs/timeout | Skip it — SQLite FTS5 works fine without vectors |
+| LanceDB hangs/timeout | Skip it — SQLite FTS5 works fine without vectors |
 | Server crashes on empty DB | Run `bun run index` first to index knowledge base |
 
 </details>
 
 ## MCP Tools
 
-22 tools available via Claude Code:
+23 tools available via Claude Code:
 
 | Tool | Description |
 |------|-------------|
-| `oracle_search` | Hybrid search (FTS5 + ChromaDB) |
+| `oracle_search` | Hybrid search (FTS5 + LanceDB) |
 | `oracle_reflect` | Random wisdom |
 | `oracle_learn` | Add new patterns |
 | `oracle_list` | Browse documents |
