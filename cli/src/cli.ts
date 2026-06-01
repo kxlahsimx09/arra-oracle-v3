@@ -22,6 +22,8 @@ import {
 } from "./commands/menu-gist.ts";
 import { menuResetAll } from "./commands/menu-reset.ts";
 import { reindex } from "./commands/reindex.ts";
+import { configCommand } from "./commands/config.ts";
+import { stripAtFlag } from "./lib/config.ts";
 
 const pkg = await Bun.file(join(import.meta.dir, "../package.json")).json();
 const VERSION: string = pkg.version;
@@ -33,6 +35,7 @@ function printHelp(commands: Array<{ command: string; help?: string }>) {
   console.log(`  ${"plugin".padEnd(16)}manage plugins (install)`);
   console.log(`  ${"session".padEnd(16)}inspect sessions (list, show, context)`);
   console.log(`  ${"menu".padEnd(16)}inspect and customize studio menu (list, add, remove)`);
+  console.log(`  ${"config".padEnd(16)}show and manage API target config`);
   console.log(`  ${"reindex".padEnd(16)}trigger SQLite/FTS reindex via ORACLE_API`);
   for (const { command, help } of commands) {
     console.log(`  ${command.padEnd(16)}${help ?? ""}`);
@@ -41,6 +44,7 @@ function printHelp(commands: Array<{ command: string; help?: string }>) {
   console.log("  --help, -h        Show this help");
   console.log("  -h <command>      Show command help + flags");
   console.log("  --version         Show version");
+  console.log("  --at <name>       Use a configured API target for this invocation");
 }
 
 function printCommandHelp(plugin: LoadedPlugin) {
@@ -69,7 +73,7 @@ async function loadAll() {
 }
 
 async function main() {
-  const args = process.argv.slice(2);
+  const args = stripAtFlag(process.argv.slice(2));
   const cmd = args[0]?.toLowerCase();
 
   if (cmd === "--version" || cmd === "version") {
@@ -156,6 +160,10 @@ async function main() {
 
   if (cmd === "reindex") {
     process.exit(await reindex(args.slice(1)));
+  }
+
+  if (cmd === "config") {
+    process.exit(await configCommand(args.slice(1)));
   }
 
   if (cmd === "plugin") {
