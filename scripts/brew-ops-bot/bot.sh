@@ -950,6 +950,19 @@ cmd_new() {
   [ -z "$repo" ] && { send_tg "❌ unknown role: $role (ใช้ /roles)"; return; }
   audit "/new $role $slug engine=$engine"
 
+  # Dead-cwd guard. `maw` runs on bun; bun aborts with "The current working
+  # directory was deleted…" if its process inherits a cwd that no longer
+  # exists on disk. That happens when the bot was started from (or a prior
+  # worktree-removal deleted) the directory the bot process sits in — every
+  # `$(maw …)` / `$(git …)` command-substitution inherits that dead cwd and
+  # fails, surfacing as "pane … ไม่ถูกสร้าง". Re-anchor to a directory that is
+  # guaranteed to exist before any git/maw call. `git -C` uses absolute paths
+  # so this only needs to make getcwd() succeed, not point anywhere specific.
+  if ! pwd -P >/dev/null 2>&1; then
+    cd "$repo" 2>/dev/null || cd "$HOME" 2>/dev/null || cd / 2>/dev/null
+    log "/new $role/$slug — bot cwd was deleted; re-anchored to $(pwd -P 2>/dev/null)"
+  fi
+
   # Pre-flight: ensure local main is current with origin/main so the worktree
   # forks from latest base. Two paths depending on what's checked out in the
   # main worktree of the repo:
