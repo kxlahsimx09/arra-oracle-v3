@@ -97,14 +97,18 @@ EOF
 if [ -d "$WT_PATH" ]; then
   ok "worktree exists — reusing (shared across roles within campaign×repo)"
 else
+  # Refresh origin/main so a NEW campaign branch always bases off fresh upstream,
+  # never the base checkout's (possibly stale / WIP / detached) local HEAD. Non-fatal
+  # if offline — fall through to whatever origin/main we already have.
+  git -C "$REPO_PATH" fetch origin main --quiet || true
   if git -C "$REPO_PATH" show-ref --verify --quiet "refs/heads/$BRANCH"; then
     git -C "$REPO_PATH" worktree add "$WT_PATH" "$BRANCH" >/dev/null \
       || die "worktree add failed (existing branch $BRANCH)"
     ok "worktree added on existing branch $BRANCH"
   else
-    git -C "$REPO_PATH" worktree add "$WT_PATH" -b "$BRANCH" >/dev/null \
-      || die "worktree add failed (new branch $BRANCH)"
-    ok "worktree added with new branch $BRANCH"
+    git -C "$REPO_PATH" worktree add "$WT_PATH" -b "$BRANCH" origin/main >/dev/null \
+      || die "worktree add failed (new branch $BRANCH off origin/main)"
+    ok "worktree added with new branch $BRANCH (based on origin/main)"
   fi
 
   # --- 2. .agent symlink (per AGENTS.md §3a) ---
