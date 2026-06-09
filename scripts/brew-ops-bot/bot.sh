@@ -372,18 +372,20 @@ is_session_alive_for() {
 
 # Tear down the bot's tracking of a chat whose pane has reverted to a shell.
 # Does NOT kill the pane — the user may want the zsh prompt there. Drops the
-# watcher (idempotent), aliases, runtime env, and clears the active-chat marker
-# if it pointed here. Worktree sweep is intentionally NOT called per-chat —
-# sweep_orphan_worktrees is heavier and is already invoked at the end of
-# cmd_close_all when the user explicitly mass-closes.
+# watcher (idempotent), aliases, and runtime env. Worktree sweep is
+# intentionally NOT called per-chat — sweep_orphan_worktrees is heavier and is
+# already invoked at the end of cmd_close_all when the user explicitly closes.
+# The active-chat marker is deliberately LEFT ALONE: it is the user's intent
+# and only /chat, /end, /close should change it. Auto-clearing it here (plus
+# the on-message resolve-miss paths, now also fixed) was silently unbinding the
+# user, forcing a /chat on every return. If the chat is truly gone the next
+# send just reports it unreachable and offers /relaunch — the binding stays.
 cleanup_dead_chat() {
   local chat="$1"
   [ -z "$chat" ] && return
   stop_watcher_for "$chat"
   remove_aliases_for_chat "$chat" 2>/dev/null || true
   remove_runtime_for_chat "$chat" 2>/dev/null || true
-  local af; af=$(active_chat_file "$CHAT")
-  [ -s "$af" ] && [ "$(cat "$af" 2>/dev/null)" = "$chat" ] && rm -f "$af"
 }
 
 # Boot recovery: scan all live chats and spawn watchers that aren't running.
@@ -1291,7 +1293,12 @@ cmd_look() {
   local target pane
   target=$(cat "$f")
   pane=$(resolve_chat "$target" | cut -d'|' -f1)
-  [ -z "$pane" ] && { send_tg "❌ active chat <code>$target</code> ตายแล้ว"; rm -f "$f"; return; }
+  # Pane not resolvable right now — could be transient (agent shelled out to a
+  # foreground cmd, tmux mid-rebuild) OR genuinely gone. Do NOT delete the
+  # active-chat marker: it is the user's intent and a single flaky lookup was
+  # silently unbinding them, forcing /chat on every return. Keep it sticky;
+  # only /chat, /end, /close change it. Tell them it's unreachable + how to act.
+  [ -z "$pane" ] && { send_tg "⚠️ active chat <code>$target</code> ส่งไม่ได้ตอนนี้ (pane ไม่เจอ — agent อาจกำลังรันคำสั่ง หรือเพิ่งปิด). binding ยังอยู่ — ลองใหม่อีกครั้ง, หรือ <code>/relaunch $target</code>, หรือ <code>/end</code> เพื่อล้าง"; return; }
   local n
   case "$arg" in
     full|all) n=5000 ;;
@@ -1813,7 +1820,12 @@ cmd_send_to_chat() {
   local target pane
   target=$(cat "$f")
   pane=$(resolve_chat "$target" | cut -d'|' -f1)
-  [ -z "$pane" ] && { send_tg "❌ active chat <code>$target</code> ตายแล้ว"; rm -f "$f"; return; }
+  # Pane not resolvable right now — could be transient (agent shelled out to a
+  # foreground cmd, tmux mid-rebuild) OR genuinely gone. Do NOT delete the
+  # active-chat marker: it is the user's intent and a single flaky lookup was
+  # silently unbinding them, forcing /chat on every return. Keep it sticky;
+  # only /chat, /end, /close change it. Tell them it's unreachable + how to act.
+  [ -z "$pane" ] && { send_tg "⚠️ active chat <code>$target</code> ส่งไม่ได้ตอนนี้ (pane ไม่เจอ — agent อาจกำลังรันคำสั่ง หรือเพิ่งปิด). binding ยังอยู่ — ลองใหม่อีกครั้ง, หรือ <code>/relaunch $target</code>, หรือ <code>/end</code> เพื่อล้าง"; return; }
   audit "→ chat=$target pane=$pane text=$text"
   # Refuse if no agent CLI is running in the pane — text would land in zsh and
   # never reach the agent. Observed 2026-05-01 after pg-tester's `claude -p`
