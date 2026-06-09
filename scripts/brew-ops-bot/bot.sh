@@ -950,6 +950,19 @@ cmd_new() {
   [ -z "$repo" ] && { send_tg "❌ unknown role: $role (ใช้ /roles)"; return; }
   audit "/new $role $slug engine=$engine"
 
+  # Dead-cwd guard. `maw` runs on bun; bun aborts with "The current working
+  # directory was deleted…" if its process inherits a cwd that no longer
+  # exists on disk. That happens when the bot was started from (or a prior
+  # worktree-removal deleted) the directory the bot process sits in — every
+  # `$(maw …)` / `$(git …)` command-substitution inherits that dead cwd and
+  # fails, surfacing as "pane … ไม่ถูกสร้าง". Re-anchor to a directory that is
+  # guaranteed to exist before any git/maw call. `git -C` uses absolute paths
+  # so this only needs to make getcwd() succeed, not point anywhere specific.
+  if ! pwd -P >/dev/null 2>&1; then
+    cd "$repo" 2>/dev/null || cd "$HOME" 2>/dev/null || cd / 2>/dev/null
+    log "/new $role/$slug — bot cwd was deleted; re-anchored to $(pwd -P 2>/dev/null)"
+  fi
+
   # Pre-flight: ensure local main is current with origin/main so the worktree
   # forks from latest base. Two paths depending on what's checked out in the
   # main worktree of the repo:
@@ -1649,12 +1662,15 @@ cmd_ctx() {
     out_tokens=$(printf '%s' "$last_line" | cut -f2)
     model=$(printf '%s' "$last_line" | cut -f3)
     # Context-window tier by model. The fleet launches `claude` with no --model,
-    # so it inherits the account default — opus-4.6/4.7 and sonnet-4.x resolve to
-    # the 1M variant (claude-*[1m]). But the JSONL records the model *without* the
-    # [1m] suffix and carries no window field, so the name alone can't prove 1M —
-    # map known-1M model families here instead of defaulting everything to 200k.
+    # so it inherits the account default — opus-4.6/4.7/4.8 and sonnet-4.x resolve
+    # to the 1M variant. The JSONL usually records the model *without* the [1m]
+    # suffix and carries no window field, so the name alone can't prove 1M — match
+    # an explicit [1m]/-1m tag first, then map known-1M families by name. Anything
+    # unrecognised (e.g. haiku) defaults to the standard 200k window.
     max_ctx=$(printf '%s' "$usage_all" | awk -F'\t' 'BEGIN{m=0} {if($1+0>m) m=$1+0} END{print m+0}')
     case "$model" in
+      *\[1m\]|*-1m)                       ctx_max=1000000 ;;  # explicit 1M beta tag
+      claude-opus-4-8*)                  ctx_max=1000000 ;;  # opus 4.8 → 1M default
       claude-opus-4-7*|claude-opus-4-6*) ctx_max=1000000 ;;
       claude-sonnet-4-*)                 ctx_max=1000000 ;;  # sonnet 1m default
       *)                                 ctx_max=200000 ;;
