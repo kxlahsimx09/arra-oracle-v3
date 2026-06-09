@@ -81,5 +81,18 @@ echo "→ maw cleanup --zombie-agents --yes"
 maw cleanup --zombie-agents --yes 2>&1 | sed 's/^/  /' || \
   warn "zombie sweep reported error (non-fatal)"
 
+# --- 4. chat-watcher state cleanup ---
+# chat-watcher.sh accumulates per-(role × campaign) state files keyed
+# <role>_<campaign> that are never removed on close, so the cache grows
+# unbounded. Purge this campaign's files across all roles (*_<campaign>).
+# Specific globs + plain `rm -f` only — never a directory removal.
+echo "→ purging chat-watcher state for *_${CAMPAIGN}"
+STATE_DIR=${STATE_DIR:-$HOME/.cache/brew-ops-bot}
+rm -f "$STATE_DIR"/idle-count.*_"$CAMPAIGN" \
+      "$STATE_DIR"/idle-alerted.*_"$CAMPAIGN" \
+      "$STATE_DIR"/idle-alerted-ts.*_"$CAMPAIGN" \
+      "$STATE_DIR"/keepalive.*_"$CAMPAIGN"
+ok "watcher state purged ($STATE_DIR/*_${CAMPAIGN})"
+
 echo
 ok "campaign $CAMPAIGN closed"

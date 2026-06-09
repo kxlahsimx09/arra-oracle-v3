@@ -54,17 +54,28 @@ LINE_STATE_FILE=$STATE_DIR/last-line.$SAFE
 # mutate parent shell vars. Reset at startup.
 KEEPALIVE_STATE=$STATE_DIR/keepalive.$SAFE
 : > "$KEEPALIVE_STATE"
-# Idle-run counter + one-shot alert flag. A teammate that finished its work but
+# Idle-run counter + re-alert cooldown. A teammate that finished its work but
 # whose session isn't shut down answers each agent-teams idle ping with a
 # throwaway turn, forever. After IDLE_ALERT_THRESHOLD consecutive idle replies
-# we send ONE Telegram alert so the orchestrator/human can decide whether to
-# close the campaign — we never close it ourselves (the teammate may yet get a
-# follow-up). Both reset when real work resumes. Files (pipe-subshell safe).
+# we alert the orchestrator/human so they can decide whether to close the
+# campaign — we never close it ourselves (the teammate may yet get a follow-up).
+# The alert is rate-limited by IDLE_REALERT_COOLDOWN (a persisted timestamp),
+# NOT one-shot: a passive orchestrator poke ("STAND BY") is a real user turn, so
+# it resets IDLE_COUNT and re-arms the counter — a one-shot flag therefore
+# re-fired forever. With a cooldown we send at most one alert per campaign per
+# window, regardless of how often the counter re-arms; a genuinely-new idle
+# spell after the cooldown still alerts. IDLE_COUNT/IDLE_ALERTED reset when real
+# work resumes; IDLE_ALERTED_TS does NOT (it gates the cooldown and must survive
+# both user turns and watcher restarts). Files (pipe-subshell safe).
 IDLE_COUNT_STATE=$STATE_DIR/idle-count.$SAFE
 IDLE_ALERTED_STATE=$STATE_DIR/idle-alerted.$SAFE
+# Last-alert timestamp (epoch). NOT truncated at startup: a watcher restart must
+# not be able to re-arm the alarm by clearing the cooldown.
+IDLE_ALERTED_TS_STATE=$STATE_DIR/idle-alerted-ts.$SAFE
 : > "$IDLE_COUNT_STATE"
 : > "$IDLE_ALERTED_STATE"
 IDLE_ALERT_THRESHOLD=${IDLE_ALERT_THRESHOLD:-10}
+IDLE_REALERT_COOLDOWN=${IDLE_REALERT_COOLDOWN:-21600}  # 6h default
 
 # Single-owner lock per resolved JSONL path. Two chats whose panes share a cwd
 # (e.g. `maw wake` placed a second oracle into an existing oracle's worktree)
@@ -429,8 +440,13 @@ while true; do
           # orchestrator can decide to close (we never close it ourselves).
           ic=$(( $(cat "$IDLE_COUNT_STATE" 2>/dev/null || echo 0) + 1 ))
           echo "$ic" > "$IDLE_COUNT_STATE"
-          if [ "$ic" -ge "$IDLE_ALERT_THRESHOLD" ] && [ ! -s "$IDLE_ALERTED_STATE" ]; then
-            echo 1 > "$IDLE_ALERTED_STATE"
+          now=$(date +%s)
+          last_alert=$(cat "$IDLE_ALERTED_TS_STATE" 2>/dev/null || echo 0)
+          [[ "$last_alert" =~ ^[0-9]+$ ]] || last_alert=0
+          if [ "$ic" -ge "$IDLE_ALERT_THRESHOLD" ] && \
+             [ $(( now - last_alert )) -ge "$IDLE_REALERT_COOLDOWN" ]; then
+            echo "$now" > "$IDLE_ALERTED_TS_STATE"
+            echo 1 > "$IDLE_ALERTED_STATE"   # keep for logging/compat
             # Notify the OWNING orchestrator directly in its conversation — the
             # same send-keys channel the kickoff uses, which we know it reads.
             # We never close the campaign ourselves; the orchestrator decides.
