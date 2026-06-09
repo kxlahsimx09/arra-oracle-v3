@@ -427,10 +427,15 @@ while true; do
         # the push gate.
         case "$kind" in
           ping) echo 1 > "$KEEPALIVE_STATE"; continue ;;
-          user)  # real work resumed — re-open gate + reset idle tracking
-            : > "$KEEPALIVE_STATE"
-            : > "$IDLE_COUNT_STATE"
-            : > "$IDLE_ALERTED_STATE" ;;
+          user)  # A user turn ARRIVED — re-open the push gate so the reply is
+            # processed. But a user turn arriving is NOT proof that work
+            # resumed: a PASSIVE orchestrator poke ("stand by / no action
+            # needed", keepalive nudges) is a non-ping user turn too. Resetting
+            # idle tracking here re-armed the alarm on a parked teammate, so the
+            # next idle ping re-fired the alert (the re-alert loop #120 only
+            # mitigated). Idle tracking is now reset solely by GENUINE assistant
+            # work — see the reset below, on the push path.
+            : > "$KEEPALIVE_STATE" ;;
         esac
         local_text=$(echo "$line" | extract_text)
         [ -z "$local_text" ] && continue
@@ -467,6 +472,16 @@ while true; do
             fi
           fi
           continue
+        fi
+        # GENUINE WORK RESUMED — the true reset signal. We only get here for an
+        # assistant turn when KEEPALIVE != 1 (idle-mode asst turns were
+        # suppressed + `continue`d above), so a substantive asst turn means the
+        # teammate is actually working again, not echoing a poke. Guard on
+        # length so a stray short throwaway ("Idle.", "รออยู่") can't reset the
+        # counter. This — not mere user-turn arrival — clears idle tracking.
+        if [ "$kind" = "asst" ] && [ "${#local_text}" -gt 16 ]; then
+          : > "$IDLE_COUNT_STATE"
+          : > "$IDLE_ALERTED_STATE"
         fi
         push_turn "$local_text" "$CHAT_ID"
         log "pushed assistant turn (${#local_text} chars)"
