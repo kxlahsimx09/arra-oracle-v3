@@ -263,6 +263,12 @@ WATCHER_SCRIPT_CODEX="$SCRIPT_DIR_BOT/codex-watcher.sh"
 
 # Phase 4 helpers — auto-push agent output to Telegram when chats respond.
 watch_pid_file() { echo "$STATE_DIR/watch.$(echo "$1" | tr '/' '_').pid"; }
+# Consecutive "pane is not an agent" observations before recover_watchers runs
+# the destructive cleanup_dead_chat. A single dead reading can be a transient
+# shell foreground or a pane mid-recreation (e.g. %1→%13 on maw wake), so we
+# defer until DEAD_STRIKE_THRESHOLD sweeps agree the session really ended.
+dead_strike_file() { echo "$STATE_DIR/deadstrike.$(echo "$1" | tr '/' '_')"; }
+DEAD_STRIKE_THRESHOLD=${DEAD_STRIKE_THRESHOLD:-2}
 user_send_marker() { echo "$STATE_DIR/last-user-send.$(echo "$1" | tr '/' '_')"; }
 chat_runtime_file() { echo "$STATE_DIR/chat-runtime.$(echo "$1" | tr '/' '_').env"; }
 
@@ -353,7 +359,14 @@ is_session_alive_for() {
     claude*|codex*|node*|bun*) return 0 ;;
     [0-9]*.[0-9]*.[0-9]*) return 0 ;;     # claude version-string form
     sh|bash|zsh|fish|tcsh|csh|ksh|dash) return 1 ;;  # known shells = session ended
-    *) return 1 ;;                         # unknown — treat as dead, fail safe
+    # Anything else (git, vim, less, a pager/REPL the agent shelled out to…) is
+    # a TRANSIENT foreground command, NOT a dead session — the agent is alive in
+    # the pane, just blocked on a child. Treating these as dead silently reaped
+    # live watchers AND unbound the Telegram chat (cleanup_dead_chat), so an
+    # orchestrator chat left running came back to a dropped, silent bridge. Be
+    # permissive here, exactly as this function's header always intended; only a
+    # reverted-to-shell pane (arm above) counts as ended.
+    *) return 0 ;;                         # unknown foreground cmd — agent still alive
   esac
 }
 
@@ -385,11 +398,23 @@ recover_watchers() {
       # Session-alive guard: if the pane has reverted to a shell, the agent
       # exited (or the user `/exit`'d after a campaign). Stop respawning a
       # watcher that can never find a JSONL — clean up bot state instead.
+      local sf; sf=$(dead_strike_file "$chat")
       if ! is_session_alive_for "$pane"; then
-        log "recover_watchers: $chat — pane $pane no longer running an agent (cleaning up)"
-        cleanup_dead_chat "$chat"
+        # One dead reading is not proof the session ended — require
+        # DEAD_STRIKE_THRESHOLD consecutive sweeps before the destructive
+        # cleanup (which drops the watcher AND the Telegram active-chat binding).
+        local strikes; strikes=$(( $(cat "$sf" 2>/dev/null || echo 0) + 1 ))
+        if [ "$strikes" -ge "$DEAD_STRIKE_THRESHOLD" ]; then
+          rm -f "$sf" 2>/dev/null
+          log "recover_watchers: $chat — pane $pane not an agent ×$strikes (cleaning up)"
+          cleanup_dead_chat "$chat"
+        else
+          echo "$strikes" > "$sf"
+          log "recover_watchers: $chat — pane $pane not an agent (strike $strikes/$DEAD_STRIKE_THRESHOLD, deferring)"
+        fi
         continue
       fi
+      rm -f "$sf" 2>/dev/null   # alive — clear any prior dead strikes
       local pf; pf=$(watch_pid_file "$chat")
       if [ -f "$pf" ] && kill -0 "$(cat "$pf" 2>/dev/null)" 2>/dev/null; then
         continue  # already running
