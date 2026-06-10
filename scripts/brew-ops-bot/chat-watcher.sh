@@ -113,15 +113,21 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$CHAT_ID/$$] $*" >> "$LOG_FILE"; }
 html_escape() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
 
 send_tg() {
-  local text="$1" disable_preview="${2:-false}"
+  local text="$1" disable_preview="${2:-false}" markup="${3:-}"
   if [ ${#text} -gt 3900 ]; then text="${text:0:3850}
 
 […truncated]"; fi
+  local args=(
+    --data-urlencode "chat_id=$CHAT"
+    --data-urlencode "parse_mode=HTML"
+    --data-urlencode "disable_web_page_preview=$disable_preview"
+    --data-urlencode "text=$text"
+  )
+  # Optional inline keyboard (reply_markup JSON) — used by the TUI-menu push so
+  # the user can pick a `❯ N.` option from Telegram instead of driving the pane.
+  [ -n "$markup" ] && args+=(--data-urlencode "reply_markup=$markup")
   curl -sf "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-    --data-urlencode "chat_id=$CHAT" \
-    --data-urlencode "parse_mode=HTML" \
-    --data-urlencode "disable_web_page_preview=$disable_preview" \
-    --data-urlencode "text=$text" -o /dev/null 2>/dev/null
+    "${args[@]}" -o /dev/null 2>/dev/null
 }
 
 # Gist publishing — `gist_publish` + `GIST_THRESHOLD` live in `gist.sh`
@@ -497,13 +503,34 @@ while true; do
     # Bare `❯ ` is claude's text-input prefix → false-positive while streaming.
     pane_visible=$(tmux capture-pane -t "$PANE" -p 2>/dev/null)
     if printf '%s' "$pane_visible" | grep -qE '^[[:space:]]*❯ [0-9]+\.'; then
-      pane_snap=$(tmux capture-pane -t "$PANE" -pS -1000 2>/dev/null)
-      url=$(gist_publish "${CHAT_ID} idle TUI prompt — $(date '+%Y-%m-%d %H:%M')" "$pane_snap" "txt")
-      body=${url:+"📖 <a href=\"$url\">read full pane on gist</a>"}
-      send_tg "🔔 <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> รอคำตอบ (TUI prompt — Escape ออก หรือไปตอบใน pane):
+      # Extract the `N. text` option lines (drop the ❯ cursor + indent) and turn
+      # them into one Telegram inline-keyboard button each, so the user picks
+      # from chat instead of driving the TUI by hand. callback_data carries the
+      # chat + option number; bot.sh's `pick:` handler navigates the pane.
+      menu_opts=$(printf '%s' "$pane_visible" \
+        | grep -E '^[[:space:]]*❯?[[:space:]]*[0-9]+\.[[:space:]]' \
+        | sed -E 's/^[[:space:]]*❯?[[:space:]]*//')
+      kbd=$(printf '%s\n' "$menu_opts" | jq -R -s -c --arg chat "$CHAT_ID" \
+        '{inline_keyboard: [ split("\n")[] | select(test("^[0-9]+\\.")) |
+           [ { text: (.[0:60]),
+               callback_data: ("pick:" + $chat + ":" + (capture("^(?<n>[0-9]+)").n)) } ] ]}' 2>/dev/null)
+      q=$(printf '%s' "$pane_visible" | grep -E '\?[[:space:]]*$' | tail -1)
+      if [ -n "$kbd" ] && printf '%s' "$kbd" | grep -q 'callback_data'; then
+        send_tg "🔔 <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> รอให้เลือก (TUI):
+${q:+<i>$(printf '%s' "$q" | html_escape)</i>
+}กดปุ่มเลือกได้เลย หรือ /key เอง" false "$kbd"
+        idle_notified=1
+        log "TUI menu detected — pushed $(printf '%s' "$menu_opts" | grep -cE '^[0-9]+\.') options as buttons"
+      else
+        # Parse failed — fall back to the plain pane-snapshot nudge.
+        pane_snap=$(tmux capture-pane -t "$PANE" -pS -1000 2>/dev/null)
+        url=$(gist_publish "${CHAT_ID} idle TUI prompt — $(date '+%Y-%m-%d %H:%M')" "$pane_snap" "txt")
+        body=${url:+"📖 <a href=\"$url\">read full pane on gist</a>"}
+        send_tg "🔔 <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> รอคำตอบ (TUI prompt — Escape ออก หรือไปตอบใน pane):
 ${body:-<pre>$(printf '%s' "$pane_snap" | tail -20 | html_escape)</pre>}"
-      idle_notified=1
-      log "idle TUI prompt detected — pushed alert (gist=${url:-fail})"
+        idle_notified=1
+        log "idle TUI prompt detected — pushed alert (gist=${url:-fail})"
+      fi
     fi
   fi
 

@@ -1889,6 +1889,35 @@ KEY_USAGE='usage: <code>/key [role/slug] &lt;keys…&gt;</code>
 คีย์: up down left right enter esc tab space pgup pgdn home end y n 0-9 (ซ้ำ: <code>down*3</code>)
 เช่น <code>/key down down enter</code> · <code>/key down*2 enter</code> · <code>/key esc</code>'
 
+# TUI-menu pick: the watcher pushed a `❯ N.` selection menu as inline buttons;
+# a tap arrives here as callback_data "pick:<role/slug>:<n>". Drive the pane to
+# option N and confirm — deterministically, by re-reading the live cursor
+# position (don't assume it sits on option 1) and stepping with Down/Up + Enter.
+cmd_pick() {
+  local arg="$1"                       # <role/slug>:<n>
+  local n="${arg##*:}" chat="${arg%:*}"
+  case "$n" in ''|*[!0-9]*) send_tg "❌ pick: ตัวเลือกไม่ถูกต้อง"; return ;; esac
+  local pane; pane=$(resolve_chat "$chat" | cut -d'|' -f1)
+  [ -z "$pane" ] && { send_tg "⚠️ <code>$chat</code> หา pane ไม่เจอ — เมนูอาจปิดไปแล้ว"; return; }
+  local snap; snap=$(tmux capture-pane -t "$pane" -p 2>/dev/null)
+  if ! printf '%s' "$snap" | grep -qE '^[[:space:]]*❯[[:space:]]*[0-9]+\.'; then
+    send_tg "⚠️ <code>$chat</code> ไม่มีเมนูให้เลือกแล้ว (agent อาจตอบไปแล้ว)"; return
+  fi
+  local cur; cur=$(printf '%s' "$snap" | grep -E '^[[:space:]]*❯[[:space:]]*[0-9]+\.' \
+    | head -1 | sed -E 's/^[[:space:]]*❯[[:space:]]*([0-9]+)\..*/\1/')
+  [ -z "$cur" ] && cur=1
+  local delta=$(( n - cur )) i
+  if [ "$delta" -gt 0 ]; then
+    for ((i=0; i<delta; i++)); do tmux send-keys -t "$pane" Down 2>/dev/null; sleep 0.1; done
+  elif [ "$delta" -lt 0 ]; then
+    for ((i=0; i<-delta; i++)); do tmux send-keys -t "$pane" Up 2>/dev/null; sleep 0.1; done
+  fi
+  sleep 0.2
+  tmux send-keys -t "$pane" Enter 2>/dev/null
+  audit "pick chat=$chat pane=$pane option=$n (cursor was $cur)"
+  send_tg "✅ <code>$chat</code> เลือกข้อ <b>$n</b> แล้ว 🔔 watcher จะ push คำตอบต่อ"
+}
+
 cmd_key() {
   local tg_chat="$1"; shift
   local target pane
@@ -2030,6 +2059,7 @@ main() {
           close:*)  dispatch "$cb_chat" "/close ${cb_data#close:}" ;;
           chats:*)  dispatch "$cb_chat" "/chats ${cb_data#chats:}" ;;
           watch_off:*) dispatch "$cb_chat" "/watch off ${cb_data#watch_off:}" ;;
+          pick:*)   cmd_pick "${cb_data#pick:}" ;;   # TUI-menu option tapped
           *)        log "unhandled callback: $cb_data" ;;
         esac
         continue
