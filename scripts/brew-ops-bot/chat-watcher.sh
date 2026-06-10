@@ -48,6 +48,11 @@ PID_FILE=$STATE_DIR/watch.$SAFE.pid
 # Persistent watch position so restarts don't lose responses written between
 # prior shutdown and this startup. Format: <jsonl_path>|<line_count>
 LINE_STATE_FILE=$STATE_DIR/last-line.$SAFE
+# AskUserQuestion forwarding: ASK_LAST dedups (push once per tool_use id);
+# ASK_PENDING tells bot.sh a menu is live (format "<tool_id>|<n_questions>") so a
+# "2,2" text reply can be routed to TUI-driving instead of the agent's input.
+ASK_LAST_STATE=$STATE_DIR/ask-last.$SAFE
+ASK_PENDING_STATE=$STATE_DIR/ask-pending.$SAFE
 # Cross-line keepalive flag: set when the last JSONL line was an agent-teams
 # idle_notification ping, so the NEXT assistant turn (its throwaway reply) is
 # suppressed. A file because the push loop runs in a pipe subshell that can't
@@ -177,6 +182,41 @@ push_turn() {
 }
 
 encode_cwd() { echo "$1" | sed 's|/|-|g; s|\.|-|g'; }
+
+# A streamed JSONL line carrying an AskUserQuestion tool_use → push the full
+# questions + options to Telegram with one inline button per option. Reading the
+# structured tool input is reliable even when the on-screen TUI is scrolled or
+# stale (capture-pane can only see what fits). Fires once per tool_use id. The
+# button callback "ask:<chat>:<qi>:<oi>" is driven by bot.sh's cmd_ask; we also
+# stamp ASK_PENDING so a plain "2,2" text reply can be routed to driving.
+# Returns 0 (caller should `continue`) when it handled an AskUserQuestion line.
+maybe_push_ask() {
+  local line="$1" payload id nq body kbd
+  payload=$(printf '%s' "$line" | jq -c '[.. | objects | select(.type?=="tool_use" and .name?=="AskUserQuestion")] | last // empty' 2>/dev/null)
+  [ -z "$payload" ] && return 1
+  id=$(printf '%s' "$payload" | jq -r '.id // empty')
+  [ -z "$id" ] && return 1
+  [ "$id" = "$(cat "$ASK_LAST_STATE" 2>/dev/null)" ] && return 0   # already pushed
+  echo "$id" > "$ASK_LAST_STATE"
+  nq=$(printf '%s' "$payload" | jq -r '.input.questions | length')
+  printf '%s|%s' "$id" "$nq" > "$ASK_PENDING_STATE"
+  # HTML-escape the user-facing labels (option text can contain & < >).
+  body=$(printf '%s' "$payload" | jq -r '
+    def esc: gsub("&";"&amp;")|gsub("<";"&lt;")|gsub(">";"&gt;");
+    .input.questions | to_entries | map(
+      "❓ <b>Q\(.key+1). \(.value.header|esc)</b> — \(.value.question|esc)\n" +
+      (.value.options | to_entries | map("   \(.key+1). \(.value.label|esc)") | join("\n"))
+    ) | join("\n\n")')
+  kbd=$(printf '%s' "$payload" | jq -c --arg chat "$CHAT_ID" \
+    '{inline_keyboard: (.input.questions | to_entries | map(.key as $qi | .value.options | to_entries | map({text: "Q\($qi+1)·\(.key+1)", callback_data: "ask:\($chat):\($qi):\(.key)"})))}')
+  send_tg "🔔 <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> ขอให้เลือก (AskUserQuestion):
+
+${body}
+
+กดปุ่ม <b>Q·ข้อ</b> ตอบแต่ละคำถาม หรือพิมพ์ตอบรวมเป็น <code>$(printf '%s' "$payload" | jq -r '[.input.questions[]|"1"]|join(",")')</code>" false "$kbd"
+  log "AskUserQuestion pushed (${nq} questions, id=$id)"
+  return 0
+}
 
 # Resolve the owning orchestrator's tmux pane for the teammate in $PANE (§151).
 # Chain: teammate pane_pid → its `claude` proc's --system-prompt-file → that
@@ -420,6 +460,18 @@ while true; do
     sed -n "$((last_line_count + 1)),${cur_count}p" "$current_jsonl" 2>/dev/null \
       | while IFS= read -r line; do
         [ -z "$line" ] && continue
+        # AskUserQuestion menu → push full questions + tappable buttons, then
+        # skip normal turn handling (it's a tool_use, no displayable text). A
+        # matching tool_result means it was answered → clear the pending state
+        # so a later "2,2" reply can't mis-route to a stale menu.
+        case "$line" in
+          *'"AskUserQuestion"'*) maybe_push_ask "$line" && continue ;;
+          *'"tool_result"'*)
+            if [ -s "$ASK_PENDING_STATE" ] && \
+               printf '%s' "$line" | grep -q "$(cut -d'|' -f1 "$ASK_PENDING_STATE")"; then
+              rm -f "$ASK_PENDING_STATE"; log "AskUserQuestion answered — cleared pending"
+            fi ;;
+        esac
         # Keepalive filter (agent-teams): an idle_notification user turn polls
         # the teammate; the teammate's reply to it is throwaway status noise.
         # Suppress that reply by keying on the trigger, not the words. State

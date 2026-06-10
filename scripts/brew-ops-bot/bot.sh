@@ -1819,6 +1819,22 @@ cmd_send_to_chat() {
   [ ! -f "$f" ] && { send_tg "❌ ไม่มี active chat — /chat &lt;role&gt; ก่อน หรือ /help"; return; }
   local target pane
   target=$(cat "$f")
+  # If this chat has a live AskUserQuestion and the text is "2,2"-style (one
+  # number per question), treat it as the answer set and drive the TUI instead
+  # of typing into the agent's input field.
+  local _safe; _safe=$(echo "$target" | tr '/' '_')
+  local _pend="$STATE_DIR/ask-pending.$_safe"
+  if [ -s "$_pend" ] && printf '%s' "$text" | grep -qE '^[0-9]+([,[:space:]]+[0-9]+)*$'; then
+    local _nq _nums _cnt; _nq=$(cut -d'|' -f2 "$_pend")
+    _nums=$(printf '%s' "$text" | grep -oE '[0-9]+'); _cnt=$(printf '%s\n' "$_nums" | grep -c .)
+    if [ "$_cnt" = "$_nq" ]; then
+      local _ans="$STATE_DIR/ask-answers.$_safe"; : > "$_ans"; local _qi=0 _n
+      for _n in $_nums; do echo "$_qi $((_n-1))" >> "$_ans"; _qi=$((_qi+1)); done
+      tui_ask_submit "$target" "$_ans" "$_nq"
+      rm -f "$_pend" "$_ans" "$STATE_DIR/ask-last.$_safe"
+      return
+    fi
+  fi
   pane=$(resolve_chat "$target" | cut -d'|' -f1)
   # Pane not resolvable right now — could be transient (agent shelled out to a
   # foreground cmd, tmux mid-rebuild) OR genuinely gone. Do NOT delete the
@@ -1916,6 +1932,50 @@ cmd_pick() {
   tmux send-keys -t "$pane" Enter 2>/dev/null
   audit "pick chat=$chat pane=$pane option=$n (cursor was $cur)"
   send_tg "✅ <code>$chat</code> เลือกข้อ <b>$n</b> แล้ว 🔔 watcher จะ push คำตอบต่อ"
+}
+
+# AskUserQuestion option tapped: callback "ask:<role/slug>:<qi>:<oi>" (0-indexed).
+# The watcher pushed one button per option across N questions; we accumulate one
+# answer per question and only drive+submit once every question is answered.
+cmd_ask() {
+  local arg="$1"                          # <role/slug>:<qi>:<oi>
+  local oi="${arg##*:}" rest qi chat
+  rest="${arg%:*}"; qi="${rest##*:}"; chat="${rest%:*}"
+  case "$qi$oi" in ''|*[!0-9]*) send_tg "❌ ask: ค่าเพี้ยน"; return ;; esac
+  local safe; safe=$(echo "$chat" | tr '/' '_')
+  local pend="$STATE_DIR/ask-pending.$safe" ans="$STATE_DIR/ask-answers.$safe"
+  [ ! -s "$pend" ] && { send_tg "⚠️ <code>$chat</code> ไม่มีเมนูค้างแล้ว (อาจตอบไปแล้ว/เปลี่ยนคำถาม)"; return; }
+  local nq; nq=$(cut -d'|' -f2 "$pend")
+  # Record (overwrite) this question's choice, keep answers ordered by question.
+  { grep -v "^$qi " "$ans" 2>/dev/null; echo "$qi $oi"; } | sort -n > "$ans.tmp" && mv "$ans.tmp" "$ans"
+  local got; got=$(grep -c . "$ans" 2>/dev/null)
+  if [ "$got" -lt "$nq" ]; then
+    send_tg "✔️ <code>$chat</code> Q$((qi+1))=ข้อ$((oi+1)) — ตอบครบ <b>$got/$nq</b> แล้ว เลือกที่เหลือต่อ"
+    return
+  fi
+  tui_ask_submit "$chat" "$ans" "$nq"
+  rm -f "$pend" "$ans" "$STATE_DIR/ask-last.$safe"
+}
+
+# Drive an AskUserQuestion TUI from the collected answers. Per the menu footer
+# ("Enter to select · Tab/Arrow keys to navigate"): step Down within a question
+# to the chosen option (cursor starts at option 1), Tab to the next question,
+# and Enter once to submit all. NOTE: this key model is best-effort — validate
+# on a live, responsive menu; if it ever drifts, answer in the pane.
+tui_ask_submit() {
+  local chat="$1" ans="$2" nq="$3" pane qi oi i first=1
+  pane=$(resolve_chat "$chat" | cut -d'|' -f1)
+  [ -z "$pane" ] && { send_tg "⚠️ <code>$chat</code> หา pane ไม่เจอ — ส่งคำตอบไม่ได้"; return; }
+  while read -r qi oi; do
+    [ "$first" = 1 ] || tmux send-keys -t "$pane" Tab 2>/dev/null
+    first=0; sleep 0.15
+    for ((i=0; i<oi; i++)); do tmux send-keys -t "$pane" Down 2>/dev/null; sleep 0.1; done
+  done < "$ans"
+  sleep 0.2
+  tmux send-keys -t "$pane" Enter 2>/dev/null
+  local summary; summary=$(awk '{printf "Q%d=ข้อ%d ", $1+1, $2+1}' "$ans")
+  audit "ask-submit chat=$chat pane=$pane [$summary]"
+  send_tg "✅ <code>$chat</code> ส่งคำตอบแล้ว: <b>$summary</b>🔔 watcher จะ push ผลต่อ"
 }
 
 cmd_key() {
@@ -2060,6 +2120,7 @@ main() {
           chats:*)  dispatch "$cb_chat" "/chats ${cb_data#chats:}" ;;
           watch_off:*) dispatch "$cb_chat" "/watch off ${cb_data#watch_off:}" ;;
           pick:*)   cmd_pick "${cb_data#pick:}" ;;   # TUI-menu option tapped
+          ask:*)    cmd_ask "${cb_data#ask:}" ;;     # AskUserQuestion option tapped
           *)        log "unhandled callback: $cb_data" ;;
         esac
         continue
