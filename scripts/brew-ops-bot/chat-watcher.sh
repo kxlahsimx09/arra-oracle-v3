@@ -140,7 +140,7 @@ send_tg() {
 # Identical layout is rebuilt in bot.sh (nav_keyboard) for the edits.
 menu_remote_kbd() {
   local c="$CHAT_ID"
-  printf '{"inline_keyboard":[[{"text":"⬆️","callback_data":"nav:%s:up"},{"text":"⬇️","callback_data":"nav:%s:down"}],[{"text":"✅ เลือก/toggle","callback_data":"nav:%s:enter"}],[{"text":"📤 Submit","callback_data":"nav:%s:submit"},{"text":"❌ Esc","callback_data":"nav:%s:esc"}]]}' "$c" "$c" "$c" "$c" "$c"
+  printf '{"inline_keyboard":[[{"text":"⬆️","callback_data":"nav:%s:up"},{"text":"⬇️","callback_data":"nav:%s:down"}],[{"text":"✅ เลือก/toggle","callback_data":"nav:%s:enter"}],[{"text":"📤 Submit","callback_data":"nav:%s:submit"},{"text":"❌ ยกเลิก(Esc)","callback_data":"nav:%s:esc"}]]}' "$c" "$c" "$c" "$c" "$c"
 }
 
 # Gist publishing — `gist_publish` + `GIST_THRESHOLD` live in `gist.sh`

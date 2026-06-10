@@ -2005,19 +2005,23 @@ tui_ask_submit() {
 # pane and edits the message in place. Mirrors chat-watcher's menu_remote_kbd.
 nav_keyboard() {
   local c="$1"
-  printf '{"inline_keyboard":[[{"text":"⬆️","callback_data":"nav:%s:up"},{"text":"⬇️","callback_data":"nav:%s:down"}],[{"text":"✅ เลือก/toggle","callback_data":"nav:%s:enter"}],[{"text":"📤 Submit","callback_data":"nav:%s:submit"},{"text":"❌ Esc","callback_data":"nav:%s:esc"}]]}' "$c" "$c" "$c" "$c" "$c"
+  printf '{"inline_keyboard":[[{"text":"⬆️","callback_data":"nav:%s:up"},{"text":"⬇️","callback_data":"nav:%s:down"}],[{"text":"✅ เลือก/toggle","callback_data":"nav:%s:enter"}],[{"text":"📤 Submit","callback_data":"nav:%s:submit"},{"text":"❌ ยกเลิก(Esc)","callback_data":"nav:%s:esc"}]]}' "$c" "$c" "$c" "$c" "$c"
 }
 
-# Page Down until the ❯ cursor lands on a "Submit" row, then Enter. Submit sits
-# at the bottom of a multi-select menu and Down wraps, so a bounded scan finds
-# it from any starting position.
+# Move the ❯ cursor onto the "Submit" row, then Enter. Step Down one at a time
+# and check after EACH step whether the cursor line now contains "Submit" — match
+# on "the ❯ line contains Submit" (robust to spacing/checkbox rendering) rather
+# than a strict "❯ Submit" regex, which silently missed and spammed Down without
+# ever submitting. Bounded; if Submit never lands under the cursor, give up so
+# the caller can tell the user to reach it with ⬇️ + ✅ instead.
 tui_goto_submit() {
-  local pane="$1" i
-  for ((i=0; i<15; i++)); do
-    if tmux capture-pane -p -t "$pane" 2>/dev/null | grep -qE '^[[:space:]]*❯[[:space:]]+Submit'; then
+  local pane="$1" i cur
+  for ((i=0; i<12; i++)); do
+    cur=$(tmux capture-pane -p -t "$pane" 2>/dev/null | grep -E '^[[:space:]]*❯' | head -1)
+    if printf '%s' "$cur" | grep -q 'Submit'; then
       tmux send-keys -t "$pane" Enter 2>/dev/null; return 0
     fi
-    tmux send-keys -t "$pane" Down 2>/dev/null; sleep 0.2
+    tmux send-keys -t "$pane" Down 2>/dev/null; sleep 0.25
   done
   return 1
 }
