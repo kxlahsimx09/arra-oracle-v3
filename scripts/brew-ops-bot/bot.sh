@@ -1841,13 +1841,19 @@ cmd_send_to_chat() {
   # Mark "user just sent" so the watcher's quiet-window kicks in (avoids
   # auto-pushing back the user's own message + claude's first ack burst).
   date +%s > "$(user_send_marker "$target")"
-  # Send text and Enter as SEPARATE send-keys with a small delay between.
-  # Reason: claude's TUI input field renders multi-byte Thai chars asynchronously;
-  # if Enter is appended in the same send-keys call, it can arrive before the
-  # full text has been processed by the TUI's input buffer → message stays in
-  # the field unsubmitted (observed 2026-04-28). The 0.3s delay reliably
-  # lets the TUI catch up before we press Enter.
-  tmux send-keys -t "$pane" -- "$text" 2>/dev/null
+  # Deliver the message the way a human paste does — atomically, not key-by-key.
+  # The old `send-keys -- "$text"` typed each char into the TUI, racing claude's
+  # async multi-byte (Thai) rendering: Enter could fire before the field caught
+  # up → text dropped or stuck unsubmitted, or fast retypes concatenated onto a
+  # half-typed leftover (the "ติด TUI" the user kept hitting). Instead:
+  #   1. C-u clears any half-typed leftover so nothing concatenates.
+  #   2. Paste the whole string via a named BRACKETED-paste buffer — multi-byte
+  #      and multi-line land intact in one shot, and bracketed mode stops an
+  #      embedded newline from submitting early.
+  #   3. Let the TUI settle, then Enter on its own to submit.
+  tmux send-keys -t "$pane" C-u 2>/dev/null                       # clear input field
+  tmux set-buffer -b brewbot_send -- "$text" 2>/dev/null
+  tmux paste-buffer -t "$pane" -b brewbot_send -p -d 2>/dev/null  # -p bracketed, -d drop buffer
   sleep 0.3
   tmux send-keys -t "$pane" Enter 2>/dev/null
   send_tg "→ <code>$target</code> sent. 🔔 watcher จะ push ตอน agent ตอบเสร็จ"
