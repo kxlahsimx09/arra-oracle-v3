@@ -2005,7 +2005,7 @@ tui_ask_submit() {
 # pane and edits the message in place. Mirrors chat-watcher's menu_remote_kbd.
 nav_keyboard() {
   local c="$1"
-  printf '{"inline_keyboard":[[{"text":"⬆️","callback_data":"nav:%s:up"},{"text":"⬇️","callback_data":"nav:%s:down"}],[{"text":"✅ เลือก/toggle","callback_data":"nav:%s:enter"}],[{"text":"📤 Submit","callback_data":"nav:%s:submit"},{"text":"❌ ยกเลิก(Esc)","callback_data":"nav:%s:esc"}]]}' "$c" "$c" "$c" "$c" "$c"
+  printf '{"inline_keyboard":[[{"text":"⬆️","callback_data":"nav:%s:up"},{"text":"⬇️","callback_data":"nav:%s:down"}],[{"text":"✅ ติ๊ก/เลือก","callback_data":"nav:%s:enter"},{"text":"⏎ Enter","callback_data":"nav:%s:enter"}],[{"text":"📤 Submit","callback_data":"nav:%s:submit"},{"text":"❌ ยกเลิก(Esc)","callback_data":"nav:%s:esc"}]]}' "$c" "$c" "$c" "$c" "$c" "$c"
 }
 
 # Move the ❯ cursor onto the "Submit" row, then Enter. Step Down one at a time
