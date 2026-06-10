@@ -2000,6 +2000,64 @@ tui_ask_submit() {
   send_tg "✅ <code>$chat</code> ส่งคำตอบแล้ว: <b>$summary</b>🔔 watcher จะ push ผลต่อ"
 }
 
+# ── TUI remote control ──────────────────────────────────────────────────────
+# The watcher pushes a live menu snapshot + this keyboard; each tap drives the
+# pane and edits the message in place. Mirrors chat-watcher's menu_remote_kbd.
+nav_keyboard() {
+  local c="$1"
+  printf '{"inline_keyboard":[[{"text":"⬆️","callback_data":"nav:%s:up"},{"text":"⬇️","callback_data":"nav:%s:down"}],[{"text":"✅ เลือก/toggle","callback_data":"nav:%s:enter"}],[{"text":"📤 Submit","callback_data":"nav:%s:submit"},{"text":"❌ Esc","callback_data":"nav:%s:esc"}]]}' "$c" "$c" "$c" "$c" "$c"
+}
+
+# Page Down until the ❯ cursor lands on a "Submit" row, then Enter. Submit sits
+# at the bottom of a multi-select menu and Down wraps, so a bounded scan finds
+# it from any starting position.
+tui_goto_submit() {
+  local pane="$1" i
+  for ((i=0; i<15; i++)); do
+    if tmux capture-pane -p -t "$pane" 2>/dev/null | grep -qE '^[[:space:]]*❯[[:space:]]+Submit'; then
+      tmux send-keys -t "$pane" Enter 2>/dev/null; return 0
+    fi
+    tmux send-keys -t "$pane" Down 2>/dev/null; sleep 0.2
+  done
+  return 1
+}
+
+# Edit a menu message in place (text + same keyboard).
+edit_menu_message() {
+  local msg="$1" text="$2" kbd="$3"
+  [ -z "$msg" ] && return
+  curl -sf "https://api.telegram.org/bot${TOKEN}/editMessageText" \
+    --data-urlencode "chat_id=$CHAT" \
+    --data-urlencode "message_id=$msg" \
+    --data-urlencode "parse_mode=HTML" \
+    --data-urlencode "text=$text" \
+    --data-urlencode "reply_markup=$kbd" -o /dev/null 2>/dev/null
+}
+
+# A TUI remote-control button was tapped — callback "nav:<role/slug>:<key>".
+# Send the key to the pane, re-capture, and edit the message so the cursor /
+# checkboxes update live. Works for single- and multi-select (Submit) menus.
+cmd_nav() {
+  local arg="$1" msg="$2"            # arg = <role/slug>:<key>
+  local key="${arg##*:}" chat="${arg%:*}"
+  local pane; pane=$(resolve_chat "$chat" | cut -d'|' -f1)
+  [ -z "$pane" ] && { send_tg "⚠️ <code>$chat</code> หา pane ไม่เจอ — เมนูอาจปิดแล้ว"; return; }
+  case "$key" in
+    up)     tmux send-keys -t "$pane" Up 2>/dev/null ;;
+    down)   tmux send-keys -t "$pane" Down 2>/dev/null ;;
+    enter)  tmux send-keys -t "$pane" Enter 2>/dev/null ;;
+    esc)    tmux send-keys -t "$pane" Escape 2>/dev/null ;;
+    submit) tui_goto_submit "$pane" || send_tg "⚠️ หา Submit ไม่เจอ — ใช้ ⬇️ + ✅ เอง" ;;
+    *) return ;;
+  esac
+  audit "nav chat=$chat key=$key pane=$pane"
+  sleep 0.35
+  local snap; snap=$(tmux capture-pane -p -t "$pane" 2>/dev/null | grep -vE '^[[:space:]]*$' | tail -22 | html_escape)
+  [ -z "$snap" ] && snap="(จอว่าง — เมนูอาจปิดแล้ว)"
+  edit_menu_message "$msg" "🎮 <code>$chat</code> เมนู TUI:
+<pre>${snap}</pre>" "$(nav_keyboard "$chat")"
+}
+
 cmd_key() {
   local tg_chat="$1"; shift
   local target pane
@@ -2134,6 +2192,7 @@ main() {
       if [ -n "$cb_id" ]; then
         cb_data=$(echo "$resp" | jq -r ".result[$i].callback_query.data // empty")
         cb_chat=$(echo "$resp" | jq -r ".result[$i].callback_query.message.chat.id // empty")
+        cb_msg=$(echo "$resp" | jq -r ".result[$i].callback_query.message.message_id // empty")
         ack_callback "$cb_id"
         # Translate callback_data → command. Format: "<action>:<arg>"
         case "$cb_data" in
@@ -2143,6 +2202,7 @@ main() {
           watch_off:*) dispatch "$cb_chat" "/watch off ${cb_data#watch_off:}" ;;
           pick:*)   cmd_pick "${cb_data#pick:}" ;;   # TUI-menu option tapped
           ask:*)    cmd_ask "${cb_data#ask:}" ;;     # AskUserQuestion option tapped
+          nav:*)    cmd_nav "${cb_data#nav:}" "$cb_msg" ;;  # TUI remote-control key
           *)        log "unhandled callback: $cb_data" ;;
         esac
         continue

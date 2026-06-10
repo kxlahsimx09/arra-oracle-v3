@@ -135,6 +135,14 @@ send_tg() {
     "${args[@]}" -o /dev/null 2>/dev/null
 }
 
+# Remote-control keyboard for a live TUI menu. Each button → bot.sh's nav:
+# handler, which sends the key to the pane, re-captures, and edits the message.
+# Identical layout is rebuilt in bot.sh (nav_keyboard) for the edits.
+menu_remote_kbd() {
+  local c="$CHAT_ID"
+  printf '{"inline_keyboard":[[{"text":"⬆️","callback_data":"nav:%s:up"},{"text":"⬇️","callback_data":"nav:%s:down"}],[{"text":"✅ เลือก/toggle","callback_data":"nav:%s:enter"}],[{"text":"📤 Submit","callback_data":"nav:%s:submit"},{"text":"❌ Esc","callback_data":"nav:%s:esc"}]]}' "$c" "$c" "$c" "$c" "$c"
+}
+
 # Gist publishing — `gist_publish` + `GIST_THRESHOLD` live in `gist.sh`
 # (sourced below) so bot.sh's cmd_look and this watcher stay in sync.
 # Replaced an earlier telegra.ph path that bucketed everything into one
@@ -460,18 +468,10 @@ while true; do
     sed -n "$((last_line_count + 1)),${cur_count}p" "$current_jsonl" 2>/dev/null \
       | while IFS= read -r line; do
         [ -z "$line" ] && continue
-        # AskUserQuestion menu → push full questions + tappable buttons, then
-        # skip normal turn handling (it's a tool_use, no displayable text). A
-        # matching tool_result means it was answered → clear the pending state
-        # so a later "2,2" reply can't mis-route to a stale menu.
-        case "$line" in
-          *'"AskUserQuestion"'*) maybe_push_ask "$line" && continue ;;
-          *'"tool_result"'*)
-            if [ -s "$ASK_PENDING_STATE" ] && \
-               printf '%s' "$line" | grep -q "$(cut -d'|' -f1 "$ASK_PENDING_STATE")"; then
-              rm -f "$ASK_PENDING_STATE"; log "AskUserQuestion answered — cleared pending"
-            fi ;;
-        esac
+        # NB: TUI selection menus are handled by the screen-scrape remote-control
+        # path in the idle block below, NOT from JSONL — in agent-teams the
+        # JSONL↔on-screen mapping is unreliable (different sessions share a
+        # project dir), so the live pane is the ground truth.
         # Keepalive filter (agent-teams): an idle_notification user turn polls
         # the teammate; the teammate's reply to it is throwaway status noise.
         # Suppress that reply by keying on the trigger, not the words. State
@@ -555,34 +555,16 @@ while true; do
     # Bare `❯ ` is claude's text-input prefix → false-positive while streaming.
     pane_visible=$(tmux capture-pane -t "$PANE" -p 2>/dev/null)
     if printf '%s' "$pane_visible" | grep -qE '^[[:space:]]*❯ [0-9]+\.'; then
-      # Extract the `N. text` option lines (drop the ❯ cursor + indent) and turn
-      # them into one Telegram inline-keyboard button each, so the user picks
-      # from chat instead of driving the TUI by hand. callback_data carries the
-      # chat + option number; bot.sh's `pick:` handler navigates the pane.
-      menu_opts=$(printf '%s' "$pane_visible" \
-        | grep -E '^[[:space:]]*❯?[[:space:]]*[0-9]+\.[[:space:]]' \
-        | sed -E 's/^[[:space:]]*❯?[[:space:]]*//')
-      kbd=$(printf '%s\n' "$menu_opts" | jq -R -s -c --arg chat "$CHAT_ID" \
-        '{inline_keyboard: [ split("\n")[] | select(test("^[0-9]+\\.")) |
-           [ { text: (.[0:60]),
-               callback_data: ("pick:" + $chat + ":" + (capture("^(?<n>[0-9]+)").n)) } ] ]}' 2>/dev/null)
-      q=$(printf '%s' "$pane_visible" | grep -E '\?[[:space:]]*$' | tail -1)
-      if [ -n "$kbd" ] && printf '%s' "$kbd" | grep -q 'callback_data'; then
-        send_tg "🔔 <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> รอให้เลือก (TUI):
-${q:+<i>$(printf '%s' "$q" | html_escape)</i>
-}กดปุ่มเลือกได้เลย หรือ /key เอง" false "$kbd"
-        idle_notified=1
-        log "TUI menu detected — pushed $(printf '%s' "$menu_opts" | grep -cE '^[0-9]+\.') options as buttons"
-      else
-        # Parse failed — fall back to the plain pane-snapshot nudge.
-        pane_snap=$(tmux capture-pane -t "$PANE" -pS -1000 2>/dev/null)
-        url=$(gist_publish "${CHAT_ID} idle TUI prompt — $(date '+%Y-%m-%d %H:%M')" "$pane_snap" "txt")
-        body=${url:+"📖 <a href=\"$url\">read full pane on gist</a>"}
-        send_tg "🔔 <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> รอคำตอบ (TUI prompt — Escape ออก หรือไปตอบใน pane):
-${body:-<pre>$(printf '%s' "$pane_snap" | tail -20 | html_escape)</pre>}"
-        idle_notified=1
-        log "idle TUI prompt detected — pushed alert (gist=${url:-fail})"
-      fi
+      # A TUI selection menu is up. Push the live screen + a remote-control
+      # keyboard (⬆️⬇️ ✅ 📤 ❌). The user drives the pane from chat; bot.sh's
+      # nav: handler sends each key, re-captures, and edits this message so the
+      # cursor/checkboxes update live. Works for single- AND multi-select
+      # (checkbox + Submit) menus — the on-screen pane is the ground truth.
+      menu_snap=$(printf '%s' "$pane_visible" | grep -vE '^[[:space:]]*$' | tail -22 | html_escape)
+      send_tg "🎮 <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> เมนู TUI — คุมด้วยปุ่มล่าง (✅ เลือก/ติ๊ก, 📤 ไป Submit):
+<pre>${menu_snap}</pre>" false "$(menu_remote_kbd)"
+      idle_notified=1
+      log "TUI menu detected — pushed remote-control keyboard"
     fi
   fi
 
