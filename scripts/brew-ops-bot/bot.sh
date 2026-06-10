@@ -402,6 +402,14 @@ recover_watchers() {
       # watcher that can never find a JSONL — clean up bot state instead.
       local sf; sf=$(dead_strike_file "$chat")
       if ! is_session_alive_for "$pane"; then
+        # Multi-pane window guard: if another pane of THIS chat is still a live
+        # agent, this dead pane is just a sibling (e.g. an exited team-subagent
+        # in the orchestrator's window). Cleaning up would clobber the live
+        # chat's watcher + aliases — the "session/alias keeps vanishing" bug.
+        if chat_has_live_pane "$role" "$slug"; then
+          rm -f "$sf" 2>/dev/null
+          continue
+        fi
         # One dead reading is not proof the session ended — require
         # DEAD_STRIKE_THRESHOLD consecutive sweeps before the destructive
         # cleanup (which drops the watcher AND the Telegram active-chat binding).
@@ -494,6 +502,20 @@ chats_for_role() {
   local role="$1"
   tmux list-panes -a -F "#{pane_id}|#{session_name}|#{window_name}|#{pane_current_command}" 2>/dev/null \
     | awk -F'|' -v p="${role}-" 'index($3, p) == 1 { slug=substr($3, length(p)+1); print $0 "|" slug }'
+}
+
+# True if ANY pane mapped to <role>/<slug> is currently a live agent. A chat maps
+# to a tmux WINDOW, and a window can hold several panes — e.g. an agent-teams
+# window keeps the orchestrator pane PLUS its exited team-subagent panes (now
+# zsh). Used so a dead sibling pane can't trigger cleanup of a chat whose primary
+# pane is still alive (which would wrongly drop its watcher + aliases).
+chat_has_live_pane() {
+  local role="$1" slug="$2" _p _s _w _c _sl
+  while IFS='|' read -r _p _s _w _c _sl; do
+    [ "$_sl" = "$slug" ] || continue
+    is_session_alive_for "$_p" && return 0
+  done <<< "$(chats_for_role "$role")"
+  return 1
 }
 
 # Resolve <role>/<slug> or just <role> to a pane line. Slug supports prefix
