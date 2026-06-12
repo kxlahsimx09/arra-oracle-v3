@@ -145,6 +145,14 @@ SILENT_FAIL_TG_PROJECT=${SILENT_FAIL_TG_PROJECT:-$HOME/Code/github.com/kokarat/m
 # git config). Used by silent-fail detector to count AMEND-path commits in
 # addition to NEW PRs.
 COMMIT_AUTHOR=${COMMIT_AUTHOR:-amadeusmarsexpress}
+# Regression runner host. When non-empty, the chained
+# regression-then-investigate.sh delegates the entire build+suite to this host
+# over SSH (scripts/regression-on-droplet.sh) instead of local Docker — this
+# machine has no usable Docker daemon, so a bare default would mean no regression
+# runs at all. Exported so the nohup'd chain inherits it; override/clear via env.
+# Provision a fresh host with scripts/provision-regression-droplet.sh.
+# (learning 2026-06-12_fleet-infra-temp-mb-regression-droplet, thread #15.)
+export REGRESSION_HOST=${REGRESSION_HOST:-root@178.128.93.199}
 
 send_silent_fail_telegram() {
   local role="$1" repo_slug="$2" wake_ts="$3" elapsed="$4" reason="${5:-}"

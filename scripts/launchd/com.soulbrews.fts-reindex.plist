@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd supervisor for fts-reindex.sh — periodic STEP-1 (SQLite + FTS5)
+  auto-ingest of the Oracle vault. Closes the "no watcher / no cron → fresh ψ/
+  files invisible until a manual reindex" gap (thread #15).
+
+  Rendered by scripts/install-launchd-fts-reindex.sh (__ARRA__ / __HOME__ /
+  __VAULT__ are substituted at install time). Do NOT load this file directly.
+
+  StartInterval (NOT KeepAlive): launchd runs the script once at load and every
+  StartInterval seconds, and coalesces — it will not start a second instance of
+  the same Label while the prior run is still alive. The script adds its own
+  mkdir lock, a vector-build guard, and git-signature change-detection (skips the
+  indexer + its per-run backup when the vault is unchanged), so most ticks are a
+  sub-second no-op. It runs ONLY STEP 1; the ~84-min vector STEP 2 is never
+  scheduled.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.soulbrews.fts-reindex</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__ARRA__/scripts/fts-reindex.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>__ARRA__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.bun/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>ARRA</key>
+        <string>__ARRA__</string>
+        <key>ORACLE_REPO_ROOT</key>
+        <string>__VAULT__</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.cache/soul-brews-startup/fts-reindex.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.cache/soul-brews-startup/fts-reindex.launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

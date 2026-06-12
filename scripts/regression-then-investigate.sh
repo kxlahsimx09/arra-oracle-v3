@@ -340,6 +340,34 @@ INFRA_LOG="$RUN_DIR/infra.log"
 # Cost: ~30-60s extra per regression run for fresh container init +
 # mongo seed + bot Playwright cold start. Acceptable trade for
 # determinism — flake debug cycles cost 10x more.
+# ── Droplet delegation (opt-in via REGRESSION_HOST) ────────────────────────
+# When the local Docker daemon is unavailable (e.g. this host has no usable
+# Docker), set REGRESSION_HOST=user@ip to run the entire build+suite on a remote
+# droplet via scripts/regression-on-droplet.sh — which drives these SAME
+# integration-tests scripts over SSH — then Telegram the result and exit BEFORE
+# any local docker work. Unset (default) = unchanged local behavior.
+# Provision the host once with scripts/provision-regression-droplet.sh.
+# (learning 2026-06-12_fleet-infra-temp-mb-regression-droplet, thread #15.)
+if [ -n "${REGRESSION_HOST:-}" ]; then
+  log "REGRESSION_HOST=$REGRESSION_HOST — delegating build+run to the droplet (local Docker not used)"
+  DROP_OUT="$RUN_DIR/droplet-run.log"
+  SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  REGRESSION_HOST="$REGRESSION_HOST" BRANCH="$BRANCH" BANK_BOT_BRANCH="$BANK_BOT_BRANCH" \
+    FAIL_FAST="${FAIL_FAST:-1}" PER_TEST_TIMEOUT="$PER_TEST_TIMEOUT" \
+    bash "$SELF_DIR/regression-on-droplet.sh" 2>&1 | tee "$DROP_OUT"
+  DROP_RC=${PIPESTATUS[0]}
+  RESULT_LINE=$(grep -E "RESULT:|ABORT:" "$DROP_OUT" | tail -1)
+  if [ "$DROP_RC" = 0 ]; then
+    send_tg "✅ <b>${RUN_LABEL} (droplet) ${RUN_ID}</b>
+${RESULT_LINE:-all passed} — host <code>${REGRESSION_HOST}</code>"
+  else
+    send_tg "🔴 <b>${RUN_LABEL} (droplet) FAILED</b> (run <code>${RUN_ID}</code>)
+${RESULT_LINE:-see logs} — host <code>${REGRESSION_HOST}</code>
+pulled logs: <code>~/.cache/w2-watcher/regression-droplet/</code>"
+  fi
+  exit "$DROP_RC"
+fi
+
 log "Tearing down stale containers + volumes (state hygiene before rebuild)..."
 docker compose -f integration-tests/docker-compose.yml down -v >> "$INFRA_LOG" 2>&1 || \
   log "  WARN: docker compose down -v exited non-zero (no containers to remove?) — continuing"
