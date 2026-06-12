@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd supervisor for worktree-janitor.sh (Path 3 — TTL worktree cleanup).
+
+  Rendered by scripts/install-launchd-janitor.sh (__ARRA__ / __HOME__ are
+  substituted at install time). Do NOT load this file directly.
+
+  Runs the janitor in `start` (daemon loop) mode: it scans every
+  SCAN_INTERVAL (4h) and retires auto-safe worktrees (age >7d + clean +
+  pushed + claude-dead + not inbox-referenced). needs-review / lost-work
+  classes are NEVER auto-deleted — only Telegram-alerted. JANITOR_AUTO=1
+  enables the retire action (without it the loop is dry-run only).
+
+  KeepAlive restarts on any exit (the loop is infinite, so this only fires
+  on crash/kill); ThrottleInterval backs off a crash-loop.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.soulbrews.worktree-janitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__ARRA__/scripts/worktree-janitor.sh</string>
+        <string>start</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>WorkingDirectory</key>
+    <string>__ARRA__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.bun/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>JANITOR_AUTO</key>
+        <string>1</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.cache/soul-brews-startup/worktree-janitor.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.cache/soul-brews-startup/worktree-janitor.launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
