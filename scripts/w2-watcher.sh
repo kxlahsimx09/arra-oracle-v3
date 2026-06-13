@@ -87,6 +87,13 @@ MIN_GAP=${MIN_GAP:-7200}                # 2 hr
 IGNORE_AUTHORS=${IGNORE_AUTHORS:-'kxlahsimx09|amadeusmarsexpress'}
 
 STATE_DIR=${STATE_DIR:-$HOME/.cache/w2-watcher}
+# Kill-switch: while this flag file exists, deploy-class triggers (the staging
+# auto-deploy / workflow-7 PUSH) are SKIPPED — the doc-workflow roles keep
+# running. Toggle WITHOUT a restart (checked from disk each poll): `touch` to
+# pause, `rm` to resume. Survives restarts (so a re-sync restart can't silently
+# re-enable). Manual `workflow-7` runs are unaffected. Added 2026-06-13 to pause
+# staging auto-deploy during frequent code-change windows (owner request).
+DEPLOY_DISABLED_FLAG=${DEPLOY_DISABLED_FLAG:-$STATE_DIR/deploy-triggers.disabled}
 PID_FILE=$STATE_DIR/watcher.pid
 LOG_FILE=${LOG_FILE:-$STATE_DIR/watcher.log}
 mkdir -p "$STATE_DIR"
@@ -244,6 +251,11 @@ cmd_status() {
   else
     echo "  watcher:   not running"
   fi
+  if [ -f "$DEPLOY_DISABLED_FLAG" ]; then
+    echo "  deploy triggers: DISABLED (flag present — staging auto-deploy OFF, run workflow-7 manually)"
+  else
+    echo "  deploy triggers: enabled (staging auto-deploy on main advance)"
+  fi
   echo ""
   for role in "${!REPOS[@]}"; do
     repo=${REPOS[$role]}
@@ -388,6 +400,9 @@ cmd_run() {
   log "  POLL_INTERVAL=${POLL_INTERVAL}s  SETTLE_WINDOW=${SETTLE_WINDOW}s  MIN_GAP=${MIN_GAP}s"
   log "  ignoring commits by: ${IGNORE_AUTHORS}"
   log "  maw binary: ${MAW_BIN}"
+  if [ -f "$DEPLOY_DISABLED_FLAG" ]; then
+    log "  deploy triggers: DISABLED (flag: $DEPLOY_DISABLED_FLAG) — staging auto-deploy OFF; run workflow-7 manually. rm the flag to re-enable."
+  fi
 
   while true; do
     for role in "${!REPOS[@]}"; do
@@ -402,6 +417,13 @@ cmd_run() {
       last_run=0
       pending_wake_ts=0
       [ -f "$state_file" ] && source "$state_file"
+
+      # Kill-switch: deploy-class triggers (staging auto-deploy) are paused while
+      # the flag file exists — skip the role entirely (no fetch/arm/fire). Doc
+      # roles are unaffected. `rm "$DEPLOY_DISABLED_FLAG"` to resume (no restart).
+      if [ -n "${DEPLOY_WAKE_ROLE[$role]:-}" ] && [ -f "$DEPLOY_DISABLED_FLAG" ]; then
+        continue
+      fi
 
       # Silent-fail check: did the previous wake actually produce output?
       # Runs before fetch so it fires even on offline rounds. Only checks
