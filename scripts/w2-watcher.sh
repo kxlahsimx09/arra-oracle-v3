@@ -108,11 +108,13 @@ declare -A REPOS=(
   ["pg-writer"]="$HOME/Code/github.com/kokarat/mobiz-payment-gateway"
   ["bot-writer"]="$HOME/Code/github.com/kokarat/bank-bot"
   ["pg-tester"]="$HOME/Code/github.com/kokarat/mobiz-payment-gateway"
+  ["brew-ops"]="$HOME/Code/github.com/kxlahsimx09/mb-next-payment-gateway"   # staging auto-deploy: PRIMARY signal repo (see DEPLOY_* below)
 )
 declare -A STEP_NAMES=(
   ["pg-writer"]="8b"   # mobiz W2 has Step 8b for Telegram (mcp: telegram)
   ["bot-writer"]="6b"  # bank-bot W2 has Step 6b for Telegram (mcp: telegram)
   ["pg-tester"]="7b"      # mobiz tester W1 has Step 7b for Telegram (mcp: tester-telegram)
+  ["brew-ops"]="-"     # deploy trigger: no Telegram step (workflow-7 emits its own manifest/report)
 )
 
 # Per-role branch patterns. The silent-fail detector uses these to scope its
@@ -126,7 +128,38 @@ declare -A WAKE_BRANCH_PATTERNS=(
   ["pg-writer"]="docs/track- docs/flow-track-"
   ["bot-writer"]="docs/track- docs/flow-track-"
   ["pg-tester"]="feat/tester-validate-"
+  ["brew-ops"]="ops/staging-deploy- staging-deploy"   # brew-ops's workflow-7 manifest PR branch (Step 4)
 )
+
+# ── Deploy-class triggers (PUSH): staging auto-redeploy on main advance ──────
+# Unlike the doc-workflow roles above, a deploy trigger watches the staging
+# SOURCE repos and, on ANY origin/main advance (author-filter OFF — the merger
+# kxlahsimx09 is in IGNORE_AUTHORS, so the doc-flow filter would suppress every
+# real deploy), wakes brew-ops to run workflow-7 (substrate deploy from
+# main@HEAD). This is the PUSH half of the deploy-currency design (thread #16
+# follow-on): staging always tracks latest main so nobody has to check it;
+# every OTHER stack uses the PULL half (mb-next .../scripts/stack-freshness.sh).
+#
+# A role is a deploy trigger iff it has a DEPLOY_WAKE_ROLE entry. REPOS[$role]
+# is the PRIMARY signal repo; DEPLOY_EXTRA_REPOS adds more whose main advancing
+# ALSO fires. Detection uses a COMBINED FINGERPRINT (concatenated origin/main of
+# every watched repo) — not rev-list ancestry — and only FETCHes (never pulls)
+# because a source repo's primary checkout may sit on a feature branch.
+#
+# Phase-1 substrate scope = what workflow-7 deploys to staging today: migrations
+# / EFs / CF worker (gateway) + admin UI (portal). bank-bot's substrate is EC2/DO
+# (its own scripts) — add it here only once workflow-7 covers the bank-bot
+# container + mock-bank (Phase 4).
+declare -A DEPLOY_WAKE_ROLE=( ["brew-ops"]="brew-ops" )   # trigger-key → maw role to wake
+declare -A DEPLOY_EXTRA_REPOS=(
+  ["brew-ops"]="$HOME/Code/github.com/kxlahsimx09/mb-next-admin-portal"
+  #  + $HOME/Code/github.com/kxlahsimx09/mb-next-bank-bot   # Phase 4 (bank-bot container + mock-bank)
+)
+declare -A DEPLOY_WAKE_SESSION=( ["brew-ops"]="01-soul-brews" )   # tmux session for wake recovery
+# Deploy debounce: tighter settle (batch a merge burst), shorter floor —
+# workflow-7 is idempotent (a redundant run is a no-op + manifest refresh).
+DEPLOY_SETTLE_WINDOW=${DEPLOY_SETTLE_WINDOW:-900}    # 15 min
+DEPLOY_MIN_GAP=${DEPLOY_MIN_GAP:-1800}               # 30 min
 
 log() {
   local ts=$(date '+%Y-%m-%d %H:%M:%S')
@@ -449,11 +482,28 @@ cmd_run() {
       # worktree can't see commits the watcher already detected (observed
       # 2026-04-25..27: bank-bot local main stuck at ffd626b while origin/main
       # advanced 6 commits, every wake's worktree checkout was stale).
-      if ! git "${GIT_AUTH_FLAGS[@]}" -C "$repo" pull --ff-only origin main 2>/dev/null; then
+      if [ -n "${DEPLOY_WAKE_ROLE[$role]:-}" ]; then
+        # Deploy trigger: only FETCH origin/main (the source repo's primary
+        # checkout may sit on a feature branch, so `pull --ff-only` would abort
+        # and the trigger would never fire). workflow-7 does its own clean
+        # `checkout main && pull` at deploy time.
+        if ! git "${GIT_AUTH_FLAGS[@]}" -C "$repo" fetch origin main --quiet 2>/dev/null; then
+          log "[$role] fetch failed; skipping"
+          continue
+        fi
+      elif ! git "${GIT_AUTH_FLAGS[@]}" -C "$repo" pull --ff-only origin main 2>/dev/null; then
         log "[$role] fetch failed; skipping"
         continue
       fi
       current=$(git -C "$repo" rev-parse origin/main 2>/dev/null)
+      # Deploy trigger: fold every EXTRA staging source repo's origin/main into a
+      # combined fingerprint so a portal-only (future: bank-bot) merge also fires.
+      if [ -n "${DEPLOY_WAKE_ROLE[$role]:-}" ]; then
+        for xrepo in ${DEPLOY_EXTRA_REPOS[$role]:-}; do
+          git "${GIT_AUTH_FLAGS[@]}" -C "$xrepo" fetch origin main --quiet 2>/dev/null || true
+          current="${current}+$(git -C "$xrepo" rev-parse origin/main 2>/dev/null)"
+        done
+      fi
 
       # first sighting: seed + don't fire (avoids a run on launch
       # just because we've never seen the repo before)
@@ -468,21 +518,30 @@ cmd_run() {
 
       # new commits detected
       if [ "$current" != "$last_seen" ]; then
-        total=$(git -C "$repo" rev-list --count "$last_seen..$current" 2>/dev/null || echo 0)
-        # count commits NOT authored by the ignore-list (match on name OR email)
-        relevant=$(git -C "$repo" log --format='%an|%ae' "$last_seen..$current" 2>/dev/null \
-                   | grep -Ev "$IGNORE_AUTHORS" | wc -l | tr -d ' ')
-        relevant=${relevant:-0}
-
-        if [ "$relevant" -gt 0 ]; then
-          log "[$role] $relevant trackable new commits ($total total): ${last_seen:0:7}..${current:0:7}"
+        if [ -n "${DEPLOY_WAKE_ROLE[$role]:-}" ]; then
+          # Deploy trigger: ANY main advance arms — author-filter OFF (the
+          # merger kxlahsimx09 is in IGNORE_AUTHORS; staging must track main no
+          # matter who merged). current is a combined fingerprint → no rev-list.
+          log "[$role] staging source advanced → armed for deploy"
           last_seen=$current
           last_new=$now
         else
-          # all new commits were by ignored authors — advance last_seen so we
-          # don't re-scan them, but don't arm the settle window
-          log "[$role] $total new commits all by ignored authors — skipping"
-          last_seen=$current
+          total=$(git -C "$repo" rev-list --count "$last_seen..$current" 2>/dev/null || echo 0)
+          # count commits NOT authored by the ignore-list (match on name OR email)
+          relevant=$(git -C "$repo" log --format='%an|%ae' "$last_seen..$current" 2>/dev/null \
+                     | grep -Ev "$IGNORE_AUTHORS" | wc -l | tr -d ' ')
+          relevant=${relevant:-0}
+
+          if [ "$relevant" -gt 0 ]; then
+            log "[$role] $relevant trackable new commits ($total total): ${last_seen:0:7}..${current:0:7}"
+            last_seen=$current
+            last_new=$now
+          else
+            # all new commits were by ignored authors — advance last_seen so we
+            # don't re-scan them, but don't arm the settle window
+            log "[$role] $total new commits all by ignored authors — skipping"
+            last_seen=$current
+          fi
         fi
       fi
 
@@ -490,9 +549,12 @@ cmd_run() {
       if [ "$last_new" -gt 0 ]; then
         settle_elapsed=$((now - last_new))
         gap_elapsed=$((now - last_run))
+        # deploy triggers use their own (tighter) settle/gap; doc roles the defaults
+        sw=$SETTLE_WINDOW; gp=$MIN_GAP
+        if [ -n "${DEPLOY_WAKE_ROLE[$role]:-}" ]; then sw=$DEPLOY_SETTLE_WINDOW; gp=$DEPLOY_MIN_GAP; fi
 
-        if [ "$settle_elapsed" -ge "$SETTLE_WINDOW" ]; then
-          if [ "$gap_elapsed" -ge "$MIN_GAP" ] || [ "$last_run" -eq 0 ]; then
+        if [ "$settle_elapsed" -ge "$sw" ]; then
+          if [ "$gap_elapsed" -ge "$gp" ] || [ "$last_run" -eq 0 ]; then
             log "[$role] TRIGGER wake (settle=$((settle_elapsed/60))min, gap=$((gap_elapsed/60))min)"
             # maw wake fires fresh worktree + fresh claude + sends the task.
             # Output is one-shot print-mode. If it fails mid-workflow, each
@@ -503,6 +565,10 @@ cmd_run() {
             # Telegram step today — see header comment).
             if [ "$role" = "pg-tester" ]; then
               prompt="อ่าน .agent/skills/tester/SKILL.md + .agent/skills/tester/references/workflow-1-validate-integration-tests.md ให้ครบ แล้วรัน W1 validate-integration-tests จนจบ. W1 เป็น full-sweep static analysis ของทุก integration-tests/test-*.sh — ใช้ \$PRIOR_BASELINE..HEAD จาก docs/test-index.md header เพื่อ scope STALE candidates. เสร็จ Step 7 (commit+PR) + Step ${step} (Telegram summary via mcp__tester-telegram__telegram_send — ไม่ใช่ generic telegram MCP ของ writer fleet) + Step 8 (retro) แล้วจบ pass — ไม่ต้อง chain workflow อื่น. ถ้า zero production-surface commits ใน range และ pattern library (\`.agent/skills/integration-test-writer/\`) ไม่ได้แก้ ให้ skip Step 7 PR (no-op) แต่ยังส่ง Telegram short-note ว่า 'วันนี้ validate N tests, 0 regression' เพื่อรักษา cadence, แล้วเขียน retro ว่า no-op."
+            elif [ -n "${DEPLOY_WAKE_ROLE[$role]:-}" ]; then
+              # Deploy trigger (PUSH): main advanced → redeploy staging from
+              # main@HEAD via workflow-7. Idempotent — unchanged substrates skip.
+              prompt="staging source (gateway + admin-portal) main ขยับ → รัน workflow-7 staging full-stack deploy. อ่าน .agent/skills/brew-ops/references/workflow-7-staging-deploy.md ให้ครบ แล้ว deploy เฉพาะ substrate ที่เปลี่ยนจาก main@HEAD ลง staging (project ref sinuwgsqqyqzlpaavimf) ตามลำดับ: migrations (db push ผ่าน IPv4 pooler) → EFs (functions deploy --project-ref) → CF worker (wrangler deploy) → admin UI (vercel deploy). source slot staging.env (owner-held, อย่า echo/commit). เสร็จ Step 3 readiness assert ให้เขียวทุกตัว — scripts/ef-deploy-list.sh --assert sinuwgsqqyqzlpaavimf + migration ledger + worker/UI — แล้ว Step 4 refresh STAGING-DEPLOY-MANIFEST.md + per-run evidence, commit + เปิด PR (branch ขึ้นต้น 'ops/staging-deploy-' เพื่อให้ silent-fail detector เห็น) ห้าม merge. นี่คือ PUSH auto-deploy หลัง main advance: idempotent — substrate ไหนไม่เปลี่ยน = skipped-no-change, ถ้าไม่มีอะไรเปลี่ยนเลยก็ re-stamp manifest เฉย ๆ. substrate ไหน deploy ไม่ผ่าน = blocker, รายงาน."
             else
               # W9 chained after W2 in the same wake (Option A from 2026-04-21
               # design discussion). One claude session, one worktree, two specs
@@ -565,6 +631,7 @@ cmd_run() {
               case "$role" in
                 pg-writer|pg-tester) wake_session=03-payment-gateway ;;
                 bot-writer)          wake_session=02-bank-bot ;;
+                brew-ops)            wake_session="${DEPLOY_WAKE_SESSION[$role]:-}" ;;
                 *)                   wake_session="" ;;
               esac
               wake_target="${wake_session}:${role}-${wake_ts}"
