@@ -1,9 +1,16 @@
 # AGENTS.md — arra-oracle-v3 Operating Contract
 
+<!-- last verified: 2026-06-15 — re-check claims against code if >7 days old (/rrr should flag). -->
+
 Top-level contract for **every** agent working in this repo (codex/omx coders,
 Claude leads, human contributors). omx auto-generates a session-local AGENTS.md
 for its own runtime; **this** file is the project-level source of truth and
 overrides anything that conflicts. Mirrors `CLAUDE.md` Project Conventions.
+
+**Verify claims against code, not this file.** Docs go stale (the Hono→Elysia
+note lagged the real state by ~57 days). A `grep`/`tsc`/`bun test` is cheaper
+than acting on a stale claim. Coders: when a task contradicts the verified code
+state, BLOCK and ask the lead — do not guess.
 
 > arra-oracle-v3 is the **MCP memory / search layer** for the Oracle family:
 > semantic search over 20k+ docs (bge-m3 + nomic + qwen3 + FTS5), the indexer
@@ -70,9 +77,29 @@ overrides anything that conflicts. Mirrors `CLAUDE.md` Project Conventions.
 
 ## 7. Reporting (codex → lead)
 
-Report **only on completion** with: ✅ summary · commit SHA · build/test result ·
-PR URL. If blocked, report the blocker and the alternative you tried. Don't
-narrate every step; don't ask "should I proceed?" on obvious next steps.
+**Done-only reporting** (cuts noise ~70%; family standard per ting). Do NOT send
+"starting" / "working" updates. Exactly two messages reach the lead:
+- ✅ `done <task> — commit <sha>, build pass, PR <url>` (+ screenshot if UI)
+- ❌ `blocked: <exact reason>` (+ the alternative you already tried)
+
+Never go dark and never forget the `done` report — silence reads as stalled.
+
+### Done-criteria checklist (self-verify BEFORE reporting done)
+- [ ] `bun run build` / `tsc --noEmit` passes
+- [ ] scoped `bun test tests/http/<cluster>/` green (NOT bare `bun test` — it
+      pulls agents/ worktree copies)
+- [ ] every changed file ≤ 250 lines (`wc -l`)
+- [ ] self `git diff` review — no stray `console.log`/debug, no dead code
+- [ ] no endpoint/function others rely on was removed or renamed
+- [ ] `actionlint` if a workflow was touched; screenshot if UI changed
+- [ ] branched from current `origin/alpha`; no force operations used
+- [ ] committed to your branch; PR targets `alpha`
+
+### Review & merge
+The **lead reviews every PR before merge** (mergeable? file sizes? build/test
+report? screenshot?). No peer review between coders — worktrees are isolated, so
+coders cannot see each other's uncommitted work and coordinate only through the
+lead. **Coders never self-merge.**
 
 ## 8. Data / Schema
 
@@ -88,6 +115,13 @@ narrate every step; don't ask "should I proceed?" on obvious next steps.
 - `src/vault/`, `src/trace/`, `src/learn/` — knowledge management
 - `src/routes/` — Elysia route clusters (`.use()`-composed in `src/server.ts`)
 - HTTP backend on `:47778`; frontend (Vite) on `:3000` proxying `/api/*`
+
+**Route clusters (21, all under `src/routes/<cluster>/`):** auth, dashboard,
+feed, files, forum, health, indexer, indexer-daemon, knowledge, menu, oraclenet,
+peer, plugins, schedule, search, sessions, settings, supersede, traces, vault,
+vector. Auth-guarded `/api/*` except open `/health`, `/peer/*`, `/identity`
+(federation). To regenerate this list: `ls src/routes/`. `src/routes/health/` is
+the reference module for a new cluster.
 
 ---
 
