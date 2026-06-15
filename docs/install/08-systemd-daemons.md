@@ -26,15 +26,25 @@ Without these, `systemctl --user` errors with `Failed to connect to bus`.
 |---|---|---|---|
 | — | `ollama.service` | `brew services` | **system** unit, added by the Ollama installer (already enabled) |
 | 1 | `oracle-http.service` | nohup / optional plist | the :47778 MCP backend |
-| 2 | `inbox-watcher.service` | **launchd** KeepAlive | core fleet dispatch — `TimeoutStopSec` matters (below) |
-| 3 | `w2-watcher.service` | nohup | settle-window deploy watcher |
-| 4 | `brew-ops-bot.service` | nohup | Telegram bot (spawns chat-watcher) |
-| 5 | `orchestrator-bot.service` | nohup | Telegram bot |
+| 2 | `w2-watcher.service` | nohup | settle-window deploy watcher |
+| 3 | `brew-ops-bot.service` | nohup | Telegram bot (spawns chat-watcher) |
+| 4 | `orchestrator-bot.service` | nohup | Telegram bot |
+| — | `inbox-watcher.service` | launchd (now **disabled**) | **LEGACY — do NOT enable** (see ⚠️ below) |
 
 `ollama.service` is **system-level** (runs as the `ollama` user) — leave it as the
 installer set it; the user units below reference it with `After=` only (ordering
 across the system/user boundary is best-effort, which is fine — Oracle retries the
 embedder).
+
+> **⚠️ `inbox-watcher.service` is LEGACY — leave it disabled.** It was the old
+> "core fleet dispatch" daemon but has been off in production since **2026-05-30**
+> (its macOS launchd plist was renamed `…inbox-watcher.plist.disabled-20260530`)
+> and the fleet runs fine without it — owner-confirmed 2026-06-15. Dispatch now
+> flows through the **bots + maw**, not inbox-envelope polling. The unit template
+> below is kept for reference only; **do not add it to the enable loop.** Under
+> `Type=simple` it self-traps anyway: `inbox-watcher.sh start` runs `run_loop` in
+> the foreground but guards on a pidfile, so the MainPID/child split makes systemd
+> loop on `another inbox-watcher.sh is already running … exit 1`.
 
 ## Unit templates → `~/.config/systemd/user/`
 
@@ -58,9 +68,9 @@ WantedBy=default.target
 ```
 
 ```ini
-# inbox-watcher.service
+# inbox-watcher.service — ⚠️ LEGACY / DISABLED — kept for reference; do NOT enable (see the note above)
 [Unit]
-Description=Oracle inbox-watcher (fleet dispatch)
+Description=Oracle inbox-watcher (fleet dispatch — LEGACY, disabled)
 After=oracle-http.service
 Requires=oracle-http.service
 [Service]
@@ -101,7 +111,7 @@ and spawn their own chat-watcher — no separate unit needed).
 ```bash
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 systemctl --user daemon-reload
-for u in oracle-http inbox-watcher w2-watcher brew-ops-bot orchestrator-bot; do
+for u in oracle-http w2-watcher brew-ops-bot orchestrator-bot; do   # NOT inbox-watcher (legacy/disabled)
   systemctl --user enable --now "$u.service"
   sleep 2; systemctl --user is-active "$u.service"
 done
@@ -110,17 +120,17 @@ done
 ## Logs + ops (journald replaces the macOS log files)
 
 ```bash
-journalctl --user -u inbox-watcher.service -f          # follow
+journalctl --user -u brew-ops-bot.service -f           # follow
 journalctl --user -u oracle-http.service --since "10 min ago"
-systemctl --user status inbox-watcher.service
-systemctl --user restart inbox-watcher.service         # after re-syncing arra (§3c discipline)
+systemctl --user status w2-watcher.service
+systemctl --user restart w2-watcher.service            # after re-syncing arra (§3c discipline)
 ```
 
 > **Runtime-checkout discipline still applies** (02-repos-symlinks §3c): both
 > `arra-oracle-v3` and `maw-js` primaries stay on `feat/all-prs-rebased`; after a
-> `git merge --ff-only`, **`systemctl --user restart inbox-watcher.service`** (the
-> bash daemon re-reads its file on restart) — the systemd equivalent of the macOS
-> "stop then start" step.
+> `git merge --ff-only`, **restart the affected daemons** (e.g. `systemctl --user
+> restart w2-watcher brew-ops-bot orchestrator-bot`) so the bash daemons re-read
+> their files — the systemd equivalent of the macOS "stop then start" step.
 
 ## ⚠️ Blocked-on: BSD→GNU portability (07 §8) — do this BEFORE enabling the units
 
@@ -128,7 +138,8 @@ The daemons will *start* but **silently misbehave** until the BSD-isms found in 
 2026-06-15 audit are fixed (Linux GNU coreutils differ):
 
 - `scripts/inbox-watcher.sh` — **5× `stat -f %m`** (lines ~417/744/781/1718/1765):
-  JSONL mtime/recency → returns empty on Linux → liveness/dispatch misfires. **Highest risk.**
+  JSONL mtime/recency → empty on Linux. *(inbox-watcher is **legacy/disabled** — the
+  fix is in the script but not load-bearing since the daemon isn't enabled.)*
 - `scripts/w2-watcher.sh` — **3× `date -r <epoch>`** (~196/197/469): on Linux `date -r`
   reads the arg as a *file* → wrong wake timestamps + broken silent-fail alerts.
 - `scripts/brew-ops-bot/bot.sh`, `scripts/inbox-loop-closure-hook.sh` — `stat -f %m`.
@@ -142,30 +153,31 @@ Linux replacement.
 ## Cutover — old runner → new (the flip)
 
 You **cannot parallel-run the watchers/bots on both boxes** — they share state:
-- `inbox-watcher` + `w2-watcher`: same git vault → push races + the SAME envelope
-  dispatched twice.
+- `w2-watcher`: same git vault → push races. (`inbox-watcher` is **legacy/disabled**
+  — no longer part of the fleet; skip it everywhere below.)
 - Telegram bots: one token → `getUpdates` returns **409 Conflict** to the second.
 - `oracle-http` is the ONE exception: per-box `oracle.db` + localhost — fine on both.
 
-So the new box's `inbox-watcher`/`w2-watcher`/`*-bot` units are **enabled but NOT
-started** until the old box's are stopped. Flip order:
+So the new box's `w2-watcher`/`*-bot` units are **enabled but NOT started** until
+the old box's are stopped. Flip order:
 
 1. **Don't flip mid-campaign.** Let the old box finish/clear in-flight agent work
    first (active dispatches, open campaigns). The new box is staged and waiting.
 2. **EBS snapshot** of the new box; **final vault sync** (old box `git add -A &&
    commit && push`; new box `git pull`) so no inbox envelope is stranded.
-3. **Stop the OLD daemons — map them PRECISELY first.** Pidfiles go stale and the
-   daemon may not be under the documented launchd label / a clean `nohup` — a broad
-   `pkill -f inbox-watcher` will also hit agent sessions whose command line contains
-   the string. Find the real parents (`ps -Ao pid,ppid,command | grep -E
-   'scripts/(inbox-watcher|w2-watcher).sh|/(brew-ops|orchestrator)-bot/bot.sh'`,
-   `ppid=1` = the daemon), `launchctl bootout` any launchd job so it doesn't
-   respawn, then kill those exact pids. Reap orphaned `chat-watcher.sh` children.
-4. **Start the new daemons:** `systemctl --user start inbox-watcher w2-watcher
-   brew-ops-bot orchestrator-bot`.
+3. **Stop the OLD daemons — map them PRECISELY first.** A broad `pkill -f
+   w2-watcher` (or any script path) will also hit **your own shell / ssh command
+   line** if it contains that string — it self-matches (bit us on the 2026-06-15
+   run). Find the real parents (`ps -Ao pid,ppid,command | grep -E
+   'scripts/w2-watcher.sh|/(brew-ops|orchestrator)-bot/bot.sh' | grep -v grep`,
+   `ppid=1` = the daemon), then kill those exact pids. Reap orphaned
+   `chat-watcher.sh` children. (The validated run found only `w2-watcher` + the
+   `brew-ops-bot` process tree actually running; `inbox-watcher` is legacy/off.)
+4. **Start the new daemons:** `systemctl --user start w2-watcher brew-ops-bot
+   orchestrator-bot`. (Do **not** start `inbox-watcher` — it's legacy/disabled.)
 5. **Verify:** all `--user is-active` = active; a Telegram `getMe` succeeds (one
-   consumer now); `inbox-watcher.sh status` shows it polling. Demote the old box to
-   an operator terminal. Rollback = restart the old daemons (nothing was deleted).
+   consumer now) for both bots. Demote the old box to an operator terminal.
+   Rollback = restart the old daemons (nothing was deleted).
 
 ## Nightly full reindex (systemd timer)
 
