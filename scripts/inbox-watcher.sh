@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# --- portability shim (BSD/GNU): file mtime as epoch. GNU-first (-c %Y) so Linux
+# works; BSD (-f %m) fallback for macOS. (BSD-first is buggy on Linux: stat -f
+# means --file-system there and emits garbage before any fallback.)
+_mtime() { stat -c %Y "$@" 2>/dev/null || _mtime "$@" 2>/dev/null; }
 # inbox-watcher.sh — pull-pattern receiver for the directed-inbox protocol
 # (AGENTS.md §11 in the central vault). Polls
 # ~/.arra-oracle-v2/ψ/inbox/for-{oracle}/ directories for new envelope files,
@@ -414,7 +419,7 @@ preempt_agent_at() {
   # claude was actively writing when we pre-empted.
   local proj_dir="$CLAUDE_PROJECTS/$(encode_cwd "$wt")"
   if [ -d "$proj_dir" ]; then
-    local newest=$(stat -f %m "$proj_dir"/*.jsonl 2>/dev/null | sort -nr | head -1)
+    local newest=$(_mtime "$proj_dir"/*.jsonl 2>/dev/null | sort -nr | head -1)
     if [ -n "$newest" ]; then
       local age=$(( $(date +%s) - newest ))
       log "  pre-empt context: JSONL idle ${age}s (>= grace = active mid-tool risk)"
@@ -741,7 +746,7 @@ claude_alive_at() {
   fi
 
   local newest_mtime now age
-  newest_mtime=$(stat -f %m "$proj_dir"/*.jsonl 2>/dev/null | sort -nr | head -1)
+  newest_mtime=$(_mtime "$proj_dir"/*.jsonl 2>/dev/null | sort -nr | head -1)
   if [ -z "$newest_mtime" ]; then
     log "claude_alive_at($wt) → pid=$found_pid alive but no JSONL; STUCK"
     return 1
@@ -778,7 +783,7 @@ codex_alive_at() {
     log "codex_alive_at($wt) → pid=$found_pid alive but no rollout JSONL; STUCK"
     return 1
   fi
-  newest_mtime=$(stat -f %m "$jsonl" 2>/dev/null)
+  newest_mtime=$(_mtime "$jsonl" 2>/dev/null)
   [ -n "$newest_mtime" ] || return 1
   now=$(date +%s)
   age=$((now - newest_mtime))
@@ -1715,7 +1720,7 @@ gc_evict_stale_sessions() {
   now=$(date +%s)
   for sid_file in "$STATE_DIR"/sessions/*/thread-*.session-id; do
     [ -f "$sid_file" ] || continue
-    mtime=$(stat -f %m "$sid_file" 2>/dev/null) || continue
+    mtime=$(_mtime "$sid_file" 2>/dev/null) || continue
     age_days=$(( (now - mtime) / 86400 ))
     if [ "$age_days" -ge "$SESSION_TTL_DAYS" ]; then
       rm -f "$sid_file"
@@ -1762,7 +1767,7 @@ gc_evict_terminal_state() {
     fname=$(basename "$sf" .state)
     # Source envelope still queued → deleting state would re-fire it.
     [ -f "$INBOX_BASE/for-$oracle/$fname" ] && continue
-    mtime=$(stat -f %m "$sf" 2>/dev/null) || continue
+    mtime=$(_mtime "$sf" 2>/dev/null) || continue
     age_days=$(( (now - mtime) / 86400 ))
     [ "$age_days" -ge "$STATE_TTL_DAYS" ] || continue
     rm -f "$sf"

@@ -84,7 +84,7 @@ process_jsonl() {
   local jsonl="$1"
   local sid=$(session_id_of "$jsonl")
   local cursor_file="$STATE_DIR/cursor.$sid"
-  local cur_size=$(stat -f %z "$jsonl" 2>/dev/null || stat -c %s "$jsonl" 2>/dev/null)
+  local cur_size=$(stat -c %s "$jsonl" 2>/dev/null || stat -f %z "$jsonl" 2>/dev/null)
 
   if [ ! -f "$cursor_file" ]; then
     # First time we see this JSONL. Record EOF as cursor — DON'T push backlog.
