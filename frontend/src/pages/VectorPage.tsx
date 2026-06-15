@@ -1,5 +1,8 @@
+import { useNavigate } from 'react-router-dom';
 import { VectorSearchWidget } from '../components/VectorSearchWidget';
+import { vectorResultsPath } from '../routePaths';
 
 export function VectorPage() {
-  return <VectorSearchWidget />;
+  const navigate = useNavigate();
+  return <VectorSearchWidget onOpenResults={(query) => navigate(vectorResultsPath(query))} />;
 }

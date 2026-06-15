@@ -4,10 +4,12 @@ import { fetchMenu, fetchPlugins } from './api';
 import { AppShell } from './components/AppShell';
 import { countPluginSurfaces } from './plugin-surfaces';
 import { McpPage } from './pages/McpPage';
+import { McpToolDetailPage } from './pages/McpToolDetailPage';
 import { MenuPage } from './pages/MenuPage';
 import { PluginsPage } from './pages/PluginsPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { VectorPage } from './pages/VectorPage';
+import { VectorSearchResultsPage } from './pages/VectorSearchResultsPage';
 import type { LoadState, MenuItem, PluginEntry } from './types';
 
 export default function App() {
@@ -56,7 +58,9 @@ export default function App() {
           <Route path="/menu" element={<MenuPage items={menu} loading={loading} />} />
           <Route path="/plugins" element={<PluginsPage plugins={plugins} loading={loading} />} />
           <Route path="/vector" element={<VectorPage />} />
+          <Route path="/vector/results" element={<VectorSearchResultsPage />} />
           <Route path="/mcp" element={<McpPage />} />
+          <Route path="/mcp/tools/:name" element={<McpToolDetailPage />} />
           <Route
             path="/settings"
             element={<SettingsPage menuCount={menu.length} pluginCount={plugins.length} surfaceCount={surfaceCount} updatedAt={updatedAt} onRefresh={refresh} />}
