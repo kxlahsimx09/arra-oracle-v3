@@ -164,6 +164,7 @@ const app = new Elysia()
 const healthRoutes = createHealthRoutes({
   pluginCount: unifiedPlugins.pluginCount,
   pluginMcpToolCount: unifiedPlugins.mcpTools.length,
+  pluginStatuses: unifiedPlugins.pluginStatuses,
   isDraining,
 });
 
@@ -214,7 +215,6 @@ printStartupBanner({
   middleware: enabledMiddleware(),
   dbStatus: startupDbStatus(),
 });
-
 
 function startupDbStatus(): string {
   try {
