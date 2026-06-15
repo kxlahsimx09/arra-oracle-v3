@@ -138,3 +138,31 @@ The daemons will *start* but **silently misbehave** until the BSD-isms found in 
 Fix forward (portable form or `[[ "$(uname)" == Darwin ]]` branch) and PR back. The
 6 `install-launchd*.sh` / `*.plist` installers stay macOS-only; this file is their
 Linux replacement.
+
+## Cutover — old runner → new (the flip)
+
+You **cannot parallel-run the watchers/bots on both boxes** — they share state:
+- `inbox-watcher` + `w2-watcher`: same git vault → push races + the SAME envelope
+  dispatched twice.
+- Telegram bots: one token → `getUpdates` returns **409 Conflict** to the second.
+- `oracle-http` is the ONE exception: per-box `oracle.db` + localhost — fine on both.
+
+So the new box's `inbox-watcher`/`w2-watcher`/`*-bot` units are **enabled but NOT
+started** until the old box's are stopped. Flip order:
+
+1. **Don't flip mid-campaign.** Let the old box finish/clear in-flight agent work
+   first (active dispatches, open campaigns). The new box is staged and waiting.
+2. **EBS snapshot** of the new box; **final vault sync** (old box `git add -A &&
+   commit && push`; new box `git pull`) so no inbox envelope is stranded.
+3. **Stop the OLD daemons — map them PRECISELY first.** Pidfiles go stale and the
+   daemon may not be under the documented launchd label / a clean `nohup` — a broad
+   `pkill -f inbox-watcher` will also hit agent sessions whose command line contains
+   the string. Find the real parents (`ps -Ao pid,ppid,command | grep -E
+   'scripts/(inbox-watcher|w2-watcher).sh|/(brew-ops|orchestrator)-bot/bot.sh'`,
+   `ppid=1` = the daemon), `launchctl bootout` any launchd job so it doesn't
+   respawn, then kill those exact pids. Reap orphaned `chat-watcher.sh` children.
+4. **Start the new daemons:** `systemctl --user start inbox-watcher w2-watcher
+   brew-ops-bot orchestrator-bot`.
+5. **Verify:** all `--user is-active` = active; a Telegram `getMe` succeeds (one
+   consumer now); `inbox-watcher.sh status` shows it polling. Demote the old box to
+   an operator terminal. Rollback = restart the old daemons (nothing was deleted).
