@@ -55,9 +55,11 @@ overrides anything that conflicts. Mirrors `CLAUDE.md` Project Conventions.
 - **Tests: nested, one behavior per file**, mirroring the route tree:
   `tests/http/<cluster>/<endpoint>.test.ts`. HTTP contract tests are
   fetch-based against a spawned server (works for Hono now, Elysia after migration).
-- **Web framework migration Hono → Elysia:** new Elysia sub-apps in
-  `src/routes-elysia/`, legacy Hono in `src/routes/`. Swap `src/server.ts` once
-  all modules land. maw-js is the reference implementation.
+- **Web framework: Elysia** (TypeBox schemas). The Hono → Elysia migration is
+  **complete** — all route clusters in `src/routes/` are native Elysia sub-apps
+  composed in `src/server.ts`; no Hono remains. New clusters: add a `new Elysia()`
+  sub-app under `src/routes/<cluster>/` and `.use()` it in `src/server.ts`.
+  `src/routes/health/` is the cleanest reference module. maw-js is the family ref.
 
 ## 6. Build Gate
 

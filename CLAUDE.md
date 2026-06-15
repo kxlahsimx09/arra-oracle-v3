@@ -22,11 +22,11 @@ Updated 2026-04-19. These override anything below that conflicts.
 - **Nested, one behavior per file** — mirror the route tree:
   `tests/http/<cluster>/<endpoint>.test.ts` (e.g. `tests/http/forum/thread-create.test.ts`).
 - `bunfig.toml` sets `roots = ["src", "tests"]`. `bun test tests/http/forum/` scopes to a cluster.
-- HTTP contract tests are fetch-based against a spawned server (see `src/integration/http.test.ts` pattern) — works against Hono today and Elysia after migration.
+- HTTP contract tests are fetch-based against a spawned Elysia server (see `src/integration/http.test.ts` pattern).
 
 ### Web framework
-- **Migrating Hono → Elysia** (bun-native, TypeBox schemas, faster). maw-js is the reference implementation in this family.
-- During migration: new Elysia sub-apps live in `src/routes-elysia/`, old Hono code in `src/routes/`. Swap `src/server.ts` once all modules land.
+- **Elysia** (bun-native, TypeBox schemas, faster). The Hono → Elysia migration is **COMPLETE** — every route cluster in `src/routes/` is a native Elysia sub-app composed in `src/server.ts`; no Hono dependency remains and there is no `src/routes-elysia/` staging dir. maw-js is the reference implementation in this family.
+- New route clusters: add a `new Elysia()` sub-app under `src/routes/<cluster>/` and `.use()` it in `src/server.ts`. `src/routes/health/` is the cleanest reference module.
 
 ### Runtime
 - **Bun ≥ 1.2.** Use `bun test`, `bun run`, `bunx --bun`. Do not add Node-specific APIs.
