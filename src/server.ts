@@ -206,7 +206,7 @@ const mcpRoutes = createMcpRoutes(unifiedPlugins.mcpTools);
 const modules = [...apiModules, mcpRoutes, menuRoutes];
 
 for (const mod of modules) app.use(mod as any);
-app.use(createNotFoundMiddleware());
+app.use(createNotFoundMiddleware(app.routes));
 
 const dbStatus = () => readStartupDbStatus(() => db.select({ key: settings.key }).from(settings).limit(1).all());
 const middleware = runtimeMiddleware({
