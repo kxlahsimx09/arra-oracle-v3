@@ -134,6 +134,23 @@ jq '.mcpServers["arra-oracle-v3"]' ~/.claude.json
 
 ---
 
+### `~/.ssh/id_ed25519` — regression-droplet access (easy to MISS)
+
+`scripts/w2-watcher.sh` hardcodes `REGRESSION_HOST=${REGRESSION_HOST:-root@178.128.93.199}`
+and **delegates the mobiz integration/regression suite to a remote DigitalOcean
+droplet** (`temp-mb-regression-droplet`) — the host's own Docker is NOT used. The new
+box's w2-watcher reaches it over SSH with the passphrase-less **`~/.ssh/id_ed25519`**.
+Copy it or the W2 regression run fails with an SSH auth error:
+
+```bash
+scp old-box:~/.ssh/id_ed25519{,.pub} ~/.ssh/ && chmod 600 ~/.ssh/id_ed25519
+ssh -i ~/.ssh/id_ed25519 root@178.128.93.199 'docker ps --format "{{.Names}}"'   # must connect
+```
+The droplet is **persistent + separate** (see the `temp-mb-regression-droplet` learning);
+it stays put — only the SSH key moves with the fleet host.
+
+---
+
 ## Verification
 
 ```bash
