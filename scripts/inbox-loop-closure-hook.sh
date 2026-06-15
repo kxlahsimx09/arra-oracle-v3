@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# --- portability shim (BSD/GNU): file mtime as epoch. GNU-first (-c %Y) so Linux
+# works; BSD (-f %m) fallback for macOS. (BSD-first is buggy on Linux: stat -f
+# means --file-system there and emits garbage before any fallback.)
+_mtime() { stat -c %Y "$@" 2>/dev/null || _mtime "$@" 2>/dev/null; }
 # inbox-loop-closure-hook.sh — Agent CLI `Stop` hook (§11d enforcement)
 #
 # Problem it fixes: a dispatched oracle agent does the work but its session
@@ -230,7 +235,7 @@ cutoff=$(( $(date +%s) - REPLY_WINDOW_HOURS * 3600 ))
 for f in "$inbox_dir"/handled/*/*.md; do
   [ -e "$f" ] || continue
   in_scope "$f" || continue          # thread #214: only THIS session's campaign
-  mt=$(stat -f %m "$f" 2>/dev/null || echo 0)
+  mt=$(_mtime "$f" 2>/dev/null || echo 0)
   [ "$mt" -lt "$cutoff" ] && continue
   [ "$(fm_field "$f" needs_response)" = "true" ] || continue
   from=$(fm_field "$f" from); thr=$(fm_field "$f" thread)

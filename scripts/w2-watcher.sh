@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# --- portability shim (BSD/GNU): format epoch $1 with strftime $2. GNU-first
+# (-d @epoch) for Linux; BSD (-r epoch) fallback for macOS.
+_fmt_epoch() { date -d "@$1" "$2" 2>/dev/null || _fmt_epoch "$1" "$2" 2>/dev/null; }
 # w2-watcher.sh — watch mobiz + bank-bot for new commits, trigger per-role
 # commit-driven workflows with debounce. Originally a pg-writer/bot-writer W2
 # watcher (hence the name); now also fires tester W1 full-sweep validation
@@ -200,8 +204,8 @@ send_silent_fail_telegram() {
   TOKEN=$(jq -r --arg p "$SILENT_FAIL_TG_PROJECT" '.projects[$p].mcpServers["tester-telegram"].env.TELEGRAM_BOT_TOKEN // empty' "$HOME/.claude.json" 2>/dev/null)
   CHAT=$(jq -r --arg p "$SILENT_FAIL_TG_PROJECT" '.projects[$p].mcpServers["tester-telegram"].env.TELEGRAM_DEFAULT_CHAT_ID // empty' "$HOME/.claude.json" 2>/dev/null)
   [ -z "$TOKEN" ] || [ -z "$CHAT" ] && return
-  local iso=$(date -r "$wake_ts" '+%Y-%m-%d %H:%M GMT+7')
-  local pane_name="${role}-$(date -r "$wake_ts" '+%Y%m%d-%H%M%S')"
+  local iso=$(_fmt_epoch "$wake_ts" '+%Y-%m-%d %H:%M GMT+7')
+  local pane_name="${role}-$(_fmt_epoch "$wake_ts" '+%Y%m%d-%H%M%S')"
   local body
   if [ -n "$reason" ]; then
     # Reason supplied (fast-path: rate-limit / API error captured from pane)
@@ -488,7 +492,7 @@ cmd_run() {
 
           total_signal=$((pr_count + commit_count))
           if [ "$total_signal" -eq 0 ]; then
-            log "[$role] SILENT-FAIL: 0 PRs + 0 commits matching role pattern in $((pending_elapsed/60))min since wake @ $(date -r "$pending_wake_ts" '+%H:%M') (search: $pr_search) — alerting operator"
+            log "[$role] SILENT-FAIL: 0 PRs + 0 commits matching role pattern in $((pending_elapsed/60))min since wake @ $(_fmt_epoch "$pending_wake_ts" '+%H:%M') (search: $pr_search) — alerting operator"
             send_silent_fail_telegram "$role" "$repo_slug" "$pending_wake_ts" "$pending_elapsed"
           else
             log "[$role] wake verified: $pr_count new PR(s) + $commit_count commit(s) matching pattern '$patterns' in $((pending_elapsed/60))min"

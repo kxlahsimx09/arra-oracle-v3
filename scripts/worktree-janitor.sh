@@ -102,7 +102,7 @@ alert_throttled() {
 
 age_days() {
   local path=$1
-  local mtime=$(stat -f %m "$path" 2>/dev/null || stat -c %Y "$path" 2>/dev/null)
+  local mtime=$(stat -c %Y "$path" 2>/dev/null || stat -f %m "$path" 2>/dev/null)
   [ -z "$mtime" ] && { echo 0; return; }
   echo $(( ($(date +%s) - mtime) / 86400 ))
 }

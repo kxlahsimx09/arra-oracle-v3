@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# --- portability shim (BSD/GNU): file mtime as epoch. GNU-first (-c %Y) so Linux
+# works; BSD (-f %m) fallback for macOS. (BSD-first is buggy on Linux: stat -f
+# means --file-system there and emits garbage before any fallback.)
+_mtime() { stat -c %Y "$@" 2>/dev/null || _mtime "$@" 2>/dev/null; }
 # brew-ops-bot.sh — Telegram bot for Soul-Brews ops awareness + claude orchestrator.
 #
 # Phases:
@@ -1621,7 +1626,7 @@ cmd_closed() {
     if tmux list-panes -a -F "#{window_name}" 2>/dev/null | grep -qE "\\-${slug}\$"; then
       continue  # still alive, skip
     fi
-    local age=$(printf '%s' "$(( ($(date +%s) - $(stat -f %m "$latest_jsonl" 2>/dev/null || echo 0)) / 60 ))min")
+    local age=$(printf '%s' "$(( ($(date +%s) - $(_mtime "$latest_jsonl" 2>/dev/null || echo 0)) / 60 ))min")
     out+="• <code>$slug</code> ($age ago, $proj)
 "
     found=1
