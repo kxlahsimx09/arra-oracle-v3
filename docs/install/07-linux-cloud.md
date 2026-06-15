@@ -160,4 +160,32 @@ is in [08-systemd-daemons.md](08-systemd-daemons.md) §Blocked-on. Fix forward
 - **Cutover (NEW):** parallel-run — keep the Mac fleet up; validate agents + a
   build + one deploy on the new box; take an **EBS snapshot**; then shift the fleet
   over and demote the Mac to an operator terminal. Rollback = keep using the Mac
-  until the new box has a few clean days.
+  until the new box has a few clean days. **Full cutover runbook → [08-systemd-daemons.md](08-systemd-daemons.md) §Cutover.**
+
+---
+
+## Real-run addenda (what the phases above gloss over — found 2026-06-15)
+
+1. **The runtime branch lives on the `fork` remote, not `origin`.** `ghq get
+   Soul-Brews-Studio/arra-oracle-v3` clones with `origin` = Soul-Brews only, but
+   `feat/all-prs-rebased` is on `kxlahsimx09` (the fork). So add it before checkout:
+   `git remote add fork https://github.com/kxlahsimx09/<repo>.git && git fetch fork
+   feat/all-prs-rebased && git checkout -B feat/all-prs-rebased fork/feat/all-prs-rebased`
+   (arra-oracle-v3 AND maw-js). `bun run db:push` **fails on `main`** (SQLITE_ERROR,
+   schema mismatch) — run it only on the runtime branch.
+2. **The fleet needs MORE than the 7 repos in §02.** The maw fleet symlinks
+   (`~/.config/maw/fleet/*.json`) reference per-repo fleet configs for **every**
+   role repo — incl. `kxlahsimx09/mb-next-admin-portal` and `mb-next-bank-bot`,
+   which are NOT in the §02 list. Clone the full role set or `maw wake <role>`
+   spawn-fails (see `maw-wake-needs-fleet-dir-symlink`).
+3. **maw fleet config must be migrated + re-pathed.** `scp ~/.config/maw/{maw.config*.json,oracles.json}`,
+   `sed -i s#/Users/<old>#/home/<new>#g` them, then **recreate** the
+   `~/.config/maw/fleet/*.json` symlinks pointing at the new `$HOME` (loop every
+   `<repo>/.agent/fleet/*.json`). The old symlinks carry absolute Mac paths.
+4. **oracle.db: snapshot live, don't stop the server.** `sqlite3
+   ~/.arra-oracle-v2/oracle.db ".backup /tmp/oracle.db"` takes a consistent copy
+   while the old Oracle keeps serving — safer than the §04 `pkill` + raw copy. scp
+   that + the lancedb tarball.
+5. **`~/.claude.json` + the arra `.env` carry Mac paths.** After scp, `sed -i
+   s#/Users/<old>#/home/<new>#g` both (mcpServers args + ORACLE_* paths). Keep
+   `ORACLE_SESSION_SECRET` from the old `.env` (changing it resets all sessions).
