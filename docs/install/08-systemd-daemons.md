@@ -166,3 +166,47 @@ started** until the old box's are stopped. Flip order:
 5. **Verify:** all `--user is-active` = active; a Telegram `getMe` succeeds (one
    consumer now); `inbox-watcher.sh status` shows it polling. Demote the old box to
    an operator terminal. Rollback = restart the old daemons (nothing was deleted).
+
+## Nightly full reindex (systemd timer)
+
+The FTS5 + bge-m3 vector index drifts as learnings accrue — rebuild it nightly. The
+vector step is **latency-bound, not CPU-bound** (sequential Ollama round-trips; the
+box sits ~98% idle at ~0.4 doc/s → ~3.4 h for ~5k docs, so more vCPU barely helps).
+It runs cheap in the background, **FTS stays up the whole time** (FTS5 is SQLite, not
+LanceDB) and vector degrades gracefully to FTS-only during the rebuild; the service
+restarts `oracle-http` at the end so it serves the fresh vectors.
+
+`~/.config/systemd/user/oracle-reindex.service`:
+```ini
+[Unit]
+Description=Oracle full reindex (FTS5 + bge-m3 vectors)
+After=ollama.service
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Code/github.com/Soul-Brews-Studio/arra-oracle-v3
+# ORACLE_REPO_ROOT = the VAULT repo (github.com/ beside ψ/), NOT the data dir, or
+# only ~98 of ~1200 learnings index — the repoRoot trap (04-data §2).
+Environment=ORACLE_REPO_ROOT=%h/Code/github.com/kxlahsimx09/mb_agent_oracle_memory
+Environment=ORACLE_DATA_DIR=%h/.arra-oracle-v2
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.bun/bin/bun run reindex:full
+ExecStartPost=/usr/bin/systemctl --user restart oracle-http.service
+TimeoutStartSec=6h
+```
+`~/.config/systemd/user/oracle-reindex.timer`:
+```ini
+[Unit]
+Description=Nightly Oracle full reindex
+[Timer]
+OnCalendar=*-*-* 03:00:00      # set the box TZ first: sudo timedatectl set-timezone Asia/Bangkok
+Persistent=true                # catch up a missed run if the box was off
+RandomizedDelaySec=300
+[Install]
+WantedBy=timers.target
+```
+```bash
+systemctl --user daemon-reload && systemctl --user enable --now oracle-reindex.timer
+systemctl --user list-timers oracle-reindex.timer    # confirm the NEXT time
+```
+systemd runs **one instance per unit**, so a slow rebuild never overlaps the next
+night's trigger. Logs: `journalctl --user -u oracle-reindex.service`.
