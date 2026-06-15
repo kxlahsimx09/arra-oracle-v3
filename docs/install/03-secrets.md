@@ -16,8 +16,9 @@ from the old server or obtained from the human owner:
 |--------|-------------------------------|
 | `ORACLE_SESSION_SECRET` (`.env`) | Random string; resets all sessions if changed |
 | `supabase.env` DB password | Hosted Supabase DB credential; only the human can rotate it |
-| `CLAUDE_CODE_OAUTH_TOKEN` (in `~/.claude.json`) | OAuth refresh token issued to a specific device |
+| `claudeAiOauth` (in `~/.claude/.credentials.json` — NOT `~/.claude.json`) | the claude plan/login token; copy the file or the new box is "not logged in" |
 | Telegram bot tokens (`BREW_OPS_BOT_TOKEN`, `TELEGRAM_BOT_TOKEN`) | Issued by BotFather; cannot be re-read after creation |
+| `~/.ssh/id_ed25519` | the regression-droplet SSH key (w2-watcher's remote run) — see below |
 
 Copy these from the old server **before** decommissioning it:
 
@@ -27,7 +28,9 @@ tar czf /tmp/oracle-secrets-backup.tar.gz \
   ~/.arra-oracle-v2/fleet-secrets/ \
   ~/.cache/brew-ops-bot/.env \
   ~/.cache/orchestrator-bot/.env \
-  ~/.claude.json
+  ~/.claude.json \
+  ~/.claude/.credentials.json \
+  ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub
 
 scp old-server:/tmp/oracle-secrets-backup.tar.gz ~/
 ```
@@ -120,8 +123,16 @@ Contains engine credentials managed by Claude Code:
 
 | Key | Purpose |
 |-----|---------|
-| `CLAUDE_CODE_OAUTH_TOKEN` | claude engine auth (per-device, cannot reconstruct) |
-| `mcpServers` block | MCP server registrations including arra-oracle-v3 |
+| `oauthAccount` + `mcpServers` block | account metadata + MCP server registrations (incl. arra-oracle-v3) |
+
+> ⚠️ **The actual plan/login token is NOT in `~/.claude.json`** — it lives in the
+> SEPARATE **`~/.claude/.credentials.json`** (`claudeAiOauth`). Copy `~/.claude.json`
+> alone and `claude` says *"Not logged in · Please run /login"*. **Copy BOTH** (the
+> backup tarball above now includes `~/.claude/.credentials.json`); after extracting:
+> `mkdir -p ~/.claude && chmod 600 ~/.claude/.credentials.json`. Verify with
+> `claude -p "say OK"` on the new box → must return without a login prompt. (The
+> OAuth token is a bearer token — it works on the new host; "per-device" means
+> "can't regenerate, must copy", not "host-locked".)
 
 **Copy in full from the old server** — do not reconstruct from scratch.
 After copying, update the `args` path for `arra-oracle-v3` if `$HOME` changed:
