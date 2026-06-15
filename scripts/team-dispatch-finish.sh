@@ -68,6 +68,19 @@ else
     fi
     if out=$(git -C "$repo" worktree remove --force "$wt" 2>&1); then
       ok "removed: $wt"
+      # Best-effort: drop the now-unused campaign branch so a future dispatch
+      # can't reuse a stale tip (workflow-2 path 2). SAFE delete only (-d,
+      # merged-only) — never -D, per AGENTS.md §9 / CLAUDE.md no-force rule. An
+      # unmerged branch is intentionally KEPT (its work isn't on origin/main
+      # yet); the helper fast-forwards it on the next reuse, so staleness is
+      # still handled either way.
+      if git -C "$repo" show-ref --verify --quiet "refs/heads/campaign/${CAMPAIGN}"; then
+        if git -C "$repo" branch -d "campaign/${CAMPAIGN}" >/dev/null 2>&1; then
+          ok "deleted merged branch campaign/${CAMPAIGN}"
+        else
+          warn "kept branch campaign/${CAMPAIGN} (unmerged — safe-delete refused; ff'd on next reuse)"
+        fi
+      fi
     else
       warn "failed to remove $wt — inspect manually:
     $out"
