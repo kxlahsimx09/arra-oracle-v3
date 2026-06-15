@@ -93,22 +93,38 @@ team-dispatch-helper:
 EOF
 [ -n "$DRY_RUN" ] && { echo; echo "(dry-run; no changes)"; exit 0; }
 
-# --- 1. worktree (create-or-reuse) ---
+# --- 1. worktree (create-or-reuse) + freshness (hybrid refresh policy) -------
+# Freshness handling used to exist ONLY on the new-branch path below; reuse and
+# existing-branch checkouts inherited a stale tip and nothing advanced them, so
+# teammates dispatched into a days-old campaign started N commits behind upstream.
+# worktree-freshen.sh is the single source of truth for the fast-forward-only
+# "advance" policy. It returns a STALE banner on stdout when it can't safely
+# advance the tree; we inject that into the teammate's kickoff turn.
+FRESHEN="$(dirname "$0")/worktree-freshen.sh"
+STALE_BANNER=""
 if [ -d "$WT_PATH" ]; then
   ok "worktree exists — reusing (shared across roles within campaign×repo)"
+  # Reuse path: the dir may already hold a live teammate. freshen fetches and
+  # fast-forwards only when clean+idle, else hands back a staleness banner.
+  STALE_BANNER=$("$FRESHEN" --repo "$REPO_PATH" --wt "$WT_PATH" \
+                            --campaign "$CAMPAIGN" --mode reuse)
 else
   # Refresh origin/main so a NEW campaign branch always bases off fresh upstream,
-  # never the base checkout's (possibly stale / WIP / detached) local HEAD. Non-fatal
-  # if offline — fall through to whatever origin/main we already have.
-  git -C "$REPO_PATH" fetch origin main --quiet || true
+  # never the base checkout's (possibly stale / WIP / detached) local HEAD.
+  git -C "$REPO_PATH" fetch origin main --quiet \
+    || say "⚠ fetch origin main failed (offline?) — basing on existing origin/main"
   if git -C "$REPO_PATH" show-ref --verify --quiet "refs/heads/$BRANCH"; then
     git -C "$REPO_PATH" worktree add "$WT_PATH" "$BRANCH" >/dev/null \
       || die "worktree add failed (existing branch $BRANCH)"
     ok "worktree added on existing branch $BRANCH"
+    # Existing branch = a tip from a prior run; advance it onto fresh origin/main.
+    # No agent is in the just-created worktree yet, so a clean ff is safe here.
+    STALE_BANNER=$("$FRESHEN" --repo "$REPO_PATH" --wt "$WT_PATH" \
+                              --campaign "$CAMPAIGN" --mode checkout)
   else
     git -C "$REPO_PATH" worktree add "$WT_PATH" -b "$BRANCH" origin/main >/dev/null \
       || die "worktree add failed (new branch $BRANCH off origin/main)"
-    ok "worktree added with new branch $BRANCH (based on origin/main)"
+    ok "worktree added with new branch $BRANCH (based on fresh origin/main)"
   fi
 
   # --- 2. .agent symlink (per AGENTS.md §3a) ---
@@ -119,6 +135,14 @@ else
   if [ -d "$SECRETS_STORE" ] && [ ! -e "$WT_PATH/.secrets" ]; then
     ln -s "$SECRETS_STORE" "$WT_PATH/.secrets" && say "+ .secrets → $SECRETS_STORE"
   fi
+fi
+# Prepend the staleness banner (if any) so the teammate reconciles the tree
+# before trusting it — the agent owns the *how* (merge / rebase / proceed).
+if [ -n "$STALE_BANNER" ]; then
+  say "⚠ stale base — injecting reconcile banner into kickoff turn"
+  PROMPT="${STALE_BANNER}
+
+${PROMPT}"
 fi
 
 # --- 4. ensure maw team manifest (idempotent) ---
