@@ -26,6 +26,21 @@ rsync -a --progress \
   ~/.arra-oracle-v2/oracle.db
 ```
 
+### Prefer: live snapshot (no downtime) — don't stop the old server
+
+If the old box is still actively serving the fleet, **don't `pkill` it.** Take a
+consistent copy while it runs (avoids the WAL-corruption risk without downtime):
+
+```bash
+# on the OLD box — sqlite .backup is atomic vs concurrent writes
+sqlite3 ~/.arra-oracle-v2/oracle.db ".backup /tmp/oracle.db"
+scp /tmp/oracle.db new-box:~/.arra-oracle-v2/oracle.db
+# lancedb (vectors) has no live-writer here → a tar/scp is fine
+```
+Used on the 2026-06-15 migration: snapshot served 5,216 docs on the new box with
+search intact (learning count 1,250 — the repoRoot trap NOT bitten), zero downtime
+on the old fleet.
+
 ### Schema migrations (Drizzle)
 
 On the new server, after copy, run schema push to apply any pending migrations:

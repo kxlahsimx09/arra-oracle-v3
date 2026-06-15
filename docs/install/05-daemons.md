@@ -180,3 +180,32 @@ bash "$ARRA/scripts/install-inbox-loop-closure-hook.sh"
 # Orchestrator guard (blocks docs/code edits from the orchestrator window)
 bash "$ARRA/scripts/install-orchestrator-guard-hook.sh"
 ```
+
+---
+
+## Cutover — old box → new box (the flip)
+
+You **cannot run the watchers/bots on both boxes at once** — they share state:
+- `inbox-watcher` + `w2-watcher`: same git vault → push races + the SAME envelope
+  dispatched twice.
+- Telegram bots: one token → the second poller gets `getUpdates` **409 Conflict**.
+- `oracle-http` is the one exception (per-box `oracle.db` + localhost) — fine on both.
+
+So bring the new box up **ready but with its watchers/bots stopped**, then flip:
+
+1. **Don't flip mid-campaign.** Let the old box finish/clear in-flight agent work
+   first; the new box waits.
+2. **Final vault sync** (old box `git add -A && commit && push`; new box `git pull`)
+   so no inbox envelope is stranded. (Cloud: also EBS-snapshot the new box.)
+3. **Stop the OLD daemons — map them PRECISELY first.** Pidfiles go stale and a
+   daemon may not be under the documented launchd label; a broad `pkill -f
+   inbox-watcher` also kills agent sessions whose command line contains the string.
+   Find real parents: `ps -Ao pid,ppid,command | grep -E
+   'scripts/(inbox-watcher|w2-watcher).sh|/(brew-ops|orchestrator)-bot/bot.sh'`
+   (`ppid=1` = the daemon). `launchctl bootout` the launchd job so it can't respawn,
+   kill those exact pids, reap orphaned `chat-watcher.sh`.
+4. **Start the new daemons** (macOS: the launchd installer + `nohup` blocks above;
+   Linux: `systemctl --user start …`, see [08-systemd-daemons.md](08-systemd-daemons.md)).
+5. **Verify:** a Telegram `getMe` succeeds (one consumer now), `inbox-watcher.sh
+   status` shows it polling. Demote the old box to an operator terminal. Rollback =
+   restart the old daemons (nothing was deleted).
