@@ -5,7 +5,7 @@ type Requester = (path: string, init?: RequestInit) => Promise<unknown>;
 type Auth = () => Record<string, string>;
 type InvokeResult = { ok: boolean; output?: string; error?: string };
 
-export const VECTOR_CONFIG_HELP = 'vector-config [--json] | vector-config reload | vector-config set|add|remove|set-primary|test';
+export const VECTOR_CONFIG_HELP = 'vector-config [--json] | vector-config set <collection> adapter <adapter> | vector-config set <collection> enabled <true|false> | vector-config reload | vector-config add|remove|set-primary|test';
 
 const enc = encodeURIComponent;
 const key = (s: string) => s.toLowerCase().replace(/-/g, '_');
@@ -82,9 +82,9 @@ function pickCollection(data: any, collection: string): any | undefined {
 }
 
 function formatList(data: any): string {
-  const lines = ['Collection | Adapter | Model | Docs | Status'];
-  for (const row of rows(data)) lines.push(`${row.collection ?? row.key} | ${row.adapter ?? 'lancedb'} | ${row.model ?? row.key} | ${row.count ?? 0} | ${row.status ?? (row.ok === false ? 'down' : 'ok')}`);
-  if (lines.length === 1) lines.push('(none) | - | - | 0 | unknown');
+  const lines = ['Collection | Adapter | Model | Enabled | Docs | Status'];
+  for (const row of rows(data)) lines.push(`${row.collection ?? row.key} | ${row.adapter ?? 'lancedb'} | ${row.model ?? row.key} | ${row.enabled !== false} | ${row.count ?? 0} | ${row.status ?? (row.ok === false ? 'down' : 'ok')}`);
+  if (lines.length === 1) lines.push('(none) | - | - | true | 0 | unknown');
   return lines.join('\n');
 }
 

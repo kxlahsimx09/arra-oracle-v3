@@ -3,7 +3,6 @@ import { join } from 'node:path';
 import { apiArgsToCliArgs } from './api.ts';
 import { runServe, type ServeDeps } from './serve.ts';
 import { runVectorConfig, VECTOR_CONFIG_HELP } from './vector-config.ts';
-
 type InvokeContext = { source?: string; args?: string[] | Record<string, unknown>; writer?: (...args: unknown[]) => void };
 type InvokeResult = { ok: boolean; output?: string; error?: string };
 type Requester = (path: string, init?: RequestInit) => Promise<unknown>;
@@ -127,7 +126,7 @@ function formatSearch(data: any, p: Parsed): string {
   for (const [i, r] of results.slice(0, 8).entries()) lines.push(`${i + 1}. ${r.id ?? r.source_file ?? 'doc'} ${r.type ? `[${r.type}] ` : ''}score=${r.score ?? 'n/a'}\n   ${one(r.content ?? r.snippet ?? r.text ?? '')}`);
   return lines.join('\n');
 }
-function formatHealth(data: any): string { return [`arra health: ${data?.status ?? 'unknown'}`, data?.vectorMode && `vectorMode: ${data.vectorMode}`, data?.version && `version: ${data.version}`].filter(Boolean).join('\n'); }
+function formatHealth(data: any): string { const engines = Array.isArray(data?.vector?.engines) ? data.vector.engines : []; return [`arra health: ${data?.status ?? 'unknown'}`, data?.vectorMode && `vectorMode: ${data.vectorMode}`, data?.version && `version: ${data.version}`, data?.vectorStatus && `vectorStatus: ${data.vectorStatus}`, ...engines.map((e: any) => `vector ${e.key ?? e.collection}: ${e.ok === false ? 'down' : 'ok'} ${e.adapter ?? ''} ${e.model ?? ''} docs=${e.count ?? 0}${e.error ? ` error=${one(e.error, 90)}` : ''}`)].filter(Boolean).join('\n'); }
 function formatStats(data: any): string { return ['arra stats', data?.total_documents !== undefined && `docs: ${data.total_documents}`, data?.total_docs !== undefined && `docs: ${data.total_docs}`, data?.vector && `vector: ${one(JSON.stringify(data.vector), 180)}`].filter(Boolean).join('\n'); }
 function formatRows(label: string, keys: string[]) { return (data: any) => { const rows = keys.map(k => data?.[k]).find(Array.isArray) ?? []; const total = data?.total ?? data?.chain_length ?? rows.length; return Array.isArray(rows) ? [`arra ${label}: ${total} item${Number(total) === 1 ? '' : 's'}`, ...rows.slice(0, 8).map((r: any) => `- ${r.id ?? r.trace_id ?? r.path ?? r.filename ?? r.name ?? '?'} ${one(r.title ?? r.query ?? r.content ?? r.preview ?? r.label ?? '')}`)].join('\n') : `arra ${label}: ${preview(data)}`; }; }
 function formatOk(label: string) { return (data: any) => [`arra ${label}: ${data?.success === false ? 'failed' : 'ok'}`, data?.id && `id: ${data.id}`, data?.trace_id && `trace_id: ${data.trace_id}`, data?.thread_id && `thread_id: ${data.thread_id}`, data?.message && one(data.message), data?.error && `error: ${one(data.error)}`].filter(Boolean).join('\n') || `arra ${label}: ${preview(data)}`; }
