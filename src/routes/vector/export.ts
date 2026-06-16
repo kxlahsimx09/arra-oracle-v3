@@ -17,9 +17,14 @@ const DEFAULT_EXPORT_LIMIT = 50_000;
 export function createVectorExportEndpoint(deps: VectorExportDeps = {}) {
   const getStore = deps.getStore ?? getVectorStoreByModel;
 
-  return new Elysia().get(
-    '/vector/export',
-    async ({ query, set }) => {
+  return new Elysia()
+    .get('/vector/export/formats', () => Object.keys(exportFormatters), {
+      detail: {
+        tags: ['vector'],
+        summary: 'List available vector export formats',
+      },
+    })
+    .get('/vector/export', async ({ query, set }) => {
       const format = query.format || 'json';
       const formatter = getExportFormat(format);
       if (!formatter) {
@@ -53,8 +58,7 @@ export function createVectorExportEndpoint(deps: VectorExportDeps = {}) {
         const message = error instanceof Error ? error.message : String(error);
         return { error: 'Vector export failed', message };
       }
-    },
-    {
+    }, {
       query: t.Object({
         collection: t.Optional(t.String()),
         format: t.Optional(t.String()),
