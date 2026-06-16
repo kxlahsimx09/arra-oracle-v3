@@ -12,6 +12,8 @@
  *   GET /api/vector/health   — adapter liveness probe
  *   GET /api/vector/cost-estimate — estimate remote embedding cost
  *   GET /api/vector/documents — browse indexed vector documents
+ *   GET /api/vector/providers — detected embedding providers and capabilities
+ *   POST /api/vector/providers/test — probe one embedding provider config
  *   GET /api/v1/vector/export/formats — available export formats
  *   GET /api/v1/vector/export — stream vector docs in a registered format
  * Mounted with the `/api` prefix from server.ts. Phase 1 of #1071: separating
