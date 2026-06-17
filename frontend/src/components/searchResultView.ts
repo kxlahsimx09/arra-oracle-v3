@@ -16,7 +16,16 @@ export type ProvenanceSearchResult = SearchResult & {
   memorySource?: string;
   memory_source?: string;
   usageCount?: number;
+  usage_count?: number;
   lastAccessedAt?: string;
+  last_accessed_at?: string;
+  lastRecalled?: string;
+  last_recalled?: string;
+  lastRecalledAt?: string;
+  last_recalled_at?: string;
+  heatScore?: number;
+  heat_score?: number;
+  ranking?: { score?: number; components?: { heat?: number; match?: number; confidence?: number; validTime?: number } };
   rankingScore?: number;
   fusedScore?: number;
   confidenceWeight?: number;
@@ -90,15 +99,16 @@ export function sourceDetails(result: ProvenanceSearchResult): string[] {
 }
 
 export function heatScore(result: ProvenanceSearchResult): number {
-  const component = result.confidence?.components?.usage;
-  if (typeof component === 'number' && Number.isFinite(component)) return Math.max(0, Math.min(1, component));
-  const usageCount = result.confidence?.usageCount ?? result.usageCount ?? 0;
+  const explicit = result.heatScore ?? result.heat_score ?? result.ranking?.components?.heat ?? result.confidence?.components?.usage;
+  if (typeof explicit === 'number' && Number.isFinite(explicit)) return Math.max(0, Math.min(1, explicit > 1 ? explicit / 100 : explicit));
+  const usageCount = result.confidence?.usageCount ?? result.usageCount ?? result.usage_count ?? 0;
   if (!usageCount) return 0;
   return Math.max(0, Math.min(1, Math.log1p(usageCount) / Math.log1p(20)));
 }
 
 export function heatDescription(result: ProvenanceSearchResult): string {
-  const usageCount = result.confidence?.usageCount ?? result.usageCount ?? 0;
+  if (result.heatScore !== undefined || result.heat_score !== undefined || result.ranking?.components?.heat !== undefined) return 'Heat-score returned by the memory ranking pipeline.';
+  const usageCount = result.confidence?.usageCount ?? result.usageCount ?? result.usage_count ?? 0;
   if (usageCount > 0) return `${usageCount} retrieval${usageCount === 1 ? '' : 's'} reinforced this memory.`;
   return 'No retrieval heat recorded yet.';
 }

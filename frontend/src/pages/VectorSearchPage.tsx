@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { apiClient, type ApiClient, type VectorIndexModelsResponse } from '../api/client';
+import { MemoryHealthPanel, MemorySignalBadges } from '../components/MemoryHealthPanel';
 import { SearchResultSignals } from '../components/SearchResultSignals';
 import type { VectorSearchResponse } from '../../../src/server/types';
 
@@ -76,9 +77,12 @@ function ResultCard({ result }: { result: VectorSearchResult }) {
           <h2 className="text-base font-semibold text-text">{titleFor(result)}</h2>
           <p className="mt-1 text-sm leading-6 text-text-muted">{contentPreview(result.content)}</p>
         </div>
-        <span className="rounded-full border border-accent-border px-2 py-1 text-xs font-semibold text-accent">
-          distance {distanceLabel(result)}
-        </span>
+        <div className="flex flex-wrap justify-end gap-2">
+          <span className="rounded-full border border-accent-border px-2 py-1 text-xs font-semibold text-accent">
+            distance {distanceLabel(result)}
+          </span>
+          <MemorySignalBadges result={result} />
+        </div>
       </div>
       <div className="mt-4" aria-label="Vector distance score">
         <div className="h-2 overflow-hidden rounded-full border border-border bg-field">
@@ -167,6 +171,9 @@ export function VectorSearchPage({ client = apiClient }: { client?: VectorSearch
 
       <p className="mt-4 text-sm text-text-muted">{status}</p>
       {error ? <p role="alert" className="mt-3 rounded-xl border border-err-border bg-err-bg p-3 text-sm text-err-text">{error}</p> : null}
+      <div className="mt-5">
+        <MemoryHealthPanel results={results} state={state} />
+      </div>
       <div className="mt-5 grid gap-3 lg:grid-cols-2" aria-busy={state === 'loading'}>
         {state !== 'loading' ? results.map((result) => <ResultCard key={result.id} result={result} />) : null}
       </div>

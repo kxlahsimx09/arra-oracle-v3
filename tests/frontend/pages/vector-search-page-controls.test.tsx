@@ -11,5 +11,7 @@ describe('VectorSearchPage controls', () => {
     expect(html).toContain('aria-label="Vector collection"');
     expect(html).toContain('aria-label="Submit vector search"');
     expect(html).toContain('/api/v1/vector/search');
+    expect(html).toContain('Memory health');
+    expect(html).toContain('Run a search to inspect memory health signals.');
   });
 });

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { searchVector } from '../api';
+import { MemoryHealthPanel } from '../components/MemoryHealthPanel';
 import { SearchResultCard } from '../components/SearchResultCard';
 import { vectorResultsPath } from '../routePaths';
 import type { SearchResult } from '../types';
@@ -93,6 +94,9 @@ export function VectorSearchResultsPage() {
 
       <p className="mt-4 text-sm text-text-muted">{status}</p>
       {error ? <p role="alert" className="mt-3 rounded-xl border border-err-border bg-err-bg p-3 text-sm text-err-text">{error}</p> : null}
+      <div className="mt-5">
+        <MemoryHealthPanel results={results} state={state} />
+      </div>
       <div className="mt-5 grid gap-3 lg:grid-cols-2">{results.map((result) => <SearchResultCard key={result.id} result={result} />)}</div>
     </section>
   );

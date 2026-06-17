@@ -1,4 +1,5 @@
 import { Badge } from './Badge';
+import { MemorySignalBadges } from './MemoryHealthPanel';
 import { SearchResultSignals } from './SearchResultSignals';
 import { previewFor, scoreLabel, titleFor, type ProvenanceSearchResult } from './searchResultView';
 
@@ -8,7 +9,10 @@ export function SearchResultCard({ result }: { result: ProvenanceSearchResult })
     <article className="rounded-2xl border border-border bg-surface p-4 transition hover:border-accent-border">
       <div className="flex items-start justify-between gap-3">
         <h3 className="break-all font-mono text-sm text-accent">{titleFor(result)}</h3>
-        {score ? <Badge tone="accent" ariaLabel={`Result score ${score}`}>{score}</Badge> : null}
+        <div className="flex flex-wrap justify-end gap-2">
+          {score ? <Badge tone="accent" ariaLabel={`Result score ${score}`}>{score}</Badge> : null}
+          <MemorySignalBadges result={result} />
+        </div>
       </div>
       <p className="mt-3 text-sm leading-6 text-text-muted">{previewFor(result)}</p>
       <SearchResultSignals result={result} />

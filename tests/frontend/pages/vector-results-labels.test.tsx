@@ -9,5 +9,6 @@ describe('VectorSearchResultsPage accessibility labels', () => {
     expect(html).toContain('aria-label="Full-page vector search form"');
     expect(html).toContain('aria-label="Vector search query"');
     expect(html).toContain('aria-label="Run vector search"');
+    expect(html).toContain('Memory health');
   });
 });
