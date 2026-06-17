@@ -6,6 +6,8 @@ import fs from 'fs';
 import path from 'path';
 import type Database from 'bun:sqlite';
 import type { OracleDocument } from '../types.ts';
+import { deriveConceptsFromPath, mergeConceptsWithTags } from './concepts.ts';
+import { inferProjectFromPath } from './discovery.ts';
 import { parseLearningFile } from './parser.ts';
 
 export const PSI_LEARN_REL = path.join('ψ', 'learn');
@@ -40,10 +42,20 @@ export function parsePsiLearnFile(relativePath: string, content: string): Oracle
   const basename = path.basename(sourceFile);
   const pathHash = Bun.hash(sourceFile).toString(36);
 
-  return parseLearningFile(basename, content, sourceFile).map((doc) => ({
+  return withDerivedStructure(parseLearningFile(basename, content, sourceFile).map((doc) => ({
     ...doc,
     id: psiLearnDocId(pathHash, doc.id),
     source_file: sourceFile,
+  })), sourceFile);
+}
+
+function withDerivedStructure(documents: OracleDocument[], sourceFile: string): OracleDocument[] {
+  const project = inferProjectFromPath(sourceFile);
+  const pathConcepts = deriveConceptsFromPath(sourceFile);
+  return documents.map((doc) => ({
+    ...doc,
+    project: doc.project ?? project ?? undefined,
+    concepts: mergeConceptsWithTags(doc.concepts, pathConcepts),
   }));
 }
 
@@ -58,7 +70,10 @@ export function readLearningDocuments(repoRoot: string, filePath: string): Oracl
   const content = fs.readFileSync(filePath, 'utf8');
   if (!content.trim()) return [];
   if (isPsiLearnSource(sourceFile)) return parsePsiLearnFile(sourceFile, content);
-  if (isMemoryLearningSource(sourceFile)) return parseLearningFile(path.basename(sourceFile), content, sourceFile);
+  if (isMemoryLearningSource(sourceFile)) return withDerivedStructure(
+    parseLearningFile(path.basename(sourceFile), content, sourceFile),
+    sourceFile,
+  );
   return [];
 }
 
