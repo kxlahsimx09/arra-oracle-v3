@@ -139,9 +139,9 @@ curl -s "${AUTH[@]}" -H 'content-type: application/json' \
 ## MCP tool catalogue
 
 `GET /api/v1/mcp/tools` returns core tools plus active plugin tools; handler names
-are omitted. The 27 core names are, in order:
+are omitted. The 28 core names are, in order:
 
-`____IMPORTANT`, `oracle_search`, `oracle_read`, `oracle_learn`, `oracle_list`,
+`____IMPORTANT`, `oracle_recap`, `oracle_search`, `oracle_read`, `oracle_learn`, `oracle_list`,
 `oracle_stats`, `oracle_concepts`, `oracle_supersede`, `oracle_research_note`,
 `oracle_handoff`, `oracle_inbox`, `oracle_thread`, `oracle_threads`,
 `oracle_thread_read`, `oracle_thread_update`, `oracle_profile`, `oracle_trace`,
@@ -161,7 +161,7 @@ are omitted. The 27 core names are, in order:
       "source": "core"
     }
   ],
-  "total": 27
+  "total": 28
 }
 ```
 

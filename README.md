@@ -21,8 +21,8 @@ Use this path first: one local data dir, Docker for HTTP, and `arra mine` to ing
 export ORACLE_DATA_DIR="$HOME/.arra-oracle-v2"
 mkdir -p "$ORACLE_DATA_DIR"
 
-docker run --rm --name arra-oracle -p 47778:47778 \
-  -e ORACLE_EMBEDDER=none \
+docker run --rm --name arra-oracle --user "$(id -u):$(id -g)" \
+  -p 47778:47778 -e ORACLE_EMBEDDER=none \
   -v "$ORACLE_DATA_DIR:/data" \
   ghcr.io/soul-brews-studio/arra-oracle-v3:http
 ```
@@ -65,7 +65,7 @@ Useful checks: `curl -sf http://localhost:47778/api/health` and `bun cli/src/cli
 | --- | --- |
 | Modular backend | Elysia/SQLite core can run all-local, behind a maw plugin backend, behind edge proxies, or split from vector/MCP adapters. |
 | Runtime plug-in/out | Unified manifests enable/disable CLI, menu/API, MCP, proxy, server, export-format, and lifecycle surfaces without forks. |
-| MCP memory tools | 28 tools: `____IMPORTANT` plus 27 `oracle_*`, including `oracle_research_note`, `oracle_profile`, and `oracle_trace_distill`. |
+| MCP memory tools | 28 tools: `____IMPORTANT` plus 27 `oracle_*`, including `oracle_recap`, `oracle_research_note`, `oracle_profile`, and `oracle_trace_distill`. |
 | Memory confidence + supersede | Confidence receipts, reversible supersede chains, trace context, and async dry-run consolidation preserve history while deduping. |
 | HTTP API | Elysia route clusters under `/api/*`, with health, search, knowledge, vector, menu, plugins, canvas, tenants, settings, and opt-in federation surfaces. |
 | Vector search | Configurable providers, LanceDB/local stores, proxy services, export formats, status/config APIs, and FTS fallback paths. |

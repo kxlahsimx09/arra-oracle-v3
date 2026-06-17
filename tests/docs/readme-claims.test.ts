@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import pkg from '../../package.json' with { type: 'json' };
+import { smokeArraMine, smokeDockerHeroPath } from './readme-claim-smoke.ts';
 
 const repoRoot = process.cwd();
 const readme = readFileSync('README.md', 'utf8');
@@ -90,6 +91,20 @@ describe('README/docs advertised claims', () => {
     expect(missing).toEqual([]);
   });
 
+  test('Docker hero path builds and serves health from /data', async () => {
+    expect(readme).toMatch(/export ORACLE_DATA_DIR=[\s\S]*docker run[\s\S]*--user \"\$\(id -u\):\$\(id -g\)\"[\s\S]*-p 47778:47778[\s\S]*-v \"\$ORACLE_DATA_DIR:\/data\"[\s\S]*arra-oracle-v3:http/);
+    const health = await smokeDockerHeroPath(repoRoot, scratch);
+    expect(health.status).toBe('ok');
+    expect(health.dbCheck.path).toBe('/data/oracle.db');
+  }, 240_000);
+
+  test('arra mine smoke ingests a folder through the advertised CLI', async () => {
+    expect(readFileSync('src/cli/help.ts', 'utf8')).toContain('arra-cli mine <dir>');
+    const result = await smokeArraMine(repoRoot, scratch);
+    expect(result.stdout).toContain('Mined 1 document');
+    expect(result.rows).toHaveLength(1);
+  }, 30_000);
+
   test('API route count claim matches the base Elysia app', () => {
     const match = apiDoc.match(/base `createApp\(\)` .*? exposes (\d+) routes, (\d+) under `\/api`/i);
     expect(match).not.toBeNull();
@@ -115,6 +130,7 @@ describe('README/docs advertised claims', () => {
 
   test('advertised MCP core tool count and names match the manifest and HTTP browser', async () => {
     expect(coreMcpToolNames).toHaveLength(28);
+    expect(coreMcpToolNames).toContain('oracle_recap');
     expect(coreMcpToolNames).toContain('oracle_search');
     expect(coreMcpToolNames).toContain('oracle_trace_distill');
 
