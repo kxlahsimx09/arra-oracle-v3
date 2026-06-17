@@ -45,6 +45,8 @@ export const oracleMemories = sqliteTable('oracle_memories', {
   title: text('title'),
   tags: text('tags').default('[]').notNull(),
   source: text('source'),
+  validFrom: integer('valid_from'),
+  validTo: integer('valid_to'),
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),
 }, (table) => [
@@ -52,6 +54,7 @@ export const oracleMemories = sqliteTable('oracle_memories', {
   index('idx_memory_title').on(table.title),
   index('idx_memory_source').on(table.source),
   index('idx_memory_tenant_created').on(table.tenantId, table.createdAt),
+  index('idx_memory_tenant_valid_time').on(table.tenantId, table.validFrom, table.validTo),
 ]);
 // Indexing status tracking
 export const indexingStatus = sqliteTable('indexing_status', {

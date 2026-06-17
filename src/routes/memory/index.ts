@@ -1,7 +1,7 @@
 import { Elysia } from 'elysia';
 import { MemoryCloseoutBody, MorningTapeQuery, RecallMemoryQuery, SaveMemoryBody, SemanticMemoryQuery, parseMemoryLimit } from './model.ts';
 import { createMemoryFanoutEndpoint } from './fanout.ts';
-import { memoryStore, type MemoryInput, type MemoryRecord, type MemoryStore } from './store.ts';
+import { memoryStore, parseValidTime, type MemoryInput, type MemoryRecord, type MemoryStore } from './store.ts';
 import { memoryVectorIndex, type MemoryVectorHit, type MemoryVectorIndex } from './vector.ts';
 import { buildMorningTape } from './morning-tape.ts';
 import { MEMORY_CONFIDENCE_STRATEGY, memoryConfidence } from './confidence.ts';
@@ -51,10 +51,14 @@ export function createMemoryRoutes(
       query: MorningTapeQuery,
       detail: { tags: ['memory'], menu: { group: 'hidden' }, summary: 'Render a two-minute morning recovery tape from persisted memories' },
     })
-    .get('/memory/recall', ({ query }) => {
+    .get('/memory/recall', ({ query, set }) => {
       const limit = parseMemoryLimit(query.limit);
-      const items = store.recall(query.q ?? '', limit);
-      return { query: query.q ?? '', total: items.length, confidence: MEMORY_CONFIDENCE_STRATEGY, items: items.map(withKeywordConfidence) };
+      try {
+        const items = store.recall(query.q ?? '', limit, query.asOf);
+        return { query: query.q ?? '', asOf: isoAsOf(query.asOf), total: items.length, confidence: MEMORY_CONFIDENCE_STRATEGY, items: items.map(withKeywordConfidence) };
+      } catch (error) {
+        return invalidAsOf(set, error);
+      }
     }, {
       query: RecallMemoryQuery,
       detail: { tags: ['memory'], menu: { group: 'hidden' }, summary: 'Recall persisted memories by keyword' },
@@ -66,18 +70,29 @@ export function createMemoryRoutes(
       }
       const limit = parseMemoryLimit(query.limit);
       try {
+        isoAsOf(query.asOf);
         const hits = await vectorIndex.search(query.q, limit);
-        const records = store.getByIds(hits.map((hit) => hit.memoryId));
+        const records = store.getByIds(hits.map((hit) => hit.memoryId), query.asOf);
         const results = mergeHits(hits, records);
-        return { success: true, query: query.q, total: results.length, confidence: MEMORY_CONFIDENCE_STRATEGY, results };
+        return { success: true, query: query.q, asOf: isoAsOf(query.asOf), total: results.length, confidence: MEMORY_CONFIDENCE_STRATEGY, results };
       } catch (error) {
-        set.status = 503;
-        return { success: false, error: error instanceof Error ? error.message : 'memory vector search failed', results: [] };
+        const message = error instanceof Error ? error.message : 'memory vector search failed';
+        set.status = message.includes('valid-time') ? 400 : 503;
+        return { success: false, error: message, results: [] };
       }
     }, {
       query: SemanticMemoryQuery,
       detail: { tags: ['memory'], menu: { group: 'hidden' }, summary: 'Search memories by vector similarity' },
     });
+}
+
+function isoAsOf(value: string | undefined): string | undefined {
+  return value ? new Date(parseValidTime(value)!).toISOString() : undefined;
+}
+
+function invalidAsOf(set: { status?: number | string }, error: unknown) {
+  set.status = 400;
+  return { success: false, error: error instanceof Error ? error.message : 'invalid valid-time timestamp' };
 }
 
 function mergeHits(hits: MemoryVectorHit[], records: MemoryRecord[]) {
@@ -122,6 +137,8 @@ function memoryForHit(hit: MemoryVectorHit, record?: MemoryRecord): MemoryRecord
     source: metadataText(hit.metadata.source ?? hit.metadata.source_file),
     createdAt,
     updatedAt: metadataText(hit.metadata.updatedAt) ?? createdAt,
+    validFrom: metadataText(hit.metadata.validFrom ?? hit.metadata.valid_from),
+    validTo: metadataText(hit.metadata.validTo ?? hit.metadata.valid_to),
   };
 }
 

@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, like, or, type SQL } from 'drizzle-orm';
+import { and, desc, eq, inArray, like, or, sql, type SQL } from 'drizzle-orm';
 import type { BunSQLiteDatabase } from 'drizzle-orm/bun-sqlite';
 import { db as defaultDb, oracleMemories } from '../../db/index.ts';
 import { currentTenantId, tenantIdForWrite } from '../../middleware/tenant.ts';
@@ -10,6 +10,8 @@ export type MemoryInput = {
   title?: string;
   tags?: string[];
   source?: string;
+  validFrom?: string | number;
+  validTo?: string | number | null;
 };
 
 export type MemoryRecord = MemoryInput & {
@@ -19,6 +21,8 @@ export type MemoryRecord = MemoryInput & {
   updatedAt: string;
   usageCount?: number;
   lastAccessedAt?: string;
+  validFrom?: string;
+  validTo?: string;
 };
 
 type OracleDb = BunSQLiteDatabase<typeof schema>;
@@ -35,6 +39,9 @@ export class MemoryStore {
     const content = input.content.trim();
     if (!content) throw new Error('memory content is required');
     const now = Date.now();
+    const validFrom = parseValidTime(input.validFrom);
+    const validTo = parseValidTime(input.validTo);
+    if (validFrom && validTo && validTo <= validFrom) throw new Error('valid_to must be after valid_from');
     const row = this.db.insert(oracleMemories).values({
       id: `mem_${now.toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
       tenantId: tenantIdForWrite(),
@@ -42,16 +49,18 @@ export class MemoryStore {
       title: input.title?.trim() || null,
       tags: JSON.stringify(cleanTags(input.tags)),
       source: input.source?.trim() || null,
+      validFrom: validFrom ?? null,
+      validTo: validTo ?? null,
       createdAt: now,
       updatedAt: now,
     }).returning().get();
     return memoryFromRow(row);
   }
 
-  recall(query = '', limit = 10): MemoryRecord[] {
+  recall(query = '', limit = 10, asOf?: string | number): MemoryRecord[] {
     const normalized = query.trim();
     const safeLimit = parseMemoryLimit(limit);
-    const where = combineWhere(tenantWhere(), searchWhere(normalized));
+    const where = combineWhere(tenantWhere(), searchWhere(normalized), asOfWhere(parseValidTime(asOf)));
     const selected = this.db.select().from(oracleMemories);
     const rows = where
       ? selected.where(where).orderBy(desc(oracleMemories.createdAt)).limit(safeLimit).all()
@@ -59,9 +68,9 @@ export class MemoryStore {
     return rows.map(memoryFromRow);
   }
 
-  getByIds(ids: string[]): MemoryRecord[] {
+  getByIds(ids: string[], asOf?: string | number): MemoryRecord[] {
     if (!ids.length) return [];
-    const where = combineWhere(inArray(oracleMemories.id, ids), tenantWhere());
+    const where = combineWhere(inArray(oracleMemories.id, ids), tenantWhere(), asOfWhere(parseValidTime(asOf)));
     const rows = this.db.select().from(oracleMemories).where(where).all();
     const byId = new Map(rows.map((row) => [row.id, memoryFromRow(row)]));
     return ids.map((id) => byId.get(id)).filter((row): row is MemoryRecord => Boolean(row));
@@ -72,6 +81,12 @@ export class MemoryStore {
 function tenantWhere(): SQL | undefined {
   const tenantId = currentTenantId();
   return tenantId ? eq(oracleMemories.tenantId, tenantId) : undefined;
+}
+
+function asOfWhere(asOf: number | undefined): SQL | undefined {
+  if (!asOf) return undefined;
+  return sql`coalesce(${oracleMemories.validFrom}, ${oracleMemories.createdAt}) <= ${asOf}
+    and (${oracleMemories.validTo} is null or ${oracleMemories.validTo} > ${asOf})`;
 }
 
 function searchWhere(query: string): SQL | undefined {
@@ -93,6 +108,13 @@ function cleanTags(tags: string[] = []): string[] {
   return tags.map((tag) => tag.trim()).filter(Boolean);
 }
 
+export function parseValidTime(value: string | number | null | undefined): number | undefined {
+  if (value === null || value === undefined || value === '') return undefined;
+  const ms = typeof value === 'number' ? value : Date.parse(value);
+  if (!Number.isSafeInteger(ms) || ms <= 0) throw new Error('invalid valid-time timestamp');
+  return ms;
+}
+
 function tagsFrom(value: string): string[] {
   try {
     const parsed = JSON.parse(value);
@@ -109,6 +131,8 @@ function memoryFromRow(row: MemoryRow): MemoryRecord {
     title: row.title ?? undefined,
     tags: tagsFrom(row.tags),
     source: row.source ?? undefined,
+    validFrom: row.validFrom ? new Date(row.validFrom).toISOString() : undefined,
+    validTo: row.validTo ? new Date(row.validTo).toISOString() : undefined,
     createdAt: new Date(row.createdAt).toISOString(),
     updatedAt: new Date(row.updatedAt).toISOString(),
   };

@@ -57,6 +57,9 @@ function memoryDocument(memory: MemoryRecord): VectorDocument {
       source: memory.source ?? '',
       tags: (memory.tags ?? []).join(','),
       createdAt: memory.createdAt,
+      updatedAt: memory.updatedAt,
+      validFrom: memory.validFrom ?? '',
+      validTo: memory.validTo ?? '',
     },
   };
 }
