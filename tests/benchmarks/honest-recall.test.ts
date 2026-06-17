@@ -26,6 +26,7 @@ describe('honest recall benchmark harness', () => {
   test('refuses to report Recall@k when top_k covers the corpus', async () => {
     const outFile = tempFile('refused.json');
     expect(() => guardTopK(4, 4)).toThrow('Refusing to report Recall@4');
+    expect(() => guardTopK(5, 4)).toThrow('top_k (5) must be smaller than corpus_size (4)');
     const searcher: Searcher = async () => { throw new Error('searcher should not run'); };
 
     await expect(runHonestRecallBenchmark({
@@ -58,12 +59,30 @@ describe('honest recall benchmark harness', () => {
       now: '2026-06-17T00:00:00.000Z',
     });
 
-    expect(report.provenance).toMatchObject({ mode: 'hybrid', model: 'multi', top_k: 3, metric: 'Recall@k', 'git-sha': 'abc123' });
+    expect(report.provenance).toMatchObject({ mode: 'hybrid', model: 'multi', top_k: 3, metric: 'Recall@3', metric_family: 'Recall@k', 'git-sha': 'abc123' });
     expect(report.provenance.stack).toEqual(['bge-m3', 'nomic', 'qwen3', 'FTS5']);
-    expect(report.metrics[0]).toMatchObject({ metric: 'Recall@k', label: 'Recall@3', value: 0.5, hits: 1, total_queries: 2 });
-    expect(report.metrics[1]).toMatchObject({ metric: 'Answer-Accuracy', status: 'not-measured' });
-    expect(report.cases.map((item) => item.metric)).toEqual(['Recall@k', 'Recall@k']);
+    expect(report.metrics[0]).toMatchObject({ metric: 'Recall@3', metric_family: 'Recall@k', label: 'Recall@3', value: 0.5, hits: 1, total_queries: 2 });
+    expect(report.metrics[1]).toMatchObject({ metric: 'Answer-Accuracy', metric_family: 'Answer-Accuracy', status: 'not-measured' });
+    expect('value' in report.metrics[1]).toBe(false);
+    expect(report.cases.map((item) => item.metric)).toEqual(['Recall@3', 'Recall@3']);
+    expect(report.cases.map((item) => item.metric_family)).toEqual(['Recall@k', 'Recall@k']);
     expect(JSON.parse(readFileSync(outFile, 'utf8')).provenance.corpus).toEqual({ label: 'oracle-test', size: 10 });
+  });
+
+  test('rejects invalid mode before search or provenance output', async () => {
+    const outFile = tempFile('bad-mode.json');
+    const searcher: Searcher = async () => { throw new Error('searcher should not run'); };
+
+    await expect(runHonestRecallBenchmark({
+      cases: [{ id: 'q1', query: 'alpha', expectedIds: ['doc-a'] }],
+      corpus: { label: 'oracle-test', size: 10 },
+      topK: 3,
+      mode: 'fake' as never,
+      searcher,
+      outFile,
+      gitSha: 'abc123',
+    })).rejects.toThrow('mode must be one of: hybrid, fts, vector');
+    expect(existsSync(outFile)).toBe(false);
   });
 
   test('HTTP searcher calls our hybrid multi-model search surface', async () => {

@@ -3,6 +3,7 @@ import { dirname } from 'node:path';
 
 export type MetricName = 'Recall@k' | 'Answer-Accuracy';
 export type BenchmarkMode = 'hybrid' | 'fts' | 'vector';
+type RecallMetricLabel = `Recall@${number}`;
 
 export type BenchmarkCase = {
   id: string;
@@ -18,8 +19,8 @@ export type Searcher = (request: SearchRequest) => Promise<SearchHit[]>;
 type CorpusRef = { label: string; size: number };
 
 type MetricRow =
-  | { metric: 'Recall@k'; label: string; value: number; hits: number; total_queries: number; top_k: number }
-  | { metric: 'Answer-Accuracy'; status: 'not-measured'; reason: string };
+  | { metric: RecallMetricLabel; metric_family: 'Recall@k'; label: RecallMetricLabel; value: number; hits: number; total_queries: number; top_k: number }
+  | { metric: 'Answer-Accuracy'; metric_family: 'Answer-Accuracy'; status: 'not-measured'; reason: string };
 
 export type HonestRecallReport = {
   schema: 'arra.honest-recall.v1';
@@ -29,7 +30,8 @@ export type HonestRecallReport = {
     model: string;
     top_k: number;
     corpus: CorpusRef;
-    metric: 'Recall@k';
+    metric: RecallMetricLabel;
+    metric_family: 'Recall@k';
     'git-sha': string;
     stack: string[];
   };
@@ -37,7 +39,8 @@ export type HonestRecallReport = {
   cases: Array<{
     id: string;
     query: string;
-    metric: 'Recall@k';
+    metric: RecallMetricLabel;
+    metric_family: 'Recall@k';
     expected_ids: string[];
     retrieved_ids: string[];
     hit: boolean;
@@ -87,8 +90,9 @@ export async function runHonestRecallBenchmark(options: {
   gitSha?: string;
   now?: string;
 }): Promise<HonestRecallReport> {
-  const mode = options.mode ?? 'hybrid';
+  const mode = normalizeMode(options.mode ?? 'hybrid');
   const model = options.model ?? 'multi';
+  const metric = recallMetric(options.topK);
   guardTopK(options.topK, options.corpus.size);
   if (!options.cases.length) throw new Error('benchmark dataset has no cases');
 
@@ -100,7 +104,8 @@ export async function runHonestRecallBenchmark(options: {
     cases.push({
       id: item.id,
       query: item.query,
-      metric: 'Recall@k',
+      metric,
+      metric_family: 'Recall@k',
       expected_ids: item.expectedIds,
       retrieved_ids: hits.map((hit) => hit.id),
       hit: matchedIndex >= 0,
@@ -118,13 +123,14 @@ export async function runHonestRecallBenchmark(options: {
       model,
       top_k: options.topK,
       corpus: options.corpus,
-      metric: 'Recall@k',
+      metric,
+      metric_family: 'Recall@k',
       'git-sha': options.gitSha ?? readGitSha(),
       stack: mode === 'hybrid' && model === 'multi' ? ['bge-m3', 'nomic', 'qwen3', 'FTS5'] : [model, mode],
     },
     metrics: [
-      { metric: 'Recall@k', label: `Recall@${options.topK}`, value: recall, hits, total_queries: cases.length, top_k: options.topK },
-      { metric: 'Answer-Accuracy', status: 'not-measured', reason: 'Retrieval-only harness: no answer generator or judge was run.' },
+      { metric, metric_family: 'Recall@k', label: metric, value: recall, hits, total_queries: cases.length, top_k: options.topK },
+      { metric: 'Answer-Accuracy', metric_family: 'Answer-Accuracy', status: 'not-measured', reason: 'Retrieval-only harness: no answer generator or judge was run.' },
     ],
     cases,
   };
@@ -134,6 +140,16 @@ export async function runHonestRecallBenchmark(options: {
     writeFileSync(options.outFile, `${JSON.stringify(report, null, 2)}\n`);
   }
   return report;
+}
+
+function normalizeMode(value: string): BenchmarkMode {
+  if (value === 'hybrid' || value === 'fts' || value === 'vector') return value;
+  throw new Error('mode must be one of: hybrid, fts, vector');
+}
+
+function recallMetric(topK: number): RecallMetricLabel {
+  guardTopK(topK, Number.MAX_SAFE_INTEGER);
+  return `Recall@${topK}`;
 }
 
 function parseCase(raw: unknown, index: number): BenchmarkCase {
@@ -192,7 +208,7 @@ function parseArgs(args: string[]) {
     corpus: opts.get('corpus') || 'oracle-hybrid-kb',
     corpusSize: Number(opts.get('corpus-size')),
     topK: Number(opts.get('top-k') ?? 10),
-    mode: (opts.get('mode') ?? 'hybrid') as BenchmarkMode,
+    mode: normalizeMode(opts.get('mode') ?? 'hybrid'),
     model: opts.get('model') ?? 'multi',
     baseUrl: opts.get('base-url') ?? 'http://127.0.0.1:47778',
     outFile: opts.get('out') ?? 'benchmarks/out/honest-recall.json',
@@ -206,7 +222,8 @@ function required(opts: Map<string, string>, key: string): string {
 }
 
 function printSummary(report: HonestRecallReport): void {
-  const recall = report.metrics[0] as Extract<MetricRow, { metric: 'Recall@k' }>;
+  const recall = report.metrics.find((row): row is Extract<MetricRow, { metric_family: 'Recall@k' }> => row.metric_family === 'Recall@k');
+  if (!recall) throw new Error('Recall@k metric row missing');
   console.log(`${recall.metric} ${recall.label}: ${recall.value} (${recall.hits}/${recall.total_queries})`);
   console.log('Answer-Accuracy: NOT MEASURED — retrieval-only harness');
   console.log(`provenance_json: ${report.provenance.mode}/${report.provenance.model} top_k=${report.provenance.top_k}`);
