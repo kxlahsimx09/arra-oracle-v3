@@ -41,7 +41,7 @@ describe('storeDocuments chunking', () => {
     const conn = createDatabase(dbPath);
     const vector = new FakeVectorStore();
     const para = (label: string, char: string) => `${label} ${char.repeat(330)}`;
-    const content = `${para('alpha', 'a')}\n\n${para('beta', 'b')}\n\n${para('gamma', 'c')}`;
+    const content = `${para('alpha CORS', 'a')}\n\n${para('beta', 'b')}\n\n${para('gamma', 'c')}`;
 
     try {
       await storeDocuments(conn.sqlite, conn.db, vector, null, [doc(content)], { tenantId: 'default' });
@@ -57,6 +57,9 @@ describe('storeDocuments chunking', () => {
       expect(rows[0].content).toContain('alpha');
       expect(rows[0].content).toContain('beta');
       expect(rows[0].content).not.toContain('gamma');
+      expect(rows[0].content).toContain('Search expansions:');
+      expect(rows[0].content).toContain('Cross-Origin Resource Sharing');
+      expect(vector.docs[0].document).toContain('Cross-Origin Resource Sharing');
       expect(rows[1].content).toContain('gamma');
       expect(vector.docs.map((item) => item.id)).toEqual(rows.map((row) => row.id));
       expect(vector.docs.map((item) => item.metadata.chunk_index)).toEqual([0, 1]);

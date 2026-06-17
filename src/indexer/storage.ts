@@ -6,6 +6,7 @@ import { Database } from 'bun:sqlite';
 import { BunSQLiteDatabase } from 'drizzle-orm/bun-sqlite';
 import * as schema from '../db/schema.ts';
 import { oracleDocuments } from '../db/schema.ts';
+import { enrichTextWithAcronyms } from '../search/acronyms.ts';
 import { tenantIdForWrite } from '../middleware/tenant.ts';
 import { replaceEntityLinks } from '../search/entity-ranking.ts';
 import { chunkDocumentsForIndexing } from './chunk-text.ts';
@@ -83,32 +84,34 @@ export async function storeDocuments(
         })
         .run();
 
+      const indexedContent = enrichTextWithAcronyms(doc.content);
+
       // SQLite FTS (raw SQL required for FTS5): delete then insert to avoid
       // duplicates across re-index runs.
       deleteFts.run(doc.id);
       insertFts.run(
         doc.id,
-        doc.content,
+        indexedContent,
         doc.concepts.join(' ')
       );
       replaceEntityLinks(sqlite, {
         documentId: doc.id,
         tenantId,
-        content: doc.content,
+        content: indexedContent,
         concepts: doc.concepts,
         now,
       });
       replaceDocumentPointers(sqlite, {
         documentId: doc.id,
         tenantId,
-        content: doc.content,
+        content: indexedContent,
         concepts: doc.concepts,
         timestamp: doc.updated_at || doc.created_at,
       });
 
       // Vector store metadata (must be primitives, not arrays)
       ids.push(doc.id);
-      contents.push(doc.content);
+      contents.push(indexedContent);
       metadatas.push({
         type: doc.type,
         tenant_id: tenantId,

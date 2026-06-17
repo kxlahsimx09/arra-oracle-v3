@@ -1,17 +1,21 @@
+import { augmentQueryWithAcronyms } from '../../search/acronyms.ts';
 import type { CombinedSearchResult, FtsResult, PointerResult, SearchConfidence, SearchProvenance, VectorResult } from './types.ts';
+
+const FTS_TOKEN_LIMIT = 32;
 
 /** Sanitize FTS5 query to prevent parse errors. */
 export function sanitizeFtsQuery(query: string): string {
-  const tokens = query
+  const tokens = augmentQueryWithAcronyms(query)
     .replace(/<[^>]*>/g, ' ')
     .normalize('NFKC')
     .match(/[\p{L}\p{N}_]+/gu)
     ?.map((token) => token.trim())
-    .filter((token) => token.length > 0)
-    .slice(0, 8) ?? [];
+    .filter((token) => token.length > 0) ?? [];
 
-  const uniqueTokens = Array.from(new Set(tokens));
-  return uniqueTokens.map((token) => `"${token.replace(/"/g, '""')}"`).join(' OR ');
+  return [...new Set(tokens)]
+    .slice(0, FTS_TOKEN_LIMIT)
+    .map((token) => `"${token.replace(/"/g, '""')}"`)
+    .join(' OR ');
 }
 
 /** Normalize FTS5 rank score using exponential decay. */

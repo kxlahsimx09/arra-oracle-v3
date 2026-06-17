@@ -9,6 +9,7 @@ import type { OracleDocument } from '../types.ts';
 import { deriveConceptsFromPath, mergeConceptsWithTags } from './concepts.ts';
 import { inferProjectFromPath } from './discovery.ts';
 import { parseLearningFile } from './parser.ts';
+import { enrichTextWithAcronyms } from '../search/acronyms.ts';
 import { chunkDocumentsForIndexing } from './chunk-text.ts';
 import { replaceDocumentPointers } from '../search/pointer-index.ts';
 
@@ -116,11 +117,12 @@ export function storeSqliteDocuments(db: Database, documents: OracleDocument[]):
         now,
         doc.project?.toLowerCase() ?? null,
       );
+      const indexedContent = enrichTextWithAcronyms(doc.content);
       deleteFts.run(doc.id);
-      insertFts.run(doc.id, doc.content, doc.concepts.join(' '));
+      insertFts.run(doc.id, indexedContent, doc.concepts.join(' '));
       replaceDocumentPointers(db, {
         documentId: doc.id,
-        content: doc.content,
+        content: indexedContent,
         concepts: doc.concepts,
         timestamp: doc.updated_at || doc.created_at,
       });
