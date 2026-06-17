@@ -1,6 +1,7 @@
 import { detectProject } from '../../server/project-detect.ts';
 import { currentTenantId } from '../../middleware/tenant.ts';
 import { rerankByEntityLinks } from '../../search/entity-ranking.ts';
+import { queryPointerIndex } from '../../search/pointer-index.ts';
 import { rerankCandidates } from '../../server/reranker.ts';
 import type { SearchResult } from '../../server/types.ts';
 import { compactSearchResults, parseSearchRetrievalMode } from '../../search/compact-summary.ts';
@@ -45,6 +46,14 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
     }
   }
 
+  const pointerResults = queryPointerIndex(ctx.sqlite, {
+    query,
+    type,
+    limit: limit * 3,
+    project: resolvedProject,
+    tenantId: currentTenantId(),
+  });
+
   let vecResults: Awaited<ReturnType<typeof vectorSearch>> = [];
   if (effectiveMode !== 'fts') {
     try {
@@ -63,7 +72,7 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
 
   const ftsResults = mapFtsResults(ftsRawResults);
   const normalizedVectorResults = vecResults.map((result) => ({ ...result, score: 1 - (result.score || 0) }));
-  const combinedResults = combineResults(ftsResults, normalizedVectorResults);
+  const combinedResults = combineResults(ftsResults, normalizedVectorResults, 0.5, 0.5, pointerResults);
   const entityRankedResults = rerankByEntityLinks(ctx.sqlite, combinedResults, query, currentTenantId());
   const reranked = await rerankCandidates({
     query,
@@ -105,6 +114,11 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
     vectorMatches: vecResults.length,
     sources: { fts: ftsCount, vector: vectorCount, hybrid: hybridCount },
     searchTime,
+    pointerIndex: {
+      enabled: true,
+      strategy: 'topic_entity_date_pointer_fast_path',
+      hits: pointerResults.length,
+    },
     ...(requestedMode !== 'fts' ? { vectorAvailable: vectorAvailable === true } : {}),
     reranked: reranked.reranked,
     ...(reranked.fallbackReason ? { rerankFallbackReason: reranked.fallbackReason } : {}),

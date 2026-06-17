@@ -8,10 +8,12 @@ export interface SearchResult {
   content: string;
   source_file: string;
   concepts: string[];
-  source?: 'fts' | 'vector' | 'hybrid';
+  source?: 'fts' | 'vector' | 'pointer' | 'hybrid';
   score?: number;
   distance?: number;
   model?: string;
+  pointerScore?: number;
+  pointerMatches?: string[];
   entity_score?: number;
   entity_matches?: string[];
   entityLinkScore?: number;

@@ -8,6 +8,7 @@ import * as schema from '../db/schema.ts';
 import { oracleDocuments } from '../db/schema.ts';
 import { tenantIdForWrite } from '../middleware/tenant.ts';
 import { replaceEntityLinks } from '../search/entity-ranking.ts';
+import { replaceDocumentPointers } from '../search/pointer-index.ts';
 import type { VectorStoreAdapter } from '../vector/types.ts';
 import type { OracleDocument } from '../types.ts';
 
@@ -94,6 +95,13 @@ export async function storeDocuments(
         content: doc.content,
         concepts: doc.concepts,
         now,
+      });
+      replaceDocumentPointers(sqlite, {
+        documentId: doc.id,
+        tenantId,
+        content: doc.content,
+        concepts: doc.concepts,
+        timestamp: doc.updated_at || doc.created_at,
       });
 
       // Vector store metadata (must be primitives, not arrays)
