@@ -77,6 +77,36 @@ test("idle_done: claude TUI at the prompt, no error → finished its turn", () =
   ).toBe("idle_done");
 });
 
+test("api_error FALSE-POSITIVE regression: error words in SCROLLBACK prose, idle at bottom → idle_done", () => {
+  // The 2026-06-17 self-watch FP: the watcher read a brew-ops dev session whose
+  // own conversation discussed the feature ("auto-resume 529", "api_error",
+  // "crashed"), with an idle prompt at the bottom. Must NOT classify api_error.
+  const pane = [
+    "  - agent API error เงียบ → L2 classify api_error distinct → alert owner",
+    "  ค้างเดียว — L3 (auto-action): auto-resume 529 / opt-in auto-close idle / crashed",
+    "  salvage-hint groundwork อยู่ใน git stash",
+    "  จะให้ทำ L3 ต่อ ไหมครับ หรือพอแค่นี้?",
+    "✻ Brewed for 1m 41s",
+    "─────────────────────────────────────────────",
+    "❯                                            ",
+    "─────────────────────────────────────────────",
+    "  ⏵⏵ bypass permissions on            ? for shortcuts",
+  ].join("\n");
+  expect(classify(pane)).toBe("idle_done");
+});
+
+test("api_error still fires when a REAL banner sits in the bottom region", () => {
+  const pane = [
+    "  I'll run the deposit journey now.",
+    "  (lots of earlier work scrolled above)",
+    "⎿  API Error: 529 overloaded_error — giving up after retries",
+    "─────────────────────────────────────────────",
+    "❯ ",
+    "  ? for shortcuts",
+  ].join("\n");
+  expect(classify(pane)).toBe("api_error");
+});
+
 test("unknown: empty capture (transient tmux failure) — never guess", () => {
   expect(classify("")).toBe("unknown");
 });
