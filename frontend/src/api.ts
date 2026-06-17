@@ -61,6 +61,20 @@ export async function searchVector(query: string, limit = 8): Promise<SearchResp
   };
 }
 
+
+export async function searchMemoryHealth(query: string, limit = 20): Promise<SearchResponse> {
+  const qs = new URLSearchParams({ q: query, limit: String(limit) });
+  const data = await getJson<SearchResponse>(`/api/memory/search?${qs}`);
+  return {
+    results: Array.isArray(data.results) ? data.results : [],
+    total: Number.isFinite(data.total) ? data.total : 0,
+    query: typeof data.query === 'string' ? data.query : query,
+    limit: data.limit,
+    offset: data.offset,
+    error: data.error,
+  };
+}
+
 export async function fetchMcpTools(): Promise<McpToolsResponse> {
   const data = await getJson<McpToolsResponse>('/api/mcp/tools');
   return {

@@ -13,6 +13,10 @@ describe('MemoryPage', () => {
 
     expect(html).toContain('Memory health');
     expect(html).toContain('Heat and recency');
+    expect(html).toContain('Heat heatmap');
+    expect(html).toContain('Confidence bars');
+    expect(html).toContain('Valid-time timeline');
+    expect(html).toContain('Supersede-chain viewer');
     expect(html).toContain('aria-label="Memory health search form"');
     expect(html).toContain('value="oracle"');
     expect(html).toContain('Run a search to inspect memory health signals.');
