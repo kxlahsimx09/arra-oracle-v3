@@ -12,6 +12,7 @@ describe('Simple page', () => {
       expect(html).toContain('Ask your Oracle');
       expect(html).toContain('type="search"');
       expect(html).toContain('Save something to memory');
+      expect(html).toContain('Add a whole folder of notes');
       expect(html).toContain('href="/"');
       expect(html).toContain('Advanced Studio');
       expect(html).toContain('Arra Oracle v');

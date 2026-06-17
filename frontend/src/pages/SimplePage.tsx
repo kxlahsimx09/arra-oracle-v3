@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { apiFetch } from '../api/oracle';
 import { HealthHero } from '../components/HealthHero';
 import { AddMemory } from '../components/simple/AddMemory';
+import { IndexFolderCard } from '../components/simple/IndexFolderCard';
 import { SimpleSearch } from '../components/simple/SimpleSearch';
 import { HealthState, mapHealthState, type SimpleHealthPayload } from '../components/simple/healthState';
 import { version } from '../../../package.json';
@@ -44,6 +45,7 @@ export function SimplePage() {
           <HealthHero state={state} checkedAt={checkedAt} onAction={poll} />
           <SimpleSearch />
           <AddMemory />
+          <IndexFolderCard />
         </div>
         <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-border py-4 text-sm text-text-muted">
           <a className="focus-ring rounded-lg font-semibold text-accent hover:text-text" href="/">
