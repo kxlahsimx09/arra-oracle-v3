@@ -8,6 +8,7 @@ import { MEMORY_CONFIDENCE_STRATEGY } from './confidence.ts';
 import { formatCloseoutMemory, type MemoryCloseoutInput } from './closeout.ts';
 import { currentTenantId } from '../../middleware/tenant.ts';
 import { rankMemories } from './rank.ts';
+import { createMemoryStatsEndpoint } from './stats.ts';
 
 export function createMemoryRoutes(
   store: MemoryStore = memoryStore,
@@ -41,6 +42,7 @@ export function createMemoryRoutes(
       detail: { tags: ['memory'], menu: { group: 'hidden' }, summary: 'Persist a Challenge 2 session close-out memory' },
     })
     .use(createMemoryFanoutEndpoint())
+    .use(createMemoryStatsEndpoint())
     .get('/memory/morning-tape', ({ query }) => {
       const limit = parseMemoryLimit(query.limit, 8, 25);
       const tape = buildMorningTape(store.recall('', limit));
