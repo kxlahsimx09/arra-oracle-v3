@@ -10,19 +10,15 @@ import {
   runHonestRecallBenchmark,
   type Searcher,
 } from '../../benchmarks/honest-recall.ts';
-
 const roots: string[] = [];
-
 function tempFile(name: string): string {
   const root = mkdtempSync(join(tmpdir(), 'arra-honest-bench-'));
   roots.push(root);
   return join(root, name);
 }
-
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
-
 describe('honest recall benchmark harness', () => {
   test('refuses to report Recall@k when top_k covers the corpus', async () => {
     const outFile = tempFile('refused.json');
@@ -30,7 +26,6 @@ describe('honest recall benchmark harness', () => {
     expect(() => guardTopK(4, 4)).toThrow('Refusing to report Recall@4');
     expect(() => guardTopK(5, 4)).toThrow('top_k (5) must be smaller than corpus_size (4)');
     const searcher: Searcher = async () => { throw new Error('searcher should not run'); };
-
     await expect(runHonestRecallBenchmark({
       cases: [{ id: 'q1', query: 'alpha', expectedIds: ['doc-a'] }],
       corpus: { label: 'tiny', size: 4 },
@@ -41,12 +36,10 @@ describe('honest recall benchmark harness', () => {
     })).rejects.toThrow('top_k (5) must be smaller than corpus_size (4)');
     expect(existsSync(outFile)).toBe(false);
   });
-
   test('refuses empty datasets and missing corpus labels before searching', async () => {
     const outFile = tempFile('empty.json');
     let searchCalls = 0;
     const searcher: Searcher = async () => { searchCalls += 1; return []; };
-
     await expect(runHonestRecallBenchmark({
       cases: parseDatasetText(' \n '),
       corpus: { label: 'oracle-test', size: 10 },
@@ -66,17 +59,18 @@ describe('honest recall benchmark harness', () => {
     expect(searchCalls).toBe(0);
     expect(existsSync(outFile)).toBe(false);
   });
-
-  test('writes provenance JSON and separates Recall@k from Answer-Accuracy', async () => {
+  test('scores answerable recall separately from rejection metrics', async () => {
     const outFile = tempFile('report.json');
-    const searcher: Searcher = async ({ query }) => query === 'alpha'
-      ? [{ id: 'noise' }, { id: 'doc-a' }]
-      : [{ id: 'noise' }, { id: 'other' }];
-
+    const searcher: Searcher = async ({ query }) => {
+      if (query === 'alpha') return [{ id: 'noise' }, { id: 'doc-a' }];
+      if (query === 'unknown') return [];
+      return [{ id: 'noise' }, { id: 'other' }];
+    };
     const report = await runHonestRecallBenchmark({
       cases: parseDatasetText([
         JSON.stringify({ id: 'q1', query: 'alpha', expected_ids: ['doc-a'], answer: 'A' }),
         JSON.stringify({ id: 'q2', query: 'beta', relevant_ids: ['doc-b'], answer: 'B' }),
+        JSON.stringify({ id: 'q3', query: 'unknown', expectedIds: [] }),
       ].join('\n')),
       corpus: { label: 'oracle-test', size: 10 },
       topK: 3,
@@ -85,23 +79,21 @@ describe('honest recall benchmark harness', () => {
       gitSha: 'abc123',
       now: '2026-06-17T00:00:00.000Z',
     });
-
     expect(report.provenance).toMatchObject({ mode: 'hybrid', model: 'multi', top_k: 3, metric: 'Recall@k', metric_family: 'Recall@k', 'git-sha': 'abc123' });
     expect(report.provenance.stack).toEqual(['bge-m3', 'nomic', 'qwen3', 'FTS5']);
     expect(report.metrics[0]).toMatchObject({ metric: 'Recall@k', metric_family: 'Recall@k', label: 'Recall@3', value: 0.5, hits: 1, total_queries: 2 });
-    expect(report.metrics[1]).toMatchObject({ metric: 'Answer-Accuracy', metric_family: 'Answer-Accuracy', status: 'not-measured' });
-    expect(report.metrics.map((item) => item.metric)).toEqual(['Recall@k', 'Answer-Accuracy']);
-    expect('value' in report.metrics[1]).toBe(false);
-    expect(report.cases.map((item) => item.metric)).toEqual(['Recall@k', 'Recall@k']);
-    expect(report.cases.map((item) => item.metric_family)).toEqual(['Recall@k', 'Recall@k']);
+    expect(report.metrics[1]).toMatchObject({ metric: 'Reject-Recall', metric_family: 'Reject', value: 1, correct_rejections: 1, total_unanswerable: 1 });
+    expect(report.metrics[2]).toMatchObject({ metric: 'Reject-Precision', metric_family: 'Reject', value: 1, correct_rejections: 1, total_rejections: 1 });
+    expect(report.metrics[3]).toMatchObject({ metric: 'Answer-Accuracy', metric_family: 'Answer-Accuracy', status: 'not-measured' });
+    expect(report.metrics.map((item) => item.metric)).toEqual(['Recall@k', 'Reject-Recall', 'Reject-Precision', 'Answer-Accuracy']);
+    expect('value' in report.metrics[3]).toBe(false);
+    expect(report.cases.map((item) => item.metric_family)).toEqual(['Recall@k', 'Recall@k', 'Reject']);
     expect(JSON.parse(readFileSync(outFile, 'utf8')).provenance.corpus).toEqual({ label: 'oracle-test', size: 10 });
   });
-
   test('shipped public recall dataset is parseable and does not leak private paths', () => {
     const text = readFileSync('benchmarks/fixtures/recall-dataset.jsonl', 'utf8');
     const lines = text.trim().split('\n');
     const cases = parseDatasetText(text);
-
     expect(lines.length).toBeGreaterThanOrEqual(200);
     expect(lines.length).toBeLessThanOrEqual(250);
     expect(cases).toHaveLength(lines.length);
@@ -115,11 +107,9 @@ describe('honest recall benchmark harness', () => {
     expect(text).not.toContain('\u03c8/');
     expect(text).not.toContain('/Users/');
   });
-
   test('rejects invalid mode before search or provenance output', async () => {
     const outFile = tempFile('bad-mode.json');
     const searcher: Searcher = async () => { throw new Error('searcher should not run'); };
-
     await expect(runHonestRecallBenchmark({
       cases: [{ id: 'q1', query: 'alpha', expectedIds: ['doc-a'] }],
       corpus: { label: 'oracle-test', size: 10 },
@@ -131,7 +121,6 @@ describe('honest recall benchmark harness', () => {
     })).rejects.toThrow('mode must be one of: hybrid, fts, vector');
     expect(existsSync(outFile)).toBe(false);
   });
-
   test('published headline artifact records hybrid multi-model provenance', () => {
     const report = JSON.parse(readFileSync('benchmarks/out/honest-recall.json', 'utf8'));
     expect(report.provenance).toMatchObject({
@@ -143,10 +132,10 @@ describe('honest recall benchmark harness', () => {
     expect(report.provenance.ollama_models).toEqual(['bge-m3', 'nomic-embed-text', 'qwen3-embedding']);
     expect(report.provenance.baseline).toMatchObject({ label: 'Recall@3', value: 0.9, hits: 9, total_queries: 10 });
     expect(report.metrics[0]).toMatchObject({ metric: 'Recall@k', label: 'Recall@3', value: 1, hits: 10, total_queries: 10 });
+    expect(report.metrics[1]).toMatchObject({ metric: 'Reject-Recall', metric_family: 'Reject', total_unanswerable: 0 });
     expect(report.cases).toHaveLength(10);
     expect(report.cases.find((item: { id: string }) => item.id === 'weak/semantic-vector')).toMatchObject({ hit: true });
   });
-
   test('HTTP searcher calls our hybrid multi-model search surface', async () => {
     const seen: string[] = [];
     const server = Bun.serve({
@@ -169,7 +158,6 @@ describe('honest recall benchmark harness', () => {
       await server.stop(true);
     }
   });
-
   test('runs deterministic FTS Recall@10 against a seeded in-memory DB', async () => {
     const sqlite = new Database(':memory:');
     try {
@@ -184,7 +172,6 @@ describe('honest recall benchmark harness', () => {
         gitSha: 'test-sha',
         now: '2026-06-17T00:00:00.000Z',
       });
-
       const recall = report.metrics[0];
       expect(recall).toMatchObject({ metric: 'Recall@k', label: 'Recall@10', top_k: 10 });
       expect(recall.metric_family).toBe('Recall@k');
@@ -197,24 +184,20 @@ describe('honest recall benchmark harness', () => {
     }
   });
 });
-
 function seedFtsCorpus(sqlite: Database): void {
   sqlite.exec('CREATE VIRTUAL TABLE docs USING fts5(id UNINDEXED, content)');
   const insert = sqlite.prepare('INSERT INTO docs (id, content) VALUES (?, ?)');
   for (const [id, content] of seededDocs()) insert.run(id, content);
 }
-
 function createSqliteFtsSearcher(sqlite: Database): Searcher {
   return async ({ query, topK }) => sqlite.prepare(`
     SELECT id FROM docs WHERE docs MATCH ? ORDER BY rank LIMIT ?
   `).all(toFtsQuery(query), topK) as Array<{ id: string }>;
 }
-
 function toFtsQuery(query: string): string {
   const tokens = query.match(/[\p{L}\p{N}_]+/gu)?.slice(0, 8) ?? [];
   return [...new Set(tokens)].map((token) => `"${token.replace(/"/g, '""')}"`).join(' OR ');
 }
-
 function seededDocs(): Array<[string, string]> {
   return [
     ['doc-cli', 'Install the Arra Oracle CLI with Bun, run setup, then open the local dashboard.'],
@@ -231,7 +214,6 @@ function seededDocs(): Array<[string, string]> {
     ['doc-plugin', 'Canvas plugins declare manifests, commands, entrypoints, and validation rules.'],
   ];
 }
-
 function seededCases() {
   return parseDatasetText([
     { id: 'q-cli', query: 'install cli bun setup dashboard', expected_ids: ['doc-cli'] },

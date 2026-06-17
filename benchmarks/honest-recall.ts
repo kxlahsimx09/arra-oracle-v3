@@ -1,23 +1,19 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { rerankStage, searchWithOptionalRerank, type RerankOptions, type RerankStage } from './honest-recall-rerank.ts';
-
-export type MetricName = 'Recall@k' | 'Answer-Accuracy';
+export type MetricName = 'Recall@k' | 'Reject-Recall' | 'Reject-Precision' | 'Answer-Accuracy';
 export type BenchmarkMode = 'hybrid' | 'fts' | 'vector';
 type RecallMetricLabel = `Recall@${number}`;
-
 export type BenchmarkCase = { id: string; query: string; expectedIds: string[]; expectedAnswer?: string };
-
 export type SearchHit = { id: string; source_file?: string; sourceFile?: string; content?: string; text?: string; title?: string };
 export type SearchRequest = { query: string; topK: number; mode: BenchmarkMode; model: string };
 export type Searcher = (request: SearchRequest) => Promise<SearchHit[]>;
-
 type CorpusRef = { label: string; size: number };
-
 export type MetricRow =
   | { metric: 'Recall@k'; metric_family: 'Recall@k'; label: RecallMetricLabel; value: number; hits: number; total_queries: number; top_k: number }
+  | { metric: 'Reject-Recall'; metric_family: 'Reject'; value: number; correct_rejections: number; total_unanswerable: number }
+  | { metric: 'Reject-Precision'; metric_family: 'Reject'; value: number; correct_rejections: number; total_rejections: number }
   | { metric: 'Answer-Accuracy'; metric_family: 'Answer-Accuracy'; status: 'not-measured'; reason: string };
-
 export type HonestRecallReport = {
   schema: 'arra.honest-recall.v1';
   generated_at: string;
@@ -26,8 +22,8 @@ export type HonestRecallReport = {
     model: string;
     top_k: number;
     corpus: CorpusRef;
-    metric: 'Recall@k';
-    metric_family: 'Recall@k';
+    metric: 'Recall@k' | 'Reject';
+    metric_family: 'Recall@k' | 'Reject';
     'git-sha': string;
     stack: string[];
     rerank?: RerankStage;
@@ -36,15 +32,14 @@ export type HonestRecallReport = {
   cases: Array<{
     id: string;
     query: string;
-    metric: 'Recall@k';
-    metric_family: 'Recall@k';
+    metric: 'Recall@k' | 'Reject';
+    metric_family: 'Recall@k' | 'Reject';
     expected_ids: string[];
     retrieved_ids: string[];
     hit: boolean;
     matched_rank: number | null;
   }>;
 };
-
 export function guardTopK(topK: number, corpusSize: number): void {
   if (!Number.isSafeInteger(topK) || topK < 1) throw new Error('top_k must be a positive integer');
   if (!Number.isSafeInteger(corpusSize) || corpusSize < 1) throw new Error('corpus_size must be a positive integer');
@@ -52,13 +47,11 @@ export function guardTopK(topK: number, corpusSize: number): void {
     throw new Error(`Refusing to report Recall@${topK}: top_k (${topK}) must be smaller than corpus_size (${corpusSize}).`);
   }
 }
-
 function validateBenchmarkInputs(cases: BenchmarkCase[], corpus: CorpusRef, topK: number): void {
   if (!cases.length) throw new Error('benchmark dataset has no cases');
   if (!stringField(corpus.label)) throw new Error('benchmark corpus/collection label is required');
   guardTopK(topK, corpus.size);
 }
-
 export function parseDatasetText(text: string): BenchmarkCase[] {
   const trimmed = text.trim();
   if (!trimmed) return [];
@@ -67,7 +60,6 @@ export function parseDatasetText(text: string): BenchmarkCase[] {
     : trimmed.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as unknown);
   return rawItems.map(parseCase);
 }
-
 export function createHttpSearcher(baseUrl: string): Searcher {
   return async ({ query, topK, mode, model }) => {
     const url = new URL('/api/search', baseUrl);
@@ -81,7 +73,6 @@ export function createHttpSearcher(baseUrl: string): Searcher {
     return (Array.isArray(body.results) ? body.results : []).map(toHit).filter(Boolean) as SearchHit[];
   };
 }
-
 export async function runHonestRecallBenchmark(options: {
   cases: BenchmarkCase[];
   corpus: CorpusRef;
@@ -99,28 +90,32 @@ export async function runHonestRecallBenchmark(options: {
   const recallLabel = recallMetric(options.topK);
   validateBenchmarkInputs(options.cases, options.corpus, options.topK);
   const stage = rerankStage(options.rerank?.enabled === true);
-
   const cases: HonestRecallReport['cases'] = [];
   for (const item of options.cases) {
     const hits = await searchWithOptionalRerank({
       searcher: options.searcher, query: item.query, topK: options.topK, mode, model, rerank: options.rerank, stage,
     });
     const expected = new Set(item.expectedIds);
-    const matchedIndex = hits.findIndex((hit) => keysForHit(hit).some((key) => expected.has(key)));
+    const retrievedIds = hits.map((hit) => hit.id);
+    const isReject = item.expectedIds.length === 0;
+    const matchedIndex = isReject ? -1 : hits.findIndex((hit) => keysForHit(hit).some((key) => expected.has(key)));
     cases.push({
-      id: item.id,
-      query: item.query,
-      metric: 'Recall@k',
-      metric_family: 'Recall@k',
-      expected_ids: item.expectedIds,
-      retrieved_ids: hits.map((hit) => hit.id),
-      hit: matchedIndex >= 0,
+      id: item.id, query: item.query,
+      metric: isReject ? 'Reject' : 'Recall@k',
+      metric_family: isReject ? 'Reject' : 'Recall@k',
+      expected_ids: item.expectedIds, retrieved_ids: retrievedIds,
+      hit: isReject ? retrievedIds.length === 0 : matchedIndex >= 0,
       matched_rank: matchedIndex >= 0 ? matchedIndex + 1 : null,
     });
   }
-
-  const hits = cases.filter((item) => item.hit).length;
-  const recall = roundMetric(hits / cases.length);
+  const answerable = cases.filter((item) => item.metric_family === 'Recall@k');
+  const rejects = cases.filter((item) => item.metric_family === 'Reject');
+  const hits = answerable.filter((item) => item.hit).length;
+  const correctRejections = rejects.filter((item) => item.hit).length;
+  const totalRejections = cases.filter((item) => item.retrieved_ids.length === 0).length;
+  const recall = answerable.length ? roundMetric(hits / answerable.length) : 0;
+  const rejectRecall = rejects.length ? roundMetric(correctRejections / rejects.length) : 0;
+  const rejectPrecision = totalRejections ? roundMetric(correctRejections / totalRejections) : 0;
   const report: HonestRecallReport = {
     schema: 'arra.honest-recall.v1',
     generated_at: options.now ?? new Date().toISOString(),
@@ -136,29 +131,27 @@ export async function runHonestRecallBenchmark(options: {
       ...(stage.enabled ? { rerank: stage } : {}),
     },
     metrics: [
-      { metric: 'Recall@k', metric_family: 'Recall@k', label: recallLabel, value: recall, hits, total_queries: cases.length, top_k: options.topK },
+      { metric: 'Recall@k', metric_family: 'Recall@k', label: recallLabel, value: recall, hits, total_queries: answerable.length, top_k: options.topK },
+      { metric: 'Reject-Recall', metric_family: 'Reject', value: rejectRecall, correct_rejections: correctRejections, total_unanswerable: rejects.length },
+      { metric: 'Reject-Precision', metric_family: 'Reject', value: rejectPrecision, correct_rejections: correctRejections, total_rejections: totalRejections },
       { metric: 'Answer-Accuracy', metric_family: 'Answer-Accuracy', status: 'not-measured', reason: 'Retrieval-only harness: no answer generator or judge was run.' },
     ],
     cases,
   };
-
   if (options.outFile) {
     mkdirSync(dirname(options.outFile), { recursive: true });
     writeFileSync(options.outFile, `${JSON.stringify(report)}\n`);
   }
   return report;
 }
-
 function normalizeMode(value: string): BenchmarkMode {
   if (value === 'hybrid' || value === 'fts' || value === 'vector') return value;
   throw new Error('mode must be one of: hybrid, fts, vector');
 }
-
 function recallMetric(topK: number): RecallMetricLabel {
   guardTopK(topK, Number.MAX_SAFE_INTEGER);
   return `Recall@${topK}`;
 }
-
 function parseCase(raw: unknown, index: number): BenchmarkCase {
   const row = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
   const query = stringField(row.query) || stringField(row.question);
@@ -172,16 +165,13 @@ function parseCase(raw: unknown, index: number): BenchmarkCase {
     expectedAnswer: stringField(row.answer ?? row.expected_answer),
   };
 }
-
 function stringField(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
-
 function stringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.map(stringField).filter(Boolean);
 }
-
 function toHit(value: unknown): SearchHit | null {
   if (!value || typeof value !== 'object') return null;
   const row = value as Record<string, unknown>;
@@ -194,26 +184,20 @@ function toHit(value: unknown): SearchHit | null {
   }
   return hit;
 }
-
 function keysForHit(hit: SearchHit): string[] {
   return [hit.id, hit.source_file, hit.sourceFile].filter((key): key is string => Boolean(key));
 }
-
 function roundMetric(value: number): number {
   return Number(value.toFixed(6));
 }
-
 function stackFor(mode: BenchmarkMode, model: string, stage: RerankStage): string[] {
   const base = mode === 'hybrid' && model === 'multi' ? ['bge-m3', 'nomic', 'qwen3', 'FTS5'] : [model, mode];
   return stage.enabled ? [...base, 'bge-reranker-v2-m3'] : base;
 }
-
 function readGitSha(): string {
   const proc = Bun.spawnSync(['git', 'rev-parse', 'HEAD']);
   return proc.success ? new TextDecoder().decode(proc.stdout).trim() : 'unknown';
 }
-
-
 if (import.meta.main) {
   try {
     const { runCli } = await import('./honest-recall-cli.ts');
