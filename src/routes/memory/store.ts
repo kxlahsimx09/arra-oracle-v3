@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, like, or, sql, type SQL } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, like, lt, or, sql, type SQL } from 'drizzle-orm';
 import type { BunSQLiteDatabase } from 'drizzle-orm/bun-sqlite';
 import { db as defaultDb, oracleMemories } from '../../db/index.ts';
 import { currentTenantId, tenantIdForWrite } from '../../middleware/tenant.ts';
@@ -12,6 +12,7 @@ export type MemoryInput = {
   source?: string;
   validFrom?: string | number;
   validTo?: string | number | null;
+  validUntil?: string | number;
 };
 
 export type MemoryRecord = MemoryInput & {
@@ -23,13 +24,18 @@ export type MemoryRecord = MemoryInput & {
   lastAccessedAt?: string;
   validFrom?: string;
   validTo?: string;
+  validUntil?: string;
+  supersededAt?: string;
+  supersededReason?: string;
 };
 
 type OracleDb = BunSQLiteDatabase<typeof schema>;
 type MemoryRow = typeof oracleMemories.$inferSelect;
 
+export type MemoryDecayOptions = { enabled?: boolean; now?: () => number };
+
 export class MemoryStore {
-  constructor(private readonly database?: OracleDb) {}
+  constructor(private readonly database?: OracleDb, private readonly decay: MemoryDecayOptions = {}) {}
 
   private get db(): OracleDb {
     return this.database ?? defaultDb;
@@ -40,7 +46,7 @@ export class MemoryStore {
     if (!content) throw new Error('memory content is required');
     const now = Date.now();
     const validFrom = parseValidTime(input.validFrom);
-    const validTo = parseValidTime(input.validTo);
+    const validTo = parseValidTime(input.validTo ?? input.validUntil);
     if (validFrom && validTo && validTo <= validFrom) throw new Error('valid_to must be after valid_from');
     const row = this.db.insert(oracleMemories).values({
       id: `mem_${now.toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
@@ -58,9 +64,10 @@ export class MemoryStore {
   }
 
   recall(query = '', limit = 10, asOf?: string | number): MemoryRecord[] {
+    this.supersedeExpired();
     const normalized = query.trim();
     const safeLimit = parseMemoryLimit(limit);
-    const where = combineWhere(tenantWhere(), searchWhere(normalized), asOfWhere(parseValidTime(asOf)));
+    const where = combineWhere(tenantWhere(), isNull(oracleMemories.supersededAt), searchWhere(normalized), asOfWhere(parseValidTime(asOf)));
     const selected = this.db.select().from(oracleMemories);
     const rows = where
       ? selected.where(where).orderBy(desc(oracleMemories.createdAt)).limit(safeLimit).all()
@@ -70,10 +77,25 @@ export class MemoryStore {
 
   getByIds(ids: string[], asOf?: string | number): MemoryRecord[] {
     if (!ids.length) return [];
-    const where = combineWhere(inArray(oracleMemories.id, ids), tenantWhere(), asOfWhere(parseValidTime(asOf)));
+    this.supersedeExpired();
+    const where = combineWhere(inArray(oracleMemories.id, ids), tenantWhere(), isNull(oracleMemories.supersededAt), asOfWhere(parseValidTime(asOf)));
     const rows = this.db.select().from(oracleMemories).where(where).all();
     const byId = new Map(rows.map((row) => [row.id, memoryFromRow(row)]));
     return ids.map((id) => byId.get(id)).filter((row): row is MemoryRecord => Boolean(row));
+  }
+
+  supersedeExpired(reason = 'memory TTL expired'): number {
+    if (!this.decay.enabled) return 0;
+    const now = this.now();
+    const result = this.db.update(oracleMemories)
+      .set({ supersededAt: now, supersededReason: reason })
+      .where(combineWhere(tenantWhere(), isNull(oracleMemories.supersededAt), lt(oracleMemories.validTo, now)))
+      .run() as { changes?: number } | void;
+    return result?.changes ?? 0;
+  }
+
+  private now(): number {
+    return this.decay.now?.() ?? Date.now();
   }
 
 }
@@ -133,9 +155,15 @@ function memoryFromRow(row: MemoryRow): MemoryRecord {
     source: row.source ?? undefined,
     validFrom: row.validFrom ? new Date(row.validFrom).toISOString() : undefined,
     validTo: row.validTo ? new Date(row.validTo).toISOString() : undefined,
+    validUntil: row.validTo ? new Date(row.validTo).toISOString() : undefined,
+    supersededAt: row.supersededAt ? new Date(row.supersededAt).toISOString() : undefined,
+    supersededReason: row.supersededReason ?? undefined,
     createdAt: new Date(row.createdAt).toISOString(),
     updatedAt: new Date(row.updatedAt).toISOString(),
   };
 }
 
-export const memoryStore = new MemoryStore();
+export const memoryStore = new MemoryStore(undefined, {
+  enabled: process.env.MEMORY_TTL_AUTOSUPERSEDE === '1'
+    || process.env.MEMORY_TTL_AUTOSUPERSEDE === 'true',
+});

@@ -7,6 +7,7 @@ export const SaveMemoryBody = t.Object({
   source: t.Optional(t.String()),
   validFrom: t.Optional(t.Union([t.String(), t.Number()])),
   validTo: t.Optional(t.Union([t.String(), t.Number(), t.Null()])),
+  validUntil: t.Optional(t.Union([t.String(), t.Number()])),
 });
 
 export const MemoryCloseoutBody = t.Object({

@@ -59,7 +59,7 @@ function memoryDocument(memory: MemoryRecord): VectorDocument {
       createdAt: memory.createdAt,
       updatedAt: memory.updatedAt,
       validFrom: memory.validFrom ?? '',
-      validTo: memory.validTo ?? '',
+      validTo: memory.validTo ?? memory.validUntil ?? '',
     },
   };
 }

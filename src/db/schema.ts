@@ -47,6 +47,7 @@ export const oracleMemories = sqliteTable('oracle_memories', {
   source: text('source'),
   validFrom: integer('valid_from'),
   validTo: integer('valid_to'),
+  supersededAt: integer('superseded_at'), supersededReason: text('superseded_reason'),
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),
 }, (table) => [
