@@ -36,8 +36,9 @@ test('rankMemories combines vector score, confidence, heat, and valid-time recen
   });
 
   expect(ranked.map((item) => item.id)).toEqual(['current-relevant', 'stale-hot']);
-  expect(ranked[0].ranking.strategy).toBe('valid_time_confidence_heat_match');
+  expect(ranked[0].ranking.strategy).toBe('valid_time_confidence_heat_entity_match');
   expect(ranked[0].ranking.components).toMatchObject({ match: 0.92 });
+  expect(ranked[0].ranking.components.entity).toBe(0);
   expect(ranked[1].ranking.components.heat).toBeGreaterThan(0.8);
 });
 

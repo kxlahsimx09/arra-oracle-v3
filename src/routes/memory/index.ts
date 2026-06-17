@@ -89,7 +89,13 @@ export function createMemoryRoutes(
         const records = store.getByIds(hits.map((hit) => hit.memoryId), { asOf: query.asOf });
         const merged = mergeHits(hits, records);
         const scores = new Map(hits.map((hit) => [hit.memoryId, hit.score]));
-        const results = rankMemories(merged, { mode: 'semantic', asOf: query.asOf, score: (memory) => scores.get(memory.id) }).slice(0, limit);
+        const entityScores = new Map(hits.map((hit) => [hit.memoryId, entityScoreFromHit(hit)]));
+        const results = rankMemories(merged, {
+          mode: 'semantic',
+          asOf: query.asOf,
+          score: (memory) => scores.get(memory.id),
+          entityScore: (memory) => entityScores.get(memory.id),
+        }).slice(0, limit);
         return { success: true, query: query.q, asOf: isoAsOf(query.asOf), total: results.length, confidence: MEMORY_CONFIDENCE_STRATEGY, results };
       } catch (error) {
         const message = error instanceof Error ? error.message : 'memory vector search failed';
@@ -130,6 +136,15 @@ function mergeHits(hits: MemoryVectorHit[], records: MemoryRecord[]) {
 function hitTenant(hit: MemoryVectorHit): string | undefined {
   const value = hit.metadata.tenant_id ?? hit.metadata.tenantId ?? hit.metadata.tenant;
   return typeof value === 'string' ? value : undefined;
+}
+
+function entityScoreFromHit(hit: MemoryVectorHit): number | undefined {
+  const value = hit.metadata.entityScore
+    ?? hit.metadata.entity_score
+    ?? hit.metadata.entityMatchScore
+    ?? hit.metadata.entity_match_score;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(0, Math.min(1, parsed)) : undefined;
 }
 
 function memoryForHit(hit: MemoryVectorHit, record?: MemoryRecord): MemoryRecord {

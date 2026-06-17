@@ -5,8 +5,8 @@ export type RankedMemory<T extends MemoryRecord = MemoryRecord> = T & {
   confidence: MemoryConfidence;
   ranking: {
     score: number;
-    components: { match: number; confidence: number; heat: number; validTime: number };
-    strategy: 'valid_time_confidence_heat_match';
+    components: { match: number; confidence: number; heat: number; validTime: number; entity: number };
+    strategy: 'valid_time_confidence_heat_entity_match';
   };
 };
 
@@ -15,6 +15,7 @@ export type RankMemoryOptions = {
   asOf?: string | number;
   now?: Date;
   score?: (memory: MemoryRecord) => number | undefined;
+  entityScore?: (memory: MemoryRecord) => number | undefined;
 };
 
 export function rankMemories<T extends MemoryRecord>(
@@ -28,14 +29,15 @@ export function rankMemories<T extends MemoryRecord>(
     const confidence = memoryConfidence(memory, { mode: options.mode ?? 'keyword', semanticScore: match, now });
     const heat = heatScore(memory, now);
     const validTime = validTimeScore(memory, asOf);
-    const score = round((match * 0.45) + (confidence.score * 0.25) + (heat * 0.2) + (validTime * 0.1));
+    const entity = clamp(options.entityScore?.(memory) ?? entitySignal(memory));
+    const score = round((match * 0.38) + (confidence.score * 0.22) + (heat * 0.18) + (validTime * 0.1) + (entity * 0.12));
     return {
       ...memory,
       confidence,
       ranking: {
         score,
-        components: { match: round(match), confidence: confidence.score, heat: round(heat), validTime: round(validTime) },
-        strategy: 'valid_time_confidence_heat_match',
+        components: { match: round(match), confidence: confidence.score, heat: round(heat), validTime: round(validTime), entity: round(entity) },
+        strategy: 'valid_time_confidence_heat_entity_match',
       },
       __rankIndex: index,
     } as RankedMemory<T> & { __rankIndex: number };
@@ -64,6 +66,13 @@ function validTimeScore(memory: MemoryRecord, asOf: number): number {
   const recency = 0.5 ** (ageDays / 365);
   const bounded = to === undefined ? 0 : 0.1;
   return clamp(0.75 + bounded + (recency * 0.15));
+}
+
+function entitySignal(memory: MemoryRecord): number {
+  const value = (memory as Record<string, unknown>).entityScore
+    ?? (memory as Record<string, unknown>).entityMatchScore
+    ?? (memory as Record<string, unknown>).entity_match_score;
+  return safeNumber(value);
 }
 
 function parseTime(value: string | number | undefined): number | undefined {
