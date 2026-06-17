@@ -1,21 +1,24 @@
 import fs from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
-import { eq } from 'drizzle-orm';
+import type { Database } from 'bun:sqlite';
 import { createDatabase } from '../db/index.ts';
-import { oracleDocuments } from '../db/schema.ts';
 import { detectProject } from '../server/project-detect.ts';
 import type { OracleDocument } from '../types.ts';
-import { extractConcepts, mergeConceptsWithTags } from './concepts.ts';
+import { deriveConceptsFromPath, extractConcepts, mergeConceptsWithTags } from './concepts.ts';
 import { chunkDocumentForIndexing } from './chunk-text.ts';
 import { storeDocuments } from './storage.ts';
 
 const DEFAULT_EXTENSIONS = new Set(['.md', '.mdx', '.txt']);
 const SKIP_DIRS = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.turbo']);
+const MAX_MINE_FILE_BYTES = 2 * 1024 * 1024;
+const BINARY_SAMPLE_BYTES = 4096;
 
 export interface MineOptions { dir: string; dbPath?: string; dryRun?: boolean }
 export interface MineResult { scanned: number; stored: number; skipped: number; project: string; root: string }
 export interface MineWatchOptions extends MineOptions { signal?: AbortSignal; debounceMs?: number }
+
+interface ExistingMineRow { id: string; updatedAt: number }
 
 export function stableMineDocId(root: string, filePath: string): string {
   const rel = relativeSource(root, filePath);
@@ -54,23 +57,27 @@ export async function mineFolder(options: MineOptions): Promise<MineResult> {
     const docs: OracleDocument[] = [];
     let skipped = 0;
     for (const file of files) {
-      const content = fs.readFileSync(file, 'utf8').trim();
-      if (!content) { skipped++; continue; }
-      const id = stableMineDocId(root, file);
+      const source = relativeSource(root, file);
+      const existing = existingMineRows(sqlite, source);
+      const content = readMineContent(file);
+      if (!content) {
+        skipped++;
+        if (!options.dryRun) deleteStaleMineRows(sqlite, existing, new Set());
+        continue;
+      }
       const updatedAt = contentVersion(content);
-      const nextDocs = chunkDocumentForIndexing(toMineDocument(root, file, content, id, updatedAt, project));
-      const unchanged = nextDocs.every((doc) => {
-        const existing = db.select({ updatedAt: oracleDocuments.updatedAt })
-          .from(oracleDocuments).where(eq(oracleDocuments.id, doc.id)).get();
-        return existing?.updatedAt === updatedAt;
-      });
-      if (unchanged) { skipped++; continue; }
-      docs.push(...nextDocs);
+      const nextDocs = chunkDocumentForIndexing(toMineDocument(root, file, content, updatedAt, project));
+      const keepIds = new Set(nextDocs.map((doc) => doc.id));
+      if (!options.dryRun) deleteStaleMineRows(sqlite, existing, keepIds);
+      const existingVersions = new Map(existing.map((row) => [row.id, row.updatedAt]));
+      const changedDocs = nextDocs.filter((doc) => existingVersions.get(doc.id) !== updatedAt);
+      if (changedDocs.length === 0) skipped++;
+      docs.push(...changedDocs);
     }
     if (!options.dryRun && docs.length > 0) {
       await storeDocuments(sqlite, db, null, project, docs, { createdBy: 'mine' });
     }
-    return { scanned: files.length, stored: options.dryRun ? docs.length : docs.length, skipped, project, root };
+    return { scanned: files.length, stored: docs.length, skipped, project, root };
   } finally {
     storage.close();
   }
@@ -118,13 +125,61 @@ function collectMineDirs(root: string): string[] {
   return dirs;
 }
 
-function toMineDocument(root: string, file: string, content: string, id: string, version: number, project: string): OracleDocument {
+function readMineContent(file: string): string | null {
+  const stat = fs.statSync(file);
+  if (stat.size === 0 || stat.size > MAX_MINE_FILE_BYTES) return null;
+  const buffer = fs.readFileSync(file);
+  if (isLikelyBinary(buffer)) return null;
+  const content = buffer.toString('utf8').trim();
+  return content || null;
+}
+
+function isLikelyBinary(buffer: Buffer): boolean {
+  const sample = buffer.subarray(0, Math.min(buffer.length, BINARY_SAMPLE_BYTES));
+  if (sample.length === 0) return false;
+  let control = 0;
+  for (const byte of sample) {
+    if (byte === 0) return true;
+    if (byte < 7 || (byte > 13 && byte < 32)) control++;
+  }
+  return control / sample.length > 0.3;
+}
+
+function existingMineRows(sqlite: Database, source: string): ExistingMineRow[] {
+  return sqlite.prepare(`
+    SELECT id, updated_at AS updatedAt
+    FROM oracle_documents
+    WHERE source_file = ? AND created_by = 'mine'
+  `).all(source) as ExistingMineRow[];
+}
+
+function deleteStaleMineRows(sqlite: Database, rows: ExistingMineRow[], keep: Set<string>): void {
+  const stale = rows.filter((row) => !keep.has(row.id));
+  if (stale.length === 0) return;
+  const deleteDoc = sqlite.prepare(`DELETE FROM oracle_documents WHERE id = ? AND created_by = 'mine'`);
+  const deleteFts = sqlite.prepare(`DELETE FROM oracle_fts WHERE id = ?`);
+  sqlite.exec('BEGIN');
+  try {
+    for (const row of stale) {
+      deleteDoc.run(row.id);
+      deleteFts.run(row.id);
+    }
+    sqlite.exec('COMMIT');
+  } catch (error) {
+    sqlite.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+function toMineDocument(root: string, file: string, content: string, version: number, project: string): OracleDocument {
   const source = relativeSource(root, file);
   const title = path.basename(file, path.extname(file));
-  const folders = path.dirname(source).split('/').filter(part => part && part !== '.');
-  const concepts = mergeConceptsWithTags(extractConcepts(title, content), [project, ...folders]);
+  const concepts = mergeConceptsWithTags(
+    extractConcepts(title, content),
+    [project, ...deriveConceptsFromPath(source)],
+  );
   return {
-    id, type: 'learning', source_file: source, content,
+    id: stableMineDocId(root, file), type: 'learning', source_file: source, content,
     concepts, created_at: fs.statSync(file).birthtimeMs || version,
     updated_at: version, project,
   };
