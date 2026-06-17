@@ -15,7 +15,7 @@ export function guideToolResponse(version: string): ToolResponse {
     content: [{
       type: 'text',
       text: `ORACLE WORKFLOW GUIDE (v${version})\n\n` +
-        `1. SEARCH & DISCOVER\n   oracle_search(query) → keyword/vector search\n` +
+        `1. SEARCH & DISCOVER\n   oracle_search(query, retrieval="compact-summary") → token-light keyword/vector search\n` +
         `   oracle_read(file/id) → full document\n   oracle_list() → browse all\n` +
         `   oracle_concepts() → topic coverage\n\n` +
         `2. LEARN & REMEMBER\n   oracle_learn(pattern) → add a learning\n` +

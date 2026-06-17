@@ -5,6 +5,7 @@
 import { Elysia } from 'elysia';
 import { sqlite } from '../../db/index.ts';
 import { filterResultsAsOf, parseAsOf } from '../../search/bitemporal.ts';
+import { compactSearchResults, parseSearchRetrievalMode } from '../../search/compact-summary.ts';
 import { attachSupersedeStatus } from '../../search/supersede-status.ts';
 import { handleSearch } from '../../server/handlers.ts';
 import { SearchQuery } from './model.ts';
@@ -38,6 +39,11 @@ export const searchEndpoint = new Elysia().get(
       set.status = 400;
       return { error: 'Invalid search mode. Expected one of: hybrid, fts, vector' };
     }
+    const retrieval = parseSearchRetrievalMode(query.retrieval);
+    if (!retrieval.ok) {
+      set.status = 400;
+      return { error: retrieval.error };
+    }
     const asOf = parseAsOf(query.asOf);
     if (!asOf.ok) {
       set.status = 400;
@@ -64,7 +70,12 @@ export const searchEndpoint = new Elysia().get(
         result.total = result.results.length;
       }
       attachSupersedeStatus(sqlite, result.results as unknown as Array<Record<string, unknown>>);
-      return { ...result, query: sanitizedQ, ...(asOf.value ? { asOf: new Date(asOf.value).toISOString() } : {}) };
+      const compact = retrieval.mode === 'compact-summary'
+        ? compactSearchResults(result.results as unknown as Array<Record<string, unknown>>, sanitizedQ)
+        : null;
+      if (compact) result.results = compact.results as unknown as typeof result.results;
+      const metadata = compact ? { metadata: { ...('metadata' in result ? result.metadata as object : {}), retrieval: compact.metadata } } : {};
+      return { ...result, ...metadata, query: sanitizedQ, ...(asOf.value ? { asOf: new Date(asOf.value).toISOString() } : {}) };
     } catch {
       set.status = 400;
       return { results: [], total: 0, query: sanitizedQ, error: 'Search failed' };

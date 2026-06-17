@@ -41,6 +41,7 @@ const searchQuery = [
   { arg: 'limit', param: 'limit' },
   { arg: 'offset', param: 'offset' },
   { arg: 'mode', param: 'mode' },
+  { arg: 'retrieval', param: 'retrieval' },
   { arg: 'project', param: 'project' },
   { arg: 'cwd', param: 'cwd' },
   { arg: 'model', param: 'model' },

@@ -30,6 +30,12 @@ export const searchToolDef = {
         description: 'Search mode: hybrid (default), fts (keywords only), vector (semantic only)',
         default: 'hybrid',
       },
+      retrieval: {
+        type: 'string',
+        enum: ['full', 'compact-summary'],
+        description: 'Result payload size: full returns normal result content, compact-summary returns query-aware distilled snippets for token economy',
+        default: 'full',
+      },
       project: {
         type: 'string',
         description: 'Filter by project (e.g., "github.com/owner/repo"). Returns project + universal results.',

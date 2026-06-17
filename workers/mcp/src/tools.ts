@@ -99,6 +99,7 @@ function schemaNode(arg: string, z: ZodLike): unknown {
   if (ARRAY_ARGS.has(arg)) return z.union([z.array(z.any()), z.string()]);
   if (arg === 'type') return z.enum(['principle', 'pattern', 'learning', 'retro', 'all']);
   if (arg === 'mode') return z.enum(['hybrid', 'fts', 'vector']);
+  if (arg === 'retrieval') return z.enum(['full', 'compact-summary']);
   if (arg === 'model') return z.enum(['nomic', 'qwen3', 'bge-m3']);
   return z.any();
 }

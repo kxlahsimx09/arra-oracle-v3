@@ -8,10 +8,12 @@ const stamp = `${Date.now()}${Math.random().toString(16).slice(2)}`;
 const tenantId = `tenant-edge-${stamp}`;
 const docId = `search-edge-${stamp}`;
 const conceptDocId = `search-concepts-${stamp}`;
+const compactDocId = `search-compact-${stamp}`;
 const supersededDocId = `search-superseded-${stamp}`;
 const successorDocId = `search-successor-${stamp}`;
 const term = `edgeterm${stamp}`;
 const conceptTerm = `conceptterm${stamp}`;
+const compactTerm = `compactterm${stamp}`;
 const supersedeTerm = `supersedeterm${stamp}`;
 const supersededAt = Date.now() - 5000;
 
@@ -59,6 +61,22 @@ beforeAll(async () => {
   }).run();
   dbModule.sqlite.prepare('INSERT INTO oracle_fts (id, content, concepts) VALUES (?, ?, ?)')
     .run(conceptDocId, `document with ${conceptTerm}`, 'edge');
+  dbModule.db.insert(dbModule.oracleDocuments).values({
+    id: compactDocId,
+    tenantId,
+    type: 'learning',
+    sourceFile: 'ψ/shared/search-compact.md',
+    concepts: JSON.stringify(['compact']),
+    createdAt: now,
+    updatedAt: now,
+    indexedAt: now,
+    project: 'edge',
+    createdBy: 'search-edge-test',
+  }).run();
+  dbModule.sqlite.prepare('INSERT INTO oracle_fts (id, content, concepts) VALUES (?, ?, ?)')
+    .run(compactDocId, `background filler `.repeat(20) +
+      `${compactTerm} compact-summary retrieval keeps a short evidence snippet. ` +
+      `unrelated tail `.repeat(20), 'compact');
   dbModule.db.insert(dbModule.oracleDocuments).values([{
     id: supersededDocId,
     tenantId,
@@ -132,6 +150,26 @@ describe('search route edge cases', () => {
     expect(body.results).toEqual([expect.objectContaining({ id: conceptDocId, concepts: [] })]);
   });
 
+  test('GET /api/search supports compact-summary retrieval payloads', async () => {
+    const res = await request(`/api/search?q=${compactTerm}&mode=fts&retrieval=compact-summary`);
+    const body = await res.json() as { results: Array<Record<string, any>>; metadata: Record<string, any> };
+
+    expect(res.status).toBe(200);
+    expect(body.results[0]).toMatchObject({ id: compactDocId, compact: true });
+    expect(body.results[0].content).toContain(compactTerm);
+    expect(body.results[0].content.length).toBeLessThanOrEqual(240);
+    expect(body.metadata.retrieval.mode).toBe('compact-summary');
+    expect(body.metadata.retrieval.savedContentChars).toBeGreaterThan(0);
+  });
+
+  test('GET /api/search rejects unknown retrieval modes', async () => {
+    const res = await request(`/api/search?q=${term}&retrieval=tiny`);
+    const body = await res.json() as { error: string };
+
+    expect(res.status).toBe(400);
+    expect(body.error).toContain('Invalid retrieval mode');
+  });
+
   test('GET /api/search surfaces supersede status inline with results', async () => {
     const res = await request(`/api/search?q=${supersedeTerm}&mode=fts`);
     const body = await res.json() as { results: Array<Record<string, unknown>>; total: number };
@@ -153,7 +191,7 @@ describe('search route edge cases', () => {
     expect(res.status).toBe(200);
     expect(body.limit).toBe(10);
     expect(body.offset).toBe(0);
-    expect(body.total).toBe(4);
+    expect(body.total).toBe(5);
     expect(body.results.map((item) => item.id)).toEqual(expect.arrayContaining([docId, conceptDocId]));
   });
 });

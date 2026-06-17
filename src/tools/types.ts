@@ -35,6 +35,7 @@ export interface OracleSearchInput {
   limit?: number;
   offset?: number;
   mode?: 'hybrid' | 'fts' | 'vector';
+  retrieval?: 'full' | 'compact-summary';
   project?: string;
   cwd?: string;
   model?: 'nomic' | 'qwen3' | 'bge-m3';
