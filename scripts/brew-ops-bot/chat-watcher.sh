@@ -82,6 +82,14 @@ IDLE_ALERTED_TS_STATE=$STATE_DIR/idle-alerted-ts.$SAFE
 IDLE_ALERT_THRESHOLD=${IDLE_ALERT_THRESHOLD:-10}
 IDLE_REALERT_COOLDOWN=${IDLE_REALERT_COOLDOWN:-21600}  # 6h default
 
+# L2 liveness state board + edge gate (pane-classify.sh). LAST_STATE persists the
+# previously-classified state so api_error / crashed alert once per spell, not
+# every poll. TEAM_STATUS is the per-teammate board file the orchestrator can
+# read (glob team-status.*.json) instead of capture-pane-polling each pane.
+LAST_STATE_STATE=$STATE_DIR/last-state.$SAFE
+TEAM_STATUS_FILE=$STATE_DIR/team-status.$SAFE.json
+: > "$LAST_STATE_STATE"
+
 # Single-owner lock per resolved JSONL path. Two chats whose panes share a cwd
 # (e.g. `maw wake` placed a second oracle into an existing oracle's worktree)
 # resolve to the SAME JSONL and would otherwise both relay every assistant turn
@@ -151,6 +159,11 @@ menu_remote_kbd() {
 SCRIPT_DIR_WATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./gist.sh
 . "$SCRIPT_DIR_WATCHER/gist.sh"
+# L2 teammate-liveness classifier: pure classify_pane_state + pane/pid probes +
+# team_status_write. Detects api_error / crashed / idle_done that the old
+# esc-to-interrupt heuristic conflated into "done".
+# shellcheck source=./pane-classify.sh
+. "$SCRIPT_DIR_WATCHER/pane-classify.sh"
 
 # Reverse-lookup alias for a chat_id (role/slug → alias name)
 chat_alias_label() {
@@ -261,6 +274,24 @@ resolve_owner_pane() {
   [ "$owt" = "$spf" ] && return 1        # path didn't contain /ψ/ — bail
   tmux list-panes -a -F '#{pane_id} #{pane_current_path}' 2>/dev/null \
     | awk -v w="$owt" '$2==w {print $1; exit}'
+}
+
+# notify_owner <msg> — deliver a one-line alert to the owning orchestrator the
+# same way the idle path does: send-keys into its live pane (it reads that), else
+# Telegram fallback so an alert is never silently dropped. Used by the L2
+# liveness path for api_error / crashed transitions.
+notify_owner() {
+  local msg="$1" owner_pane
+  owner_pane=$(resolve_owner_pane)
+  if [ -n "$owner_pane" ]; then
+    tmux send-keys -t "$owner_pane" -l "$msg" 2>/dev/null
+    sleep 0.4
+    tmux send-keys -t "$owner_pane" Enter 2>/dev/null
+    log "owner-alert → pane $owner_pane: ${msg:0:60}"
+  else
+    send_tg "$(printf '%s' "$msg" | html_escape)"
+    log "owner-alert → telegram fallback: ${msg:0:60}"
+  fi
 }
 
 # Resolve the pane's current cwd → claude's projects dir for this worktree.
@@ -547,25 +578,54 @@ while true; do
     last_line_count=$cur_count
     last_change_ts=$(date +%s)
     idle_notified=0
+    # Work resumed → re-arm the L2 edge gate so a fresh api_error/crashed spell
+    # alerts again (state is re-classified on the next quiet cycle anyway).
+    echo working > "$LAST_STATE_STATE"
     # persist position so a bot restart doesn't lose unread turns
     echo "${current_jsonl}|${last_line_count}" > "$LINE_STATE_FILE"
-  elif [ "$idle_notified" = "0" ] && \
-       [ $(( $(date +%s) - last_change_ts )) -ge "$IDLE_PROMPT_SECONDS" ]; then
-    # JSONL quiet — match only `❯ N.` (numbered menu) on visible pane.
-    # Bare `❯ ` is claude's text-input prefix → false-positive while streaming.
+  elif [ $(( $(date +%s) - last_change_ts )) -ge "$IDLE_PROMPT_SECONDS" ]; then
+    # JSONL has been quiet — classify the teammate's LIVE state (pane-classify.sh)
+    # so a finished / API-errored / crashed teammate is detected and routed, not
+    # silently read as "done" off a single esc-to-interrupt bit (L2). The pane is
+    # ground truth here: in agent-teams the JSONL↔screen mapping is unreliable.
     pane_visible=$(tmux capture-pane -t "$PANE" -p 2>/dev/null)
-    if printf '%s' "$pane_visible" | grep -qE '^[[:space:]]*❯ [0-9]+\.'; then
-      # A TUI selection menu is up. Push the live screen + a remote-control
-      # keyboard (⬆️⬇️ ✅ 📤 ❌). The user drives the pane from chat; bot.sh's
-      # nav: handler sends each key, re-captures, and edits this message so the
-      # cursor/checkboxes update live. Works for single- AND multi-select
-      # (checkbox + Submit) menus — the on-screen pane is the ground truth.
-      menu_snap=$(printf '%s' "$pane_visible" | grep -vE '^[[:space:]]*$' | tail -22 | html_escape)
-      send_tg "🎮 <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> เมนู TUI — คุมด้วยปุ่มล่าง (✅ เลือก/ติ๊ก, 📤 ไป Submit):
+    pid_alive=1; pane_claude_alive "$PANE" || pid_alive=0
+    state=$(classify_pane_state "$pane_visible" "$pid_alive")
+    prev_state=$(cat "$LAST_STATE_STATE" 2>/dev/null || echo)
+    case "$state" in
+      menu)
+        # A `❯ N.` TUI selection menu is up (classify_pane_state required the
+        # numbered form, so bare `❯ ` text-input can't false-positive). Push once
+        # per spell: the live screen + a remote-control keyboard (⬆️⬇️ ✅ 📤 ❌).
+        # The user drives the pane from chat; bot.sh's nav: handler sends each
+        # key, re-captures, and edits this message so the cursor/checkboxes
+        # update live. Works for single- AND multi-select menus.
+        if [ "$idle_notified" = "0" ]; then
+          menu_snap=$(printf '%s' "$pane_visible" | grep -vE '^[[:space:]]*$' | tail -22 | html_escape)
+          send_tg "🎮 <b>${CHAT_ID}$(chat_alias_label "$CHAT_ID")</b> เมนู TUI — คุมด้วยปุ่มล่าง (✅ เลือก/ติ๊ก, 📤 ไป Submit):
 <pre>${menu_snap}</pre>" false "$(menu_remote_kbd)"
-      idle_notified=1
-      log "TUI menu detected — pushed remote-control keyboard"
-    fi
+          idle_notified=1
+          log "TUI menu detected — pushed remote-control keyboard"
+        fi ;;
+      api_error|crashed)
+        # NEW (L2): a distinct terminal fault the old heuristic read as "done".
+        # Edge-trigger ONE owner alert per spell — re-armed when work resumes
+        # (the active-JSONL branch resets LAST_STATE to `working`).
+        if [ "$state" != "$prev_state" ]; then
+          slug=${CHAT_ID#*/}
+          if [ "$state" = "api_error" ]; then
+            notify_owner "⚠️ teammate [${CHAT_ID}] hit an API error and is parked at the prompt — NOT done. Resume it / check account quota; its work is likely committed-but-unpushed (don't redo). (auto-detected by chat-watcher; nothing closed)"
+          else
+            notify_owner "💀 teammate [${CHAT_ID}] process is GONE (crashed/exited) — pane no longer runs claude. Salvage unpushed work + respawn if needed; clear stale state with team-dispatch-finish.sh --campaign ${slug}. (auto-detected)"
+          fi
+          log "L2 state transition ${prev_state:-?}→${state} — owner alerted"
+        fi ;;
+    esac
+    # Per-teammate status board (orchestrator reads team-status.*.json instead of
+    # capture-pane-polling) + edge state. Refreshed each quiet cycle so a stale
+    # ts also signals a dead watcher.
+    team_status_write "$TEAM_STATUS_FILE" "$CHAT_ID" "$state" "$(cat "$IDLE_COUNT_STATE" 2>/dev/null || echo 0)"
+    echo "$state" > "$LAST_STATE_STATE"
   fi
 
   sleep "$POLL_INTERVAL"
