@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -129,4 +130,80 @@ describe('honest recall benchmark harness', () => {
       await server.stop(true);
     }
   });
+
+  test('runs deterministic FTS Recall@10 against a seeded in-memory DB', async () => {
+    const sqlite = new Database(':memory:');
+    try {
+      seedFtsCorpus(sqlite);
+      const report = await runHonestRecallBenchmark({
+        cases: seededCases(),
+        corpus: { label: 'seeded-fts-memory', size: 12 },
+        topK: 10,
+        mode: 'fts',
+        model: 'sqlite-fts5',
+        searcher: createSqliteFtsSearcher(sqlite),
+        gitSha: 'test-sha',
+        now: '2026-06-17T00:00:00.000Z',
+      });
+
+      const recall = report.metrics[0];
+      expect(recall).toMatchObject({ metric: 'Recall@10', top_k: 10 });
+      expect(recall.metric_family).toBe('Recall@k');
+      expect('value' in recall && typeof recall.value === 'number').toBe(true);
+      if ('value' in recall && typeof recall.value === 'number') expect(recall.value).toBeGreaterThanOrEqual(0.7);
+      expect(report.provenance).toMatchObject({ mode: 'fts', model: 'sqlite-fts5', top_k: 10 });
+      expect(report.cases.every((row) => row.retrieved_ids.length <= 10)).toBe(true);
+    } finally {
+      sqlite.close();
+    }
+  });
 });
+
+function seedFtsCorpus(sqlite: Database): void {
+  sqlite.exec('CREATE VIRTUAL TABLE docs USING fts5(id UNINDEXED, content)');
+  const insert = sqlite.prepare('INSERT INTO docs (id, content) VALUES (?, ?)');
+  for (const [id, content] of seededDocs()) insert.run(id, content);
+}
+
+function createSqliteFtsSearcher(sqlite: Database): Searcher {
+  return async ({ query, topK }) => sqlite.prepare(`
+    SELECT id FROM docs WHERE docs MATCH ? ORDER BY rank LIMIT ?
+  `).all(toFtsQuery(query), topK) as Array<{ id: string }>;
+}
+
+function toFtsQuery(query: string): string {
+  const tokens = query.match(/[\p{L}\p{N}_]+/gu)?.slice(0, 8) ?? [];
+  return [...new Set(tokens)].map((token) => `"${token.replace(/"/g, '""')}"`).join(' OR ');
+}
+
+function seededDocs(): Array<[string, string]> {
+  return [
+    ['doc-cli', 'Install the Arra Oracle CLI with Bun, run setup, then open the local dashboard.'],
+    ['doc-backup', 'Before database migrations take a backup snapshot and verify restore logs.'],
+    ['doc-fts', 'SQLite FTS5 provides full text search with token matching and rank ordering.'],
+    ['doc-vector', 'Vector search uses embeddings for semantic nearest neighbor retrieval.'],
+    ['doc-tenant', 'Tenant isolation scopes every database query by tenant id to prevent leakage.'],
+    ['doc-drift', 'Drizzle drift recovery recreates missing indexes after db push skips them.'],
+    ['doc-supersede', 'Supersede chain integrity prevents replacement cycles in memory records.'],
+    ['doc-concepts', 'Concept extraction derives project names from folder paths and keywords.'],
+    ['doc-a11y', 'Accessibility checks include keyboard focus, landmarks, headings, and contrast.'],
+    ['doc-federation', 'OracleNet federation exchanges peer health and manifests between nodes.'],
+    ['doc-schedule', 'Scheduled jobs store cron expressions, retry metadata, and next run times.'],
+    ['doc-plugin', 'Canvas plugins declare manifests, commands, entrypoints, and validation rules.'],
+  ];
+}
+
+function seededCases() {
+  return parseDatasetText([
+    { id: 'q-cli', query: 'install cli bun setup dashboard', expected_ids: ['doc-cli'] },
+    { id: 'q-backup', query: 'backup snapshot migrations restore logs', expected_ids: ['doc-backup'] },
+    { id: 'q-fts', query: 'sqlite fts5 token matching rank', expected_ids: ['doc-fts'] },
+    { id: 'q-vector', query: 'embeddings semantic nearest neighbor', expected_ids: ['doc-vector'] },
+    { id: 'q-tenant', query: 'tenant id query scope leakage', expected_ids: ['doc-tenant'] },
+    { id: 'q-drift', query: 'drizzle drift missing indexes db push', expected_ids: ['doc-drift'] },
+    { id: 'q-supersede', query: 'supersede replacement cycles memory records', expected_ids: ['doc-supersede'] },
+    { id: 'q-concepts', query: 'derive project folder keywords', expected_ids: ['doc-concepts'] },
+    { id: 'q-a11y', query: 'keyboard focus landmarks contrast', expected_ids: ['doc-a11y'] },
+    { id: 'q-plugin', query: 'canvas plugin manifests commands validation', expected_ids: ['doc-plugin'] },
+  ].map((row) => JSON.stringify(row)).join('\n'));
+}
