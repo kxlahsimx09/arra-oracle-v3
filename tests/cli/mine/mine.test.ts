@@ -55,6 +55,30 @@ describe('arra mine folder ingest', () => {
     expect(JSON.parse(row?.concepts ?? '[]')).toContain('ops');
   });
 
+  test('stores long notes as deterministic paragraph chunks', async () => {
+    const root = tmp();
+    const dbPath = path.join(root, 'oracle.db');
+    const notes = path.join(root, 'notes');
+    fs.mkdirSync(path.join(notes, 'ops'), { recursive: true });
+    const notePath = path.join(notes, 'ops', 'long.md');
+    const para = (label: string, char: string) => `${label} ${char.repeat(330)}`;
+    fs.writeFileSync(notePath, [para('alpha', 'a'), '', para('beta', 'b'), '', para('gamma', 'c')].join('\n'));
+
+    const first = await mineFolder({ dir: notes, dbPath });
+    const second = await mineFolder({ dir: notes, dbPath });
+
+    expect(first).toMatchObject({ scanned: 1, stored: 2, skipped: 0 });
+    expect(second).toMatchObject({ scanned: 1, stored: 0, skipped: 1 });
+
+    const id = stableMineDocId(notes, notePath);
+    const { db, storage } = createDatabase(dbPath);
+    const rows = db.select().from(oracleDocuments).orderBy(oracleDocuments.id).all();
+    storage.close();
+
+    expect(rows.map((row) => row.id)).toEqual([`${id}__chunk_0`, `${id}__chunk_1`]);
+    expect(rows.every((row) => row.createdBy === 'mine')).toBe(true);
+  });
+
   test('watch re-ingests changed files after the initial run', async () => {
     const root = tmp();
     const dbPath = path.join(root, 'oracle.db');

@@ -9,6 +9,7 @@ import type { OracleDocument } from '../types.ts';
 import { deriveConceptsFromPath, mergeConceptsWithTags } from './concepts.ts';
 import { inferProjectFromPath } from './discovery.ts';
 import { parseLearningFile } from './parser.ts';
+import { chunkDocumentsForIndexing } from './chunk-text.ts';
 import { replaceDocumentPointers } from '../search/pointer-index.ts';
 
 export const PSI_LEARN_REL = path.join('ψ', 'learn');
@@ -82,6 +83,7 @@ export const readPsiLearnDocuments = readLearningDocuments;
 
 export function storeSqliteDocuments(db: Database, documents: OracleDocument[]): string[] {
   if (documents.length === 0) return [];
+  const storedDocuments = chunkDocumentsForIndexing(documents);
   const now = Date.now();
   const upsertDoc = db.prepare(`
     INSERT INTO oracle_documents
@@ -103,7 +105,7 @@ export function storeSqliteDocuments(db: Database, documents: OracleDocument[]):
 
   db.exec('BEGIN');
   try {
-    for (const doc of documents) {
+    for (const doc of storedDocuments) {
       upsertDoc.run(
         doc.id,
         doc.type,
@@ -128,5 +130,5 @@ export function storeSqliteDocuments(db: Database, documents: OracleDocument[]):
     db.exec('ROLLBACK');
     throw error;
   }
-  return documents.map((doc) => doc.id);
+  return storedDocuments.map((doc) => doc.id);
 }

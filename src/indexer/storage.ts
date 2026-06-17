@@ -8,6 +8,7 @@ import * as schema from '../db/schema.ts';
 import { oracleDocuments } from '../db/schema.ts';
 import { tenantIdForWrite } from '../middleware/tenant.ts';
 import { replaceEntityLinks } from '../search/entity-ranking.ts';
+import { chunkDocumentsForIndexing } from './chunk-text.ts';
 import { replaceDocumentPointers } from '../search/pointer-index.ts';
 import type { VectorStoreAdapter } from '../vector/types.ts';
 import type { OracleDocument } from '../types.ts';
@@ -26,6 +27,7 @@ export async function storeDocuments(
 ): Promise<void> {
   const now = Date.now();
   const tenantId = opts.tenantId ?? tenantIdForWrite();
+  const storedDocuments = chunkDocumentsForIndexing(documents);
 
   // Prepare FTS statements. FTS5 virtual tables have no UNIQUE constraint on
   // the id column (it's UNINDEXED), so INSERT OR REPLACE doesn't dedupe —
@@ -46,7 +48,7 @@ export async function storeDocuments(
   // Wrap SQLite inserts in a transaction for performance + atomicity
   sqlite.exec('BEGIN');
   try {
-    for (const doc of documents) {
+    for (const doc of storedDocuments) {
       // SQLite metadata - use doc.project if available, fall back to repo project
       const docProject = (doc.project || project)?.toLowerCase();
 
@@ -111,7 +113,10 @@ export async function storeDocuments(
         type: doc.type,
         tenant_id: tenantId,
         source_file: doc.source_file,
-        concepts: doc.concepts.join(',')
+        concepts: doc.concepts.join(','),
+        ...(doc.chunk_index !== undefined && { chunk_index: doc.chunk_index }),
+        ...(doc.line_start !== undefined && { line_start: doc.line_start }),
+        ...(doc.line_end !== undefined && { line_end: doc.line_end }),
       });
     }
     sqlite.exec('COMMIT');

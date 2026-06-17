@@ -7,6 +7,7 @@ import { oracleDocuments } from '../db/schema.ts';
 import { detectProject } from '../server/project-detect.ts';
 import type { OracleDocument } from '../types.ts';
 import { extractConcepts, mergeConceptsWithTags } from './concepts.ts';
+import { chunkDocumentForIndexing } from './chunk-text.ts';
 import { storeDocuments } from './storage.ts';
 
 const DEFAULT_EXTENSIONS = new Set(['.md', '.mdx', '.txt']);
@@ -57,10 +58,14 @@ export async function mineFolder(options: MineOptions): Promise<MineResult> {
       if (!content) { skipped++; continue; }
       const id = stableMineDocId(root, file);
       const updatedAt = contentVersion(content);
-      const existing = db.select({ updatedAt: oracleDocuments.updatedAt })
-        .from(oracleDocuments).where(eq(oracleDocuments.id, id)).get();
-      if (existing?.updatedAt === updatedAt) { skipped++; continue; }
-      docs.push(toMineDocument(root, file, content, id, updatedAt, project));
+      const nextDocs = chunkDocumentForIndexing(toMineDocument(root, file, content, id, updatedAt, project));
+      const unchanged = nextDocs.every((doc) => {
+        const existing = db.select({ updatedAt: oracleDocuments.updatedAt })
+          .from(oracleDocuments).where(eq(oracleDocuments.id, doc.id)).get();
+        return existing?.updatedAt === updatedAt;
+      });
+      if (unchanged) { skipped++; continue; }
+      docs.push(...nextDocs);
     }
     if (!options.dryRun && docs.length > 0) {
       await storeDocuments(sqlite, db, null, project, docs, { createdBy: 'mine' });
