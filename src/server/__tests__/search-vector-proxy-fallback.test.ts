@@ -7,18 +7,14 @@ const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'arra-search-vector-proxy-
 const dataDir = path.join(tmpRoot, 'data');
 const dbPath = path.join(dataDir, 'oracle.db');
 
-const remote = Bun.serve({
-  port: 0,
-  fetch(request) {
-    const url = new URL(request.url);
-    if (url.pathname === '/api/search') return Response.json({ error: 'remote vector down' }, { status: 503 });
-    if (url.pathname === '/api/vector/health') return Response.json({ status: 'down', engines: [], checked_at: new Date().toISOString() });
-    return Response.json({ error: 'not found' }, { status: 404 });
-  },
-});
-
 function runFallbackInFreshProcess() {
   const script = `
+    globalThis.fetch = async (input) => {
+      const url = new URL(typeof input === 'string' ? input : input.url);
+      if (url.pathname === '/api/search') return Response.json({ error: 'remote vector down' }, { status: 503 });
+      if (url.pathname === '/api/vector/health') return Response.json({ status: 'down', engines: [], checked_at: new Date().toISOString() });
+      return Response.json({ error: 'unexpected proxy call' }, { status: 404 });
+    };
     const { handleLearn, handleSearch } = await import('./src/server/handlers.ts');
     handleLearn('cloudproxy1378 local fts ground truth survives remote vector outage', 'test', ['cloudproxy1378']);
     const result = await handleSearch('cloudproxy1378', 'all', 5, 0, 'hybrid');
@@ -32,7 +28,7 @@ function runFallbackInFreshProcess() {
       ORACLE_DATA_DIR: dataDir,
       ORACLE_DB_PATH: dbPath,
       ORACLE_REPO_ROOT: tmpRoot,
-      VECTOR_URL: `http://127.0.0.1:${remote.port}`,
+      VECTOR_URL: 'http://127.0.0.1:9',
     },
     stdout: 'pipe',
     stderr: 'pipe',
@@ -61,6 +57,5 @@ describe('handleSearch cloud vector proxy fallback', () => {
 });
 
 afterAll(() => {
-  remote.stop(true);
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });

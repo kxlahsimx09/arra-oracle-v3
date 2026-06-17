@@ -100,8 +100,12 @@ const createdMarkdownFiles = new Set<string>();
 
 function markdownPathCandidates(relativePath: string): string[] {
   const dataRoot = process.env.ORACLE_DATA_DIR || path.join(os.homedir(), '.arra-oracle-v2');
-  return [SHARED_REPO_ROOT, process.cwd(), dataRoot]
-    .map((root) => path.join(root, relativePath));
+  const tmpRoots = fs.readdirSync(os.tmpdir(), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith('arra-'))
+    .map((entry) => path.join(os.tmpdir(), entry.name));
+  const roots = [SHARED_REPO_ROOT, ORIGINAL_REPO_ROOT, process.cwd(), dataRoot, ...tmpRoots]
+    .filter((root): root is string => Boolean(root));
+  return Array.from(new Set(roots)).map((root) => path.join(root, relativePath));
 }
 
 function rememberMarkdown(relativePath: string): void {

@@ -7,34 +7,30 @@ const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'arra-search-vector-proxy-
 const dataDir = path.join(tmpRoot, 'data');
 const dbPath = path.join(dataDir, 'oracle.db');
 
-const fakeVector = Bun.serve({
-  port: 0,
-  fetch(request) {
-    const url = new URL(request.url);
-    if (url.pathname !== '/api/search') return Response.json({ error: 'not found' }, { status: 404 });
-    return Response.json({
-      results: [{
-        id: 'remote-vector-1',
-        type: 'learning',
-        content: 'Remote vector result',
-        source_file: 'vault/remote.md',
-        concepts: [],
-        source: 'vector',
-        score: 0.91,
-      }],
-      total: 42,
-      offset: 0,
-      limit: 1,
-      mode: 'vector',
-      vectorAvailable: true,
-    });
-  },
-});
-
 function runSearchInFreshProcess() {
   const script = `
     const warnMessages = [];
     console.warn = (...args) => warnMessages.push(args.map(String).join(' '));
+    globalThis.fetch = async (input) => {
+      const url = new URL(typeof input === 'string' ? input : input.url);
+      if (url.pathname !== '/api/search') return Response.json({ error: 'unexpected proxy call' }, { status: 404 });
+      return Response.json({
+        results: [{
+          id: 'remote-vector-1',
+          type: 'learning',
+          content: 'Remote vector result',
+          source_file: 'vault/remote.md',
+          concepts: [],
+          source: 'vector',
+          score: 0.91,
+        }],
+        total: 42,
+        offset: 0,
+        limit: 1,
+        mode: 'vector',
+        vectorAvailable: true,
+      });
+    };
     const { handleSearch } = await import('./src/server/handlers.ts');
     const result = await handleSearch('oracle', 'all', 1, 0, 'vector');
     console.log('RESULT_JSON:' + JSON.stringify({ result, warnMessages }));
@@ -47,7 +43,7 @@ function runSearchInFreshProcess() {
       ORACLE_DATA_DIR: dataDir,
       ORACLE_DB_PATH: dbPath,
       ORACLE_REPO_ROOT: tmpRoot,
-      VECTOR_URL: `http://127.0.0.1:${fakeVector.port}`,
+      VECTOR_URL: 'http://127.0.0.1:9',
     },
     stdout: 'pipe',
     stderr: 'pipe',
@@ -76,6 +72,5 @@ describe('handleSearch VECTOR_URL proxy totals', () => {
 });
 
 afterAll(() => {
-  fakeVector.stop(true);
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
