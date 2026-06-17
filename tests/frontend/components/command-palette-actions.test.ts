@@ -11,6 +11,7 @@ describe('commandPaletteActions', () => {
       ['status', '/status'],
       ['storage', '/storage'],
       ['vector', '/vector'],
+      ['memory', '/memory'],
     ]));
   });
 
@@ -23,6 +24,7 @@ describe('commandPaletteActions', () => {
   test('filters commands by labels and descriptions', () => {
     const commands = commandPaletteActions(() => {});
     expect(filterCommandPaletteActions(commands, 'mcp').map((command) => command.id)).toEqual(['mcp']);
+    expect(filterCommandPaletteActions(commands, 'heat-score').map((command) => command.id)).toEqual(['memory']);
     expect(filterCommandPaletteActions(commands, 'runtime').map((command) => command.id)).toEqual(['plugins', 'settings']);
     expect(filterCommandPaletteActions(commands, 'nope')).toEqual([]);
   });

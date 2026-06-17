@@ -6,6 +6,7 @@ import { MetricsPage } from './pages/MetricsPage';
 import { McpToolDetailPage } from './pages/McpToolDetailPage';
 import { ExportApp } from './pages/ExportApp';
 import { LearnPage } from './pages/LearnPage';
+import { MemoryPage } from './pages/MemoryPage';
 import { MenuPage } from './pages/MenuPage';
 import { PluginsPage } from './pages/PluginsPage';
 import { CanvasAliasPage } from './pages/CanvasAliasPage';
@@ -36,6 +37,7 @@ export const frontendRoutes = [
   '/search',
   '/export',
   '/learn',
+  '/memory',
   '/vector',
   '/vector/search',
   '/vector/documents',
@@ -96,6 +98,7 @@ export function DashboardRoutes({
       <Route path="/search" element={<SearchPage />} />
       <Route path="/export" element={<ExportApp />} />
       <Route path="/learn" element={<LearnPage />} />
+      <Route path="/memory" element={<MemoryPage />} />
       <Route path="/menu" element={menuPage} />
       <Route path="/vector" element={<VectorPage />} />
       <Route path="/vector/search" element={<VectorSearchPage />} />

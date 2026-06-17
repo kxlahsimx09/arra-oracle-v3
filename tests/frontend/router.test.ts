@@ -42,6 +42,7 @@ describe('frontend router', () => {
       '/search',
       '/export',
       '/learn',
+      '/memory',
       '/vector',
       '/vector/search',
       '/vector/documents',
@@ -70,6 +71,7 @@ describe('frontend router', () => {
     expect(htmlAt('/search')).toContain('Full-text menu search');
     expect(htmlAt('/export')).toContain('Export app');
     expect(htmlAt('/learn')).toContain('Learn entries');
+    expect(htmlAt('/memory')).toContain('Memory health');
     expect(htmlAt('/vector')).toContain('Vector dashboard');
     expect(htmlAt('/vector/search')).toContain('Vector search preview');
     expect(htmlAt('/vector/documents')).toContain('Vector documents');

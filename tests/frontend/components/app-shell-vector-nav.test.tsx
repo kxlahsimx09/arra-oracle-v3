@@ -20,6 +20,7 @@ describe('AppShell Vector navigation', () => {
       expect(html).toContain('aria-label="Index Manager: Backfill vectors and watch jobs"');
       expect(html).toContain('aria-label="Vector Search: Semantic preview by collection"');
       expect(html).toContain('aria-label="Export App: Legacy v2 JSON/Markdown backups"');
+      expect(html).toContain('aria-label="Memory Health: Heat-score and recency visualization"');
       expect(html).toContain('aria-label="Export: Download vector collections"');
     } finally {
       restore();

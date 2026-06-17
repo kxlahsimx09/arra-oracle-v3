@@ -71,6 +71,12 @@ export function exportPagePath(): string {
   return '/export';
 }
 
+export function memoryPath(query = ''): string {
+  const q = query.trim();
+  if (!q) return '/memory';
+  return `/memory?${new URLSearchParams({ q })}`;
+}
+
 export function vectorDocumentsPath(): string {
   return '/vector/documents';
 }
