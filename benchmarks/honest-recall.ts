@@ -155,9 +155,9 @@ function recallMetric(topK: number): RecallMetricLabel {
 function parseCase(raw: unknown, index: number): BenchmarkCase {
   const row = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
   const query = stringField(row.query) || stringField(row.question);
-  const expectedIds = stringArray(row.expectedIds ?? row.expected_ids ?? row.expected_doc_ids ?? row.relevant_ids ?? row.target_ids ?? row.evidence_ids);
+  const rawExpected = row.expectedIds ?? row.expected_ids ?? row.expected_doc_ids ?? row.relevant_ids ?? row.target_ids ?? row.evidence_ids, expectedIds = stringArray(rawExpected);
   if (!query) throw new Error(`case ${index + 1} missing query/question`);
-  if (!expectedIds.length) throw new Error(`case ${index + 1} missing expected/relevant ids`);
+  if (!Array.isArray(rawExpected)) throw new Error(`case ${index + 1} missing expected/relevant ids`);
   return {
     id: stringField(row.id) || `case-${index + 1}`,
     query,

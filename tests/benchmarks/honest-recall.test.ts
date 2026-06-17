@@ -79,7 +79,12 @@ describe('honest recall benchmark harness', () => {
     expect(lines.length).toBeGreaterThanOrEqual(30);
     expect(lines.length).toBeLessThanOrEqual(50);
     expect(cases).toHaveLength(lines.length);
-    expect(cases.every((item) => item.id && item.query && item.expectedIds.length > 0)).toBe(true);
+    expect(cases.every((item) => item.id && item.query && Array.isArray(item.expectedIds))).toBe(true);
+    expect(cases.filter((item) => item.id.includes('multi-word'))).toHaveLength(4);
+    expect(cases.filter((item) => item.id.includes('no-match'))).toHaveLength(4);
+    expect(cases.filter((item) => item.expectedIds.length === 0).map((item) => item.id).sort())
+      .toEqual(['edge/no-match-personal', 'edge/no-match-recipes', 'edge/no-match-sports', 'edge/no-match-weather']);
+    expect(() => parseDatasetText('{"id":"bad","query":"missing expected ids"}')).toThrow('missing expected/relevant ids');
     expect(text).not.toContain('\u03c8/');
     expect(text).not.toContain('/Users/');
   });

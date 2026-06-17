@@ -38,3 +38,11 @@
 {"id":"plugins/toggle","query":"enable and disable MCP tool plugins through the CLI manifest commands","expectedIds":["pub-plugin-toggle"]}
 {"id":"benchmarks/guard-topk","query":"honest recall benchmark refuses to report when top k covers the whole corpus","expectedIds":["pub-benchmark-guard-topk"]}
 {"id":"benchmarks/answer-accuracy","query":"recall harness reports Answer Accuracy as not measured separate from Recall at k","expectedIds":["pub-benchmark-metric-separation"]}
+{"id":"edge/multi-word-install-path","query":"global bun install path verification after alpha prerelease install","expectedIds":["pub-quickstart-install"]}
+{"id":"edge/multi-word-cross-origin","query":"hosted Studio browser fetch to localhost backend CORS allow origin credentials","expectedIds":["pub-cors-hosted-studio"]}
+{"id":"edge/multi-word-health-timeout","query":"never silent health hero startup grace escape timing retry counter","expectedIds":["pub-simple-health-timing"]}
+{"id":"edge/multi-word-memory-metrics","query":"heat distribution confidence histogram supersede chain valid time coverage metrics","expectedIds":["pub-memory-stats"]}
+{"id":"edge/no-match-weather","query":"tomorrow rainfall forecast for a city not present in Oracle memory","expectedIds":[]}
+{"id":"edge/no-match-recipes","query":"sourdough starter hydration schedule and baking temperature","expectedIds":[]}
+{"id":"edge/no-match-sports","query":"latest baseball playoff score and inning summary","expectedIds":[]}
+{"id":"edge/no-match-personal","query":"private diary entry location from a user home directory","expectedIds":[]}
