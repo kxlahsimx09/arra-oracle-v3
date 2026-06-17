@@ -25,6 +25,7 @@ export type MemoryRecord = MemoryInput & {
   validFrom?: string;
   validTo?: string;
   validUntil?: string;
+  supersededBy?: string;
   supersededAt?: string;
   supersededReason?: string;
 };
@@ -156,6 +157,7 @@ function memoryFromRow(row: MemoryRow): MemoryRecord {
     validFrom: row.validFrom ? new Date(row.validFrom).toISOString() : undefined,
     validTo: row.validTo ? new Date(row.validTo).toISOString() : undefined,
     validUntil: row.validTo ? new Date(row.validTo).toISOString() : undefined,
+    supersededBy: row.supersededBy ?? undefined,
     supersededAt: row.supersededAt ? new Date(row.supersededAt).toISOString() : undefined,
     supersededReason: row.supersededReason ?? undefined,
     createdAt: new Date(row.createdAt).toISOString(),
