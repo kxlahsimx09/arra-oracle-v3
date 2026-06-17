@@ -26,8 +26,13 @@
 CLAUDE_WORKING_RE=${CLAUDE_WORKING_RE:-'esc to interrupt'}
 # Numbered TUI menu — same anchor chat-watcher already used for `❯ N.`.
 CLAUDE_MENU_RE=${CLAUDE_MENU_RE:-'^[[:space:]]*❯ [0-9]+\.'}
-# API / usage / transport errors claude surfaces on the pane.
-CLAUDE_ERROR_RE=${CLAUDE_ERROR_RE:-'API Error|overloaded_error|"type":[[:space:]]*"error"|Request timed out|rate.?limit|Internal server error|usage limit|Connection error|API request failed|(^|[^0-9])(529|503|502|500)([^0-9]|$)'}
+# API / usage / transport errors claude surfaces on the pane. Deliberately the
+# claude BANNER forms (case-sensitive `API Error`, the structured error-type
+# tokens `*_error`, full phrases) — NOT bare numbers (`529`/`500`) or lowercase
+# "api error", which match ordinary prose. A session that merely DISCUSSES errors
+# (e.g. a brew-ops dev working on this very feature) must not trip it. Combined
+# with the bottom-region scan in classify_pane_state. (2026-06-17 self-watch FP.)
+CLAUDE_ERROR_RE=${CLAUDE_ERROR_RE:-'API Error|overloaded_error|rate_limit_error|Request timed out|Internal server error|usage limit reached|Connection error|API request failed'}
 # Any marker proving a claude TUI frame is rendered (vs a bare shell prompt).
 CLAUDE_TUI_RE=${CLAUDE_TUI_RE:-'esc to interrupt|\? for shortcuts|❯ |⏵⏵|bypass permissions|/help for|Context (left|low)|auto-accept'}
 
@@ -42,7 +47,13 @@ classify_pane_state() {
   # error outrank the idle/crash fallthrough.
   if printf '%s' "$pane" | grep -qE "$CLAUDE_WORKING_RE"; then echo working;  return; fi
   if printf '%s' "$pane" | grep -qE "$CLAUDE_MENU_RE";    then echo menu;     return; fi
-  if printf '%s' "$pane" | grep -qE "$CLAUDE_ERROR_RE";   then echo api_error; return; fi
+  # api_error: scan ONLY the bottom active region (a real parked error banner sits
+  # just above the input box). Scrollback prose that merely DISCUSSES errors
+  # ("auto-resume 529", "hit an API error") must NOT trip it — the 2026-06-17
+  # self-watch false positive where the watcher read this dev session's own summary.
+  if printf '%s' "$pane" | grep -vE '^[[:space:]]*$' | tail -8 | grep -qE "$CLAUDE_ERROR_RE"; then
+    echo api_error; return
+  fi
   # No claude TUI marker at all → the process exited to the shell.
   if ! printf '%s' "$pane" | grep -qE "$CLAUDE_TUI_RE";   then echo crashed;   return; fi
   # claude TUI up, no work, no error → finished, parked at the prompt.
