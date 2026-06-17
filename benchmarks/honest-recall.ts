@@ -1,5 +1,6 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { rerankStage, searchWithOptionalRerank, type RerankOptions, type RerankStage } from './honest-recall-rerank.ts';
 
 export type MetricName = 'Recall@k' | 'Answer-Accuracy';
 export type BenchmarkMode = 'hybrid' | 'fts' | 'vector';
@@ -7,13 +8,13 @@ type RecallMetricLabel = `Recall@${number}`;
 
 export type BenchmarkCase = { id: string; query: string; expectedIds: string[]; expectedAnswer?: string };
 
-export type SearchHit = { id: string; source_file?: string; sourceFile?: string };
+export type SearchHit = { id: string; source_file?: string; sourceFile?: string; content?: string; text?: string; title?: string };
 export type SearchRequest = { query: string; topK: number; mode: BenchmarkMode; model: string };
 export type Searcher = (request: SearchRequest) => Promise<SearchHit[]>;
 
 type CorpusRef = { label: string; size: number };
 
-type MetricRow =
+export type MetricRow =
   | { metric: 'Recall@k'; metric_family: 'Recall@k'; label: RecallMetricLabel; value: number; hits: number; total_queries: number; top_k: number }
   | { metric: 'Answer-Accuracy'; metric_family: 'Answer-Accuracy'; status: 'not-measured'; reason: string };
 
@@ -29,6 +30,7 @@ export type HonestRecallReport = {
     metric_family: 'Recall@k';
     'git-sha': string;
     stack: string[];
+    rerank?: RerankStage;
   };
   metrics: MetricRow[];
   cases: Array<{
@@ -90,15 +92,19 @@ export async function runHonestRecallBenchmark(options: {
   outFile?: string;
   gitSha?: string;
   now?: string;
+  rerank?: RerankOptions;
 }): Promise<HonestRecallReport> {
   const mode = normalizeMode(options.mode ?? 'hybrid');
   const model = options.model ?? 'multi';
   const recallLabel = recallMetric(options.topK);
   validateBenchmarkInputs(options.cases, options.corpus, options.topK);
+  const stage = rerankStage(options.rerank?.enabled === true);
 
   const cases: HonestRecallReport['cases'] = [];
   for (const item of options.cases) {
-    const hits = (await options.searcher({ query: item.query, topK: options.topK, mode, model })).slice(0, options.topK);
+    const hits = await searchWithOptionalRerank({
+      searcher: options.searcher, query: item.query, topK: options.topK, mode, model, rerank: options.rerank, stage,
+    });
     const expected = new Set(item.expectedIds);
     const matchedIndex = hits.findIndex((hit) => keysForHit(hit).some((key) => expected.has(key)));
     cases.push({
@@ -126,7 +132,8 @@ export async function runHonestRecallBenchmark(options: {
       metric: 'Recall@k',
       metric_family: 'Recall@k',
       'git-sha': options.gitSha ?? readGitSha(),
-      stack: mode === 'hybrid' && model === 'multi' ? ['bge-m3', 'nomic', 'qwen3', 'FTS5'] : [model, mode],
+      stack: stackFor(mode, model, stage),
+      ...(stage.enabled ? { rerank: stage } : {}),
     },
     metrics: [
       { metric: 'Recall@k', metric_family: 'Recall@k', label: recallLabel, value: recall, hits, total_queries: cases.length, top_k: options.topK },
@@ -179,7 +186,13 @@ function toHit(value: unknown): SearchHit | null {
   if (!value || typeof value !== 'object') return null;
   const row = value as Record<string, unknown>;
   const id = stringField(row.id);
-  return id ? { id, source_file: stringField(row.source_file), sourceFile: stringField(row.sourceFile) } : null;
+  if (!id) return null;
+  const hit: SearchHit = { id, sourceFile: stringField(row.sourceFile) };
+  for (const key of ['source_file', 'content', 'text', 'title'] as const) {
+    const value = stringField(row[key]);
+    if (value) hit[key] = value;
+  }
+  return hit;
 }
 
 function keysForHit(hit: SearchHit): string[] {
@@ -190,59 +203,21 @@ function roundMetric(value: number): number {
   return Number(value.toFixed(6));
 }
 
+function stackFor(mode: BenchmarkMode, model: string, stage: RerankStage): string[] {
+  const base = mode === 'hybrid' && model === 'multi' ? ['bge-m3', 'nomic', 'qwen3', 'FTS5'] : [model, mode];
+  return stage.enabled ? [...base, 'bge-reranker-v2-m3'] : base;
+}
+
 function readGitSha(): string {
   const proc = Bun.spawnSync(['git', 'rev-parse', 'HEAD']);
   return proc.success ? new TextDecoder().decode(proc.stdout).trim() : 'unknown';
 }
 
-function parseArgs(args: string[]) {
-  const opts = new Map<string, string>();
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    if (!arg.startsWith('--')) continue;
-    opts.set(arg.slice(2), args[i + 1] ?? '');
-    i += 1;
-  }
-  return {
-    dataset: required(opts, 'dataset'),
-    corpus: opts.get('corpus') || 'oracle-hybrid-kb',
-    corpusSize: Number(opts.get('corpus-size')),
-    topK: Number(opts.get('top-k') ?? 10),
-    mode: normalizeMode(opts.get('mode') ?? 'hybrid'),
-    model: opts.get('model') ?? 'multi',
-    baseUrl: opts.get('base-url') ?? 'http://127.0.0.1:47778',
-    outFile: opts.get('out') ?? 'benchmarks/out/honest-recall.json',
-  };
-}
-
-function required(opts: Map<string, string>, key: string): string {
-  const value = opts.get(key);
-  if (!value) throw new Error(`missing --${key}`);
-  return value;
-}
-
-function printSummary(report: HonestRecallReport): void {
-  const recall = report.metrics.find((row): row is Extract<MetricRow, { metric_family: 'Recall@k' }> => row.metric_family === 'Recall@k');
-  if (!recall) throw new Error('Recall@k metric row missing');
-  console.log(`${recall.label}: ${recall.value} (${recall.hits}/${recall.total_queries})`);
-  console.log('Answer-Accuracy: NOT MEASURED — retrieval-only harness');
-  console.log(`provenance_json: ${report.provenance.mode}/${report.provenance.model} top_k=${report.provenance.top_k}`);
-}
 
 if (import.meta.main) {
   try {
-    const cli = parseArgs(Bun.argv.slice(2));
-    const cases = parseDatasetText(readFileSync(cli.dataset, 'utf8'));
-    const report = await runHonestRecallBenchmark({
-      cases,
-      topK: cli.topK,
-      corpus: { label: cli.corpus, size: cli.corpusSize },
-      mode: cli.mode,
-      model: cli.model,
-      searcher: createHttpSearcher(cli.baseUrl),
-      outFile: cli.outFile,
-    });
-    printSummary(report);
+    const { runCli } = await import('./honest-recall-cli.ts');
+    await runCli(Bun.argv.slice(2));
   } catch (error) {
     console.error(`HONEST BENCHMARK REFUSED: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
