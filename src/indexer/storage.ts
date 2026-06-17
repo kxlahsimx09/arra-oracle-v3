@@ -7,6 +7,7 @@ import { BunSQLiteDatabase } from 'drizzle-orm/bun-sqlite';
 import * as schema from '../db/schema.ts';
 import { oracleDocuments } from '../db/schema.ts';
 import { tenantIdForWrite } from '../middleware/tenant.ts';
+import { replaceEntityLinks } from '../search/entity-ranking.ts';
 import type { VectorStoreAdapter } from '../vector/types.ts';
 import type { OracleDocument } from '../types.ts';
 
@@ -87,6 +88,13 @@ export async function storeDocuments(
         doc.content,
         doc.concepts.join(' ')
       );
+      replaceEntityLinks(sqlite, {
+        documentId: doc.id,
+        tenantId,
+        content: doc.content,
+        concepts: doc.concepts,
+        now,
+      });
 
       // Vector store metadata (must be primitives, not arrays)
       ids.push(doc.id);

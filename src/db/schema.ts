@@ -37,6 +37,17 @@ export const oracleDocuments = sqliteTable('oracle_documents', {
   index('idx_documents_tenant_type_active_updated').on(table.tenantId, table.type, table.supersededAt, table.updatedAt),
   index('idx_documents_tenant_valid_time').on(table.tenantId, table.validTime),
 ]);
+export const oracleEntityLinks = sqliteTable('oracle_entity_links', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').default('default').notNull().references(() => tenants.id),
+  documentId: text('document_id').notNull().references(() => oracleDocuments.id, { onDelete: 'cascade' }),
+  entity: text('entity').notNull(), entityKey: text('entity_key').notNull(),
+  weight: integer('weight').default(1).notNull(),
+  createdAt: integer('created_at').notNull(), updatedAt: integer('updated_at').notNull(),
+}, (table) => [
+  index('idx_entity_links_tenant_key').on(table.tenantId, table.entityKey),
+  index('idx_entity_links_tenant_doc').on(table.tenantId, table.documentId),
+]);
 // Challenge 2 memory system persistence (#1457)
 export const oracleMemories = sqliteTable('oracle_memories', {
   id: text('id').primaryKey(),
@@ -68,19 +79,12 @@ export const indexingStatus = sqliteTable('indexing_status', {
   error: text('error'),
   repoRoot: text('repo_root'),  // Root directory being indexed
 });
-
-// Per-doc per-model index job queue.
-// Foundation for the indexer-CLI / FTS-first / vector-later split — a doc gets
-// FTS5-inserted synchronously, then one row per registered model lands here for
-// the daemon to embed asynchronously. Plug-and-play: adding/removing a model
-// adds/skips queue entries without touching oracle_documents or other models'
-// LanceDB collections. Design: ψ/lab/indexer-cli/DESIGN.md (M1).
 export const indexingJobs = sqliteTable('indexing_jobs', {
-  id: text('id').primaryKey(),                                  // "idx-<ts>-<modelKey>-<rand>"
-  docId: text('doc_id').notNull(),                              // FK to oracle_documents.id
-  modelKey: text('model_key').notNull(),                        // "bge-m3", "qwen3", ...
-  collection: text('collection').notNull(),                     // "oracle_knowledge_bge_m3"
-  status: text('status').default('pending').notNull(),          // pending | claimed | done | error
+  id: text('id').primaryKey(),
+  docId: text('doc_id').notNull(),
+  modelKey: text('model_key').notNull(),
+  collection: text('collection').notNull(),
+  status: text('status').default('pending').notNull(),
   attempts: integer('attempts').default(0).notNull(),
   createdAt: integer('created_at')
     .default(sql`(strftime('%s','now')*1000)`)
@@ -89,7 +93,6 @@ export const indexingJobs = sqliteTable('indexing_jobs', {
   finishedAt: integer('finished_at'),
   error: text('error'),
 });
-
 // Search query logging
 export const searchLog = sqliteTable('search_log', {
   id: integer('id').primaryKey({ autoIncrement: true }),
@@ -156,7 +159,6 @@ export const documentAccess = sqliteTable('document_access', {
   index('idx_access_doc').on(table.documentId),
 ]);
 
-
 export const forumThreads = sqliteTable('forum_threads', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   title: text('title').notNull(),
@@ -176,7 +178,6 @@ export const forumThreads = sqliteTable('forum_threads', {
   index('idx_thread_created').on(table.createdAt),
   index('idx_thread_tenant_status_updated').on(table.tenantId, table.status, table.updatedAt),
 ]);
-
 export const forumMessages = sqliteTable('forum_messages', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   threadId: integer('thread_id').notNull().references(() => forumThreads.id),
@@ -196,7 +197,6 @@ export const forumMessages = sqliteTable('forum_messages', {
 // Note: FTS5 virtual table (oracle_fts) is managed via raw SQL
 // since Drizzle doesn't natively support FTS5
 // Trace Log Tables (discovery tracing with dig points)
-
 export const traceLog = sqliteTable('trace_log', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   traceId: text('trace_id').unique().notNull(),
@@ -245,6 +245,5 @@ export const traceLog = sqliteTable('trace_log', {
   index('idx_trace_next').on(table.nextTraceId),
   index('idx_trace_created').on(table.createdAt),
 ]);
-
 export { exportJobs } from './export-schema.ts';
 export { activityLog, menuItems, schedule, settings, supersedeLog } from './logistics-schema.ts';

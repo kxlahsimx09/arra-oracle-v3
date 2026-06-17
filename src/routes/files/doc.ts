@@ -3,6 +3,7 @@ import { sqlite, db, oracleDocuments } from '../../db/index.ts';
 import { and, eq } from 'drizzle-orm';
 import { docParams } from './model.ts';
 import { currentTenantId, tenantIdForWrite } from '../../middleware/tenant.ts';
+import { replaceEntityLinks } from '../../search/entity-ranking.ts';
 
 // Body schemas for PATCH/POST.
 const PatchDocBody = t.Object({
@@ -112,6 +113,20 @@ export const docRoute = new Elysia()
             .prepare(`INSERT INTO oracle_fts (id, content, concepts) VALUES (?, ?, ?)`)
             .run(params.id, data.content, conceptsArr.join(' '));
         }
+        if (typeof data.content === 'string' || Array.isArray(data.concepts)) {
+          const linkRow = sqlite.prepare(`
+            SELECT d.tenant_id, d.concepts, f.content
+            FROM oracle_documents d LEFT JOIN oracle_fts f ON d.id = f.id
+            WHERE d.id = ? ${filter.clause}
+          `).get(params.id, ...filter.params) as { tenant_id: string; concepts: string; content: string | null } | undefined;
+          replaceEntityLinks(sqlite, {
+            documentId: params.id,
+            tenantId: linkRow?.tenant_id,
+            content: linkRow?.content ?? '',
+            concepts: linkRow?.concepts,
+            now,
+          });
+        }
 
         return { ok: true, id: params.id };
       } catch (e: any) {
@@ -152,9 +167,10 @@ export const docRoute = new Elysia()
           ? Array.from(new Set(data.concepts.filter((c: any) => typeof c === 'string' && c).map((c: string) => c.toLowerCase())))
           : [];
 
+        const tenantId = tenantIdForWrite();
         db.insert(oracleDocuments).values({
           id,
-          tenantId: tenantIdForWrite(),
+          tenantId,
           type: data.type,
           sourceFile: data.source_file ?? `imported/${id}.md`,
           concepts: JSON.stringify(conceptsArr),
@@ -169,6 +185,13 @@ export const docRoute = new Elysia()
         sqlite
           .prepare(`INSERT INTO oracle_fts (id, content, concepts) VALUES (?, ?, ?)`)
           .run(id, data.content, conceptsArr.join(' '));
+        replaceEntityLinks(sqlite, {
+          documentId: id,
+          tenantId,
+          content: data.content,
+          concepts: conceptsArr,
+          now,
+        });
 
         return { ok: true, id };
       } catch (e: any) {

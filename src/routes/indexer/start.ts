@@ -4,6 +4,7 @@ import { createDatabase } from '../../db/index.ts';
 import { setIndexingStatus } from '../../indexer/status.ts';
 import { DB_PATH, REPO_ROOT } from '../../config.ts';
 import { currentTenantId, runWithTenant } from '../../middleware/tenant.ts';
+import { replaceEntityLinks } from '../../search/entity-ranking.ts';
 import { entityCollectionName, entityDocumentsFor } from '../../vector/entities.ts';
 import type { IndexerConfig } from '../../types.ts';
 
@@ -122,6 +123,14 @@ export function createStartRoute(deps: StartRouteDeps = {}) {
 
           await store.addDocuments(docs);
           const entityDocs = docs.flatMap(entityDocumentsFor);
+          for (const doc of docs) {
+            replaceEntityLinks(sqlite, {
+              documentId: doc.id,
+              tenantId: String(doc.metadata.tenant_id ?? ''),
+              content: doc.document,
+              concepts: doc.metadata.concepts,
+            });
+          }
           if (entityDocs.length > 0) await entityStore.addDocuments(entityDocs);
           setIndexingStatus(sqlite, config, true, i + batchRows.length, total);
         }

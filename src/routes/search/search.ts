@@ -4,8 +4,10 @@
 
 import { Elysia } from 'elysia';
 import { sqlite } from '../../db/index.ts';
+import { currentTenantId } from '../../middleware/tenant.ts';
 import { filterResultsAsOf, parseAsOf } from '../../search/bitemporal.ts';
 import { compactSearchResults, parseSearchRetrievalMode } from '../../search/compact-summary.ts';
+import { rerankByEntityLinks } from '../../search/entity-ranking.ts';
 import { attachSupersedeStatus } from '../../search/supersede-status.ts';
 import { handleSearch } from '../../server/handlers.ts';
 import { SearchQuery } from './model.ts';
@@ -69,6 +71,7 @@ export const searchEndpoint = new Elysia().get(
         ) as unknown as typeof result.results;
         result.total = result.results.length;
       }
+      result.results = rerankByEntityLinks(sqlite, result.results, sanitizedQ, currentTenantId());
       attachSupersedeStatus(sqlite, result.results as unknown as Array<Record<string, unknown>>);
       const compact = retrieval.mode === 'compact-summary'
         ? compactSearchResults(result.results as unknown as Array<Record<string, unknown>>, sanitizedQ)

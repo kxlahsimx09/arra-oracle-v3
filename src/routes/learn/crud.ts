@@ -3,8 +3,9 @@ import { and, eq } from 'drizzle-orm';
 import { sqliteTable, text } from 'drizzle-orm/sqlite-core';
 import fs from 'fs';
 import path from 'path';
-import { db, learnLog, oracleDocuments } from '../../db/index.ts';
+import { db, learnLog, oracleDocuments, sqlite } from '../../db/index.ts';
 import { currentTenantId, tenantIdForWrite } from '../../middleware/tenant.ts';
+import { replaceEntityLinks } from '../../search/entity-ranking.ts';
 import { conceptsFrom, learningContent, slugFor } from './content.ts';
 import {
   INVALID_LEARNING_ID,
@@ -143,6 +144,7 @@ export function createLearning(body: LearnCreateBody) {
     createdBy: 'oracle_learn',
   }).run();
   upsertFts(identity.id, content, concepts);
+  replaceEntityLinks(sqlite, { documentId: identity.id, tenantId, content, concepts, now });
   db.insert(learnLog).values({
     documentId: identity.id,
     tenantId,
@@ -180,6 +182,7 @@ function updateLearning(id: string, body: LearnUpdateBody) {
       ...(currentTenantId() ? [eq(oracleDocuments.tenantId, currentTenantId()!)] : [])))
     .returning()
     .get();
+  replaceEntityLinks(sqlite, { documentId: id, tenantId: row.tenantId, content, concepts: nextConcepts, now });
   return { status: 200, body: responseRow(row) };
 }
 function softDeleteLearning(id: string) {
@@ -198,6 +201,7 @@ function softDeleteLearning(id: string) {
     .returning()
     .get();
   db.delete(oracleFts).where(eq(oracleFts.id, id)).run();
+  replaceEntityLinks(sqlite, { documentId: id, tenantId: row.tenantId, content: '', concepts: [], now });
   return { status: 200, body: { id: row.id, deleted: 'soft', supersededAt: row.supersededAt } };
 }
 export function createLearnCrudRoutes() {

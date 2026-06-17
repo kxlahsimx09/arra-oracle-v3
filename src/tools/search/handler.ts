@@ -1,4 +1,6 @@
 import { detectProject } from '../../server/project-detect.ts';
+import { currentTenantId } from '../../middleware/tenant.ts';
+import { rerankByEntityLinks } from '../../search/entity-ranking.ts';
 import { rerankCandidates } from '../../server/reranker.ts';
 import type { SearchResult } from '../../server/types.ts';
 import { compactSearchResults, parseSearchRetrievalMode } from '../../search/compact-summary.ts';
@@ -61,14 +63,15 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
   const ftsResults = mapFtsResults(ftsRawResults);
   const normalizedVectorResults = vecResults.map((result) => ({ ...result, score: 1 - (result.score || 0) }));
   const combinedResults = combineResults(ftsResults, normalizedVectorResults);
+  const entityRankedResults = rerankByEntityLinks(ctx.sqlite, combinedResults, query, currentTenantId());
   const reranked = await rerankCandidates({
     query,
-    candidates: combinedResults.slice(0, 50),
+    candidates: entityRankedResults.slice(0, 50),
     getText: (result) => result.content,
   });
   const finalResults = reranked.reranked
-    ? [...reranked.results, ...combinedResults.slice(50)]
-    : combinedResults;
+    ? [...reranked.results, ...entityRankedResults.slice(50)]
+    : entityRankedResults;
   const totalMatches = finalResults.length;
   let results: Array<Record<string, unknown>> = attachSearchEvidence(finalResults.slice(offset, offset + limit));
   enrichSupersedeFlags(ctx, results);

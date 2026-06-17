@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { entityKey, entityLinksForDocument } from '../../src/search/entity-ranking.ts';
 import { entityCollectionName, entityDocumentsFor, extractEntities } from '../../src/vector/entities.ts';
 
 test('extractEntities combines concept metadata with write-time text entities', () => {
@@ -22,4 +23,24 @@ test('entityDocumentsFor writes a parallel vector payload without graph edges', 
     document: 'Oracle',
     metadata: { source_doc_id: 'doc-1', tenant_id: 'team-a', type: 'entity' },
   });
+});
+
+test('entityLinksForDocument creates deterministic document-entity link rows', () => {
+  const links = entityLinksForDocument({
+    documentId: 'doc-1',
+    tenantId: 'team-a',
+    content: 'Arra Oracle links Cloudflare Workers for ranking only.',
+    concepts: ['Cloudflare Workers'],
+    now: 123,
+  });
+
+  expect(entityKey('Cloudflare Workers')).toBe('cloudflare-workers');
+  expect(links).toContainEqual(expect.objectContaining({
+    id: 'team-a:doc-1:cloudflare-workers',
+    documentId: 'doc-1',
+    tenantId: 'team-a',
+    entity: 'Cloudflare Workers',
+    entityKey: 'cloudflare-workers',
+    createdAt: 123,
+  }));
 });
