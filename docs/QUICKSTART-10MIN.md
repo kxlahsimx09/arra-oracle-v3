@@ -1,61 +1,107 @@
-# 10-minute quickstart verification
+# 10-minute quickstart: Docker → `arra mine` → ask
 
-Live check for #2420: start Oracle, mine a small folder, then search for the
-mined note. This run used the local server path allowed by the issue instead of
-Docker.
+This is the non-dev path for a first local Oracle memory. It starts the HTTP
+server in Docker, runs the bundled `arra` CLI inside that same container, mines a
+notes folder, and asks a cited question. No schema, collection, vector provider,
+embedding provider, local Bun install, or LLM key is required: `arra mine`
+derives project/concepts from the folder and `ask` uses local extractive answers
+here.
 
-## Commands verified
+## 0. Requirements
 
-From a clean checkout:
+- Docker
+- `curl`
+- A folder of Markdown, MDX, or text notes. The examples use `~/notes`.
 
-```bash
-export ORACLE_DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/arra-quickstart-XXXXXX")"
-export ORACLE_DB_PATH="$ORACLE_DATA_DIR/oracle.db"
-export ORACLE_PORT=48942
-export PORT="$ORACLE_PORT"
-export ORACLE_FILE_WATCHER=0
-
-bun bin/arra.ts serve --port "$ORACLE_PORT"
-```
-
-In another shell, mine with the same package bin. In an installed build this is
-`arra-oracle mine`; in this source checkout the same entrypoint is
-`bun bin/arra.ts mine`:
+## 1. Start Arra Oracle
 
 ```bash
-bun bin/arra.ts mine docs/sample-notes --db-path "$ORACLE_DB_PATH"
-curl -s "http://127.0.0.1:$ORACLE_PORT/api/v1/search?q=memory%20onboarding&mode=fts&limit=5"
+export ARRA_PORT="${ARRA_PORT:-47778}"
+export ARRA_URL="http://127.0.0.1:${ARRA_PORT}"
+export ARRA_IMAGE="${ARRA_IMAGE:-ghcr.io/soul-brews-studio/arra-oracle-v3:http}"
+export ARRA_VOLUME="${ARRA_VOLUME:-arra-oracle-data}"
+export ARRA_CONTAINER="${ARRA_CONTAINER:-arra-oracle}"
+export ARRA_NOTES_DIR="${ARRA_NOTES_DIR:-$HOME/notes}"
+
+mkdir -p "$ARRA_NOTES_DIR"
+docker volume create "$ARRA_VOLUME" >/dev/null
+
+docker run --rm -d --name "$ARRA_CONTAINER" \
+  -p "${ARRA_PORT}:47778" \
+  -v "${ARRA_VOLUME}:/data" \
+  -v "${ARRA_NOTES_DIR}:${ARRA_NOTES_DIR}:ro" \
+  "$ARRA_IMAGE"
+
+until curl -sf "${ARRA_URL}/api/health" >/dev/null; do sleep 1; done
+echo "Arra Oracle is ready at ${ARRA_URL}"
 ```
 
-## Actual elapsed run
+If port `47778` is busy, run `export ARRA_PORT=47878` first and repeat the block.
+If your notes live somewhere else, set `ARRA_NOTES_DIR=/path/to/notes` before the
+`docker run` block and mine that path instead.
 
-Verified on 2026-06-17 from branch `origin/alpha` using `rtk`:
+## 2. Add the `arra` helper
 
-| Elapsed | Step | Evidence |
-| ---: | --- | --- |
-| 0.02s | Created isolated data dir | `ORACLE_DATA_DIR=/var/.../arra-quickstart-bin-aIVoDF` |
-| 0.04s | Started local server | `bun bin/arra.ts serve --port 48942`, PID `16156`, port `48942` |
-| 0.61s | Health check passed | `GET /api/health` returned OK |
-| 0.63s | Mined sample folder | `Mined 2 documents from 2 files (0 skipped)` |
-| 0.71s | Searched indexed notes | `GET /api/v1/search?q=memory%20onboarding&mode=fts&limit=5` |
-| 0.76s | Verified result | response included `mine/sample-notes/projects/oracle-memory.md` |
-| 0.78s | Complete | end-to-end under one second on this machine |
+This shell helper runs the bundled CLI inside the already-running container, so
+`arra mine` writes to the same `/data` volume the server is using.
 
-Search response summary:
-
-```json
-{
-  "status": 200,
-  "total": 2,
-  "sources": [
-    "mine/sample-notes/ops/runbook.txt",
-    "mine/sample-notes/projects/oracle-memory.md"
-  ]
+```bash
+arra() {
+  docker exec "$ARRA_CONTAINER" bun dist-cli/index.js "$@"
 }
 ```
 
-## Notes
+## 3. Mine your notes
 
-- No schema, vector-provider, or taxonomy choices were required.
-- Vector indexing was skipped by default-safe FTS mode: `Skipping vector indexing (SQLite-only mode)`.
-- Re-running `arra mine docs/sample-notes` is safe; unchanged files are skipped.
+```bash
+arra mine ~/notes
+```
+
+Re-running is safe: unchanged files are skipped with deterministic IDs. Vector
+indexing can stay off; FTS works immediately in SQLite-only mode.
+
+For a clean demo if you do not have notes yet:
+
+```bash
+cat > ~/notes/arra-demo.md <<'NOTE'
+# Family recipes
+
+The cardamom chai ratio is two crushed pods per mug, simmered for five minutes.
+NOTE
+arra mine ~/notes
+```
+
+## 4. Ask a grounded question
+
+```bash
+curl -sfS "${ARRA_URL}/api/v1/ask" \
+  -H 'content-type: application/json' \
+  -d '{"q":"What is the cardamom chai ratio?","limit":5,"llm":false}'
+```
+
+Expected result: JSON with an `answer`, `citations`, and `sources`. Because the
+request sends `"llm": false`, the answer is extractive and local; no provider key
+or vector service is needed.
+
+## Verified command path
+
+The #2420 path was smoke-tested from a clean data volume with a local image built
+from this checkout:
+
+| Step | Evidence |
+| --- | --- |
+| `docker run` | `/api/health` returned OK on the mapped port. |
+| `arra mine ~/notes` | `Mined 1 document from 1 file (0 skipped)` into project `notes`. |
+| `curl /api/v1/ask` | Response had `"noEvidence": false` and cited `two crushed pods per mug`. |
+
+## Stop or restart later
+
+```bash
+docker stop "${ARRA_CONTAINER:-arra-oracle}"
+```
+
+Restart by re-running the `docker run` block. Your memory remains in the Docker
+volume named by `$ARRA_VOLUME`.
+
+_Tracks the onboarding goal in #2420: Docker first, then `arra mine ~/notes`,
+then ask with zero schema/provider choices._
