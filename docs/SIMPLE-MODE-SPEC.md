@@ -54,6 +54,8 @@ user searches, saves, or reads recovery copy.
 - Flip to Down after repeated failed polls instead of leaving stale green copy.
 - Use degraded states when the backend answers but DB, plugins, or search/vector
   capability is limited.
+- Prefer backend `healthStatus` (`healthy|starting|degraded|down`) and
+  `subsystems.{db,fts,vector,plugin}` when present; fall back to legacy fields.
 
 ## README and recap entry points
 

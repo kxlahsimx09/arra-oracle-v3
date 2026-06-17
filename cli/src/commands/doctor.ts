@@ -22,7 +22,7 @@ export interface DoctorReport {
 }
 
 type DoctorOptions = { env?: NodeJS.ProcessEnv; cwd?: string; fetcher?: typeof fetch; mcpProbe?: McpProbe; timeoutMs?: number };
-type HealthPayload = { healthStatus?: HealthStatusEnum; status?: string; subsystems?: Record<string, HealthSubsystem> };
+type HealthPayload = { healthStatus?: HealthStatusEnum; state?: HealthStatusEnum; status?: string; subsystems?: Record<string, HealthSubsystem> };
 
 function ok(id: string, label: string, detail?: string, data?: unknown): DoctorCheck {
   return { id, label, status: "pass", critical: true, detail, data };
@@ -51,7 +51,7 @@ function subsystemCheck(id: string, label: string, subsystem: HealthSubsystem | 
 }
 
 function healthOverallCheck(health: HealthPayload): DoctorCheck {
-  const status = health.healthStatus ?? normalizeLegacyStatus(health.status);
+  const status = health.healthStatus ?? health.state ?? normalizeLegacyStatus(health.status);
   if (status === "healthy") return ok("backend.status", "overall health", "healthy", health);
   if (status === "degraded") return warn("backend.status", "overall health", "degraded; see subsystem detail", health);
   return fail("backend.status", "overall health", status ?? "unknown", health);
@@ -62,6 +62,10 @@ function normalizeLegacyStatus(status: unknown): HealthStatusEnum | undefined {
   if (status === "degraded") return "degraded";
   if (status === "draining") return "down";
   return undefined;
+}
+
+function pickSubsystem(subsystems: Record<string, HealthSubsystem> | undefined, ...names: string[]) {
+  return names.map(name => subsystems?.[name]).find(Boolean);
 }
 
 export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorReport> {
@@ -104,10 +108,11 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
   }
 
   const subsystems = healthPayload?.subsystems;
-  checks.push(subsystemCheck("db.writable", "DB writable", subsystems?.database, "strict"));
-  checks.push(subsystemCheck("fts.healthy", "FTS healthy", subsystems?.fts, "strict"));
-  checks.push(subsystemCheck("vector.backend", "vector backend", subsystems?.vector, "soft"));
-  checks.push(subsystemCheck("embedder.reachable", "embedder reachable", subsystems?.embedder, "soft"));
+  checks.push(subsystemCheck("db.writable", "DB writable", pickSubsystem(subsystems, "database", "db"), "strict"));
+  checks.push(subsystemCheck("fts.healthy", "FTS healthy", pickSubsystem(subsystems, "fts"), "strict"));
+  checks.push(subsystemCheck("vector.backend", "vector backend", pickSubsystem(subsystems, "vector"), "soft"));
+  checks.push(subsystemCheck("embedder.reachable", "embedder reachable", pickSubsystem(subsystems, "embedder"), "soft"));
+  checks.push(subsystemCheck("plugins.loaded", "plugins loaded", pickSubsystem(subsystems, "plugins", "plugin"), "soft"));
 
   try {
     const mcp = await (options.mcpProbe ?? defaultMcpProbe)({ env, cwd, resolved });

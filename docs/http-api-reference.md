@@ -20,7 +20,7 @@ Protected routes may require API token/session auth; tenant-aware routes honor `
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| GET | `/api/health` | None. | Aggregate `{ status, uptime, version, db, vectorStatus, pluginStatus }` |
+| GET | `/api/health` | None. | Aggregate `{ status, healthStatus, subsystems, uptime, version }` |
 | GET | `/api/stats` | Optional `X-Oracle-Tenant`. | Document, vector, vault, tenant-scoped counts. |
 | GET | `/api/oracles` | Optional tenant header. | Oracle identities/projects summary. |
 | GET | `/api/oracles/profiles` | None. | Code-backed Oracle profile registry. |

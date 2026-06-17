@@ -75,7 +75,18 @@ curl -s "${AUTH[@]}" "$BASE/api/v1/vector/health"
 ```
 
 ```json
-{ "status": "ok", "server": "arra-oracle-v3", "db": "connected", "vectorStatus": "ok", "mcp": { "toolCount": 28 } }
+{
+  "status": "ok",
+  "healthStatus": "healthy",
+  "server": "arra-oracle-v3",
+  "subsystems": {
+    "db": { "status": "healthy" },
+    "fts": { "status": "healthy" },
+    "vector": { "status": "healthy" },
+    "plugin": { "status": "healthy" }
+  },
+  "mcp": { "toolCount": 28 }
+}
 ```
 
 ```json

@@ -11,7 +11,7 @@ import { mcpTools } from '../../tools/mcp-manifest.ts';
 import type { UnifiedPluginStatus } from '../../plugins/unified-loader.ts';
 import { sandboxLabel } from '../../runtime/sandbox-label.ts';
 import { healthRollupStatus } from './rollup.ts';
-import { buildHealthSubsystems, rollupHealthStatus, type EmbeddingProviderProbe } from './subsystems.ts';
+import { buildHealthSubsystems, drainingSubsystems, rollupHealthStatus, type EmbeddingProviderProbe } from './subsystems.ts';
 import pkg from '../../../package.json' with { type: 'json' };
 
 type VectorHealth = Awaited<ReturnType<typeof readVectorBackendHealth>>;
@@ -98,9 +98,12 @@ export function createHealthEndpoint(options: HealthEndpointOptions = {}) {
   return new Elysia().get('/health', async ({ set }) => {
     if (options.isDraining?.()) {
       set.status = 503;
+      const healthStatus = 'down';
       return {
-        status: 'draining', healthStatus: 'down', server: MCP_SERVER_NAME,
+        status: 'draining', healthStatus, state: healthStatus,
+        checked_at: new Date().toISOString(), server: MCP_SERVER_NAME,
         version: pkg.version, sandbox: sandboxLabel(), draining: true,
+        subsystems: drainingSubsystems(),
       };
     }
 
@@ -114,14 +117,16 @@ export function createHealthEndpoint(options: HealthEndpointOptions = {}) {
     const toolCount = mcpTools.length + (options.pluginMcpToolCount ?? 0);
     const vectorRuntime = getVectorRuntimeStatus();
     const serviceUptime = Math.round(uptimeSeconds * 1000) / 1000;
+    const vectorIsAvailable = vectorAvailable(vectorRuntime, vector, vectorServer);
     const subsystems = await buildHealthSubsystems({
       dbStatus, vector, vectorServer, vectorRuntime, pluginStatus, pluginCount,
       toolCount, uptimeSeconds: serviceUptime, embeddingProviders: options.embeddingProviders,
     });
+    const healthStatus = rollupHealthStatus(subsystems);
 
     return {
       status: healthRollupStatus(dbStatus, pluginStatus, vector, vectorServer, vectorRuntime),
-      healthStatus: rollupHealthStatus(subsystems),
+      healthStatus, state: healthStatus, checked_at: new Date().toISOString(),
       server: MCP_SERVER_NAME,
       version: pkg.version,
       port: Number(PORT),
@@ -133,7 +138,7 @@ export function createHealthEndpoint(options: HealthEndpointOptions = {}) {
       dbStatus: dbStatus.status,
       vectorStatus: vector.status,
       ...vectorRuntime,
-      vectorAvailable: vectorAvailable(vectorRuntime, vector, vectorServer),
+      vectorAvailable: vectorIsAvailable,
       pluginStatus,
       mcpToolCount: toolCount,
       pluginCount,

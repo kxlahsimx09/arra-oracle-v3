@@ -52,10 +52,24 @@ describe('simple health state mapper', () => {
       .toBe(HealthState.DegradedFts);
   });
 
+  test('prefers backend healthStatus and subsystem details when present', () => {
+    expect(mapHealthState({
+      msSinceLoad: 10_000,
+      health: { status: 'ok', healthStatus: 'healthy', vectorAvailable: false, subsystems: { vector: { status: 'healthy' }, fts: { status: 'healthy' } } },
+    })).toBe(HealthState.Healthy);
+    expect(mapHealthState({ msSinceLoad: 10_000, health: { status: 'ok', healthStatus: 'starting' } }))
+      .toBe(HealthState.Starting);
+    expect(mapHealthState({ msSinceLoad: 10_000, health: { status: 'ok', healthStatus: 'healthy', subsystems: { database: { status: 'down' } } } }))
+      .toBe(HealthState.DegradedDb);
+    expect(mapHealthState({ msSinceLoad: 10_000, health: { status: 'ok', healthStatus: 'healthy', subsystems: { plugins: { status: 'degraded' } } } }))
+      .toBe(HealthState.DegradedPlugin);
+    expect(mapHealthState({ msSinceLoad: 10_000, health: { status: 'degraded', healthStatus: 'degraded', subsystems: { fts: { status: 'degraded' } } } }))
+      .toBe(HealthState.DegradedFts);
+  });
+
   test('maps explicit down payloads to down', () => {
     expect(mapHealthState({ msSinceLoad: 10_000, health: { status: 'down' } })).toBe(HealthState.Down);
   });
-
 
   test('prefers enriched healthStatus over legacy ok status', () => {
     expect(mapHealthState({ msSinceLoad: 10_000, health: { status: 'ok', healthStatus: 'degraded', dbStatus: 'connected' } }))

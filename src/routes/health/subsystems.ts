@@ -7,6 +7,7 @@ import type { VectorRuntimeStatus } from '../../vector/runtime-status.ts';
 import type { VectorServerHealth } from './vector-server.ts';
 
 type DbStatus = { status: 'connected' } | { status: 'error'; error: string };
+type CanonicalSubsystemName = 'backend' | 'database' | 'fts' | 'vector' | 'embedder' | 'mcp' | 'plugins';
 export type HealthStatusEnum = 'healthy' | 'starting' | 'degraded' | 'down';
 export type EmbeddingProviderDetection = { checkedAt?: string; providers: DetectedEmbeddingProvider[] };
 export type EmbeddingProviderProbe = () => Promise<EmbeddingProviderDetection>;
@@ -20,7 +21,11 @@ export type HealthSubsystem = {
   data?: Record<string, unknown>;
 };
 
-export type HealthSubsystems = Record<'backend' | 'database' | 'fts' | 'vector' | 'embedder' | 'mcp' | 'plugins', HealthSubsystem>;
+type CanonicalHealthSubsystems = Record<CanonicalSubsystemName, HealthSubsystem>;
+export type HealthSubsystems = CanonicalHealthSubsystems & {
+  db: HealthSubsystem;
+  plugin: HealthSubsystem;
+};
 
 function err(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 
@@ -35,7 +40,7 @@ export async function buildHealthSubsystems(input: {
   uptimeSeconds: number;
   embeddingProviders?: EmbeddingProviderProbe;
 }): Promise<HealthSubsystems> {
-  return {
+  return withAliases({
     backend: backendSubsystem(input.uptimeSeconds),
     database: databaseSubsystem(input.dbStatus),
     fts: ftsSubsystem(input.dbStatus),
@@ -43,7 +48,17 @@ export async function buildHealthSubsystems(input: {
     embedder: await embedderSubsystem(input.embeddingProviders),
     mcp: mcpSubsystem(input.toolCount),
     plugins: pluginSubsystem(input.pluginStatus, input.pluginCount),
-  };
+  });
+}
+
+export function drainingSubsystems(): HealthSubsystems {
+  const item = (label: string) => down(label, 'server is draining requests');
+  return withAliases({
+    backend: item('backend reachable'), database: item('database writable'),
+    fts: item('FTS healthy'), vector: item('vector backend'),
+    embedder: item('embedder reachable'), mcp: item('MCP launchable'),
+    plugins: item('plugins loaded'),
+  });
 }
 
 export function rollupHealthStatus(subsystems: HealthSubsystems): HealthStatusEnum {
@@ -52,6 +67,10 @@ export function rollupHealthStatus(subsystems: HealthSubsystems): HealthStatusEn
   if (values.some((item) => item.critical && item.status === 'starting')) return 'starting';
   if (values.some((item) => item.status !== 'healthy')) return 'degraded';
   return 'healthy';
+}
+
+function withAliases(subsystems: CanonicalHealthSubsystems): HealthSubsystems {
+  return { ...subsystems, db: subsystems.database, plugin: subsystems.plugins };
 }
 
 function backendSubsystem(uptimeSeconds: number): HealthSubsystem {
@@ -81,11 +100,12 @@ function ftsSubsystem(dbStatus: DbStatus): HealthSubsystem {
   try {
     const docs = count('oracle_documents');
     const indexed = count('oracle_fts');
+    const missing = Math.max(0, docs - indexed);
     const status = docs > 0 && indexed === 0 ? 'degraded' : 'healthy';
     return {
       status, label: 'FTS healthy', critical: status === 'healthy',
       detail: docs === 0 ? 'FTS5 table ready; no documents yet' : `FTS5 indexed ${indexed}/${docs} documents`,
-      data: { indexed, documents: docs, missing: Math.max(0, docs - indexed) },
+      data: { indexed, documents: docs, missing },
     };
   } catch (error) {
     return down('FTS healthy', `FTS5 check failed: ${err(error)}`);

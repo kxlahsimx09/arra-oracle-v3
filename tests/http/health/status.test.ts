@@ -87,8 +87,16 @@ test('GET /api/health catches dbPing exceptions and keeps response shaped', asyn
 
 
 test('GET /api/health reports healthy enum when every subsystem is available', async () => {
-  const previous = process.env.ORACLE_EMBEDDER;
+  const previous = {
+    embedder: process.env.ORACLE_EMBEDDER,
+    legacy: process.env.ORACLE_EMBEDDING_PROVIDER,
+    backend: process.env.ORACLE_EMBEDDER_BACKEND,
+    type: process.env.EMBEDDER_TYPE,
+  };
   process.env.ORACLE_EMBEDDER = 'ollama';
+  delete process.env.ORACLE_EMBEDDING_PROVIDER;
+  delete process.env.ORACLE_EMBEDDER_BACKEND;
+  delete process.env.EMBEDDER_TYPE;
   try {
     const app = createHealthRoutes({
       pluginCount: 1,
@@ -103,7 +111,14 @@ test('GET /api/health reports healthy enum when every subsystem is available', a
     expect(body.subsystems.embedder).toMatchObject({ status: 'healthy', label: 'embedder reachable' });
     expect(body.subsystems.mcp.status).toBe('healthy');
   } finally {
-    if (previous === undefined) delete process.env.ORACLE_EMBEDDER;
-    else process.env.ORACLE_EMBEDDER = previous;
+    restoreEnv('ORACLE_EMBEDDER', previous.embedder);
+    restoreEnv('ORACLE_EMBEDDING_PROVIDER', previous.legacy);
+    restoreEnv('ORACLE_EMBEDDER_BACKEND', previous.backend);
+    restoreEnv('EMBEDDER_TYPE', previous.type);
   }
 });
+
+function restoreEnv(key: string, value: string | undefined) {
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+}

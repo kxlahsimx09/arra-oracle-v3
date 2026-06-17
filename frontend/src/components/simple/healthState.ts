@@ -11,9 +11,12 @@ export const HEALTH_STARTING_GRACE_MS = 8_000;
 export const HEALTH_STARTING_ESCAPE_MS = 30_000;
 export const HEALTH_DOWN_RETRY_COUNT = 3;
 
+type SimpleSubsystem = { status?: string; ok?: boolean };
+
 export interface SimpleHealthPayload {
   status?: string;
   healthStatus?: string;
+  state?: string;
   db?: string | { status?: string };
   dbStatus?: string;
   oracle?: string;
@@ -21,6 +24,7 @@ export interface SimpleHealthPayload {
   vectorAvailable?: boolean;
   pluginStatus?: string;
   plugins?: { status?: string };
+  subsystems?: Partial<Record<string, SimpleSubsystem>>;
   draining?: boolean;
 }
 
@@ -88,29 +92,42 @@ export function mapHealthState(input: HealthStateInput): HealthState {
     return HealthState.Starting;
   }
 
-  const status = (health.healthStatus ?? health.status)?.toLowerCase();
-  if (health.draining || status === 'starting' || status === 'draining') return HealthState.Starting;
-  if (status === 'down' || status === 'error') return HealthState.Down;
+  const legacyStatus = health.status?.toLowerCase();
+  const status = (health.healthStatus ?? health.state)?.toLowerCase();
+  if (health.draining || status === 'starting' || legacyStatus === 'starting' || legacyStatus === 'draining') return HealthState.Starting;
 
   if (dbIsBad(health)) return HealthState.DegradedDb;
   if (pluginIsBad(health)) return HealthState.DegradedPlugin;
   if (searchIsLimited(health)) return HealthState.DegradedFts;
-  if (status === 'degraded') return HealthState.DegradedFts;
+  if (status === 'degraded' || legacyStatus === 'degraded') return HealthState.DegradedFts;
+  if (status === 'down' || legacyStatus === 'down' || legacyStatus === 'error') return HealthState.Down;
   return HealthState.Healthy;
+}
+
+function subsystemStatus(health: SimpleHealthPayload, ...names: string[]): string | undefined {
+  for (const name of names) {
+    const status = health.subsystems?.[name]?.status;
+    if (status) return status;
+  }
+  return undefined;
 }
 
 function dbIsBad(health: SimpleHealthPayload): boolean {
   const dbStatus = typeof health.db === 'string' ? health.db : health.db?.status;
-  return [health.dbStatus, dbStatus, health.oracle]
+  return [subsystemStatus(health, 'db', 'database'), health.dbStatus, dbStatus, health.oracle]
     .some((value) => ['down', 'error', 'disconnected'].includes(String(value ?? '').toLowerCase()));
 }
 
 function pluginIsBad(health: SimpleHealthPayload): boolean {
-  const value = health.pluginStatus ?? health.plugins?.status;
+  const value = subsystemStatus(health, 'plugin', 'plugins') ?? health.pluginStatus ?? health.plugins?.status;
   return ['degraded', 'down', 'error'].includes(String(value ?? '').toLowerCase());
 }
 
 function searchIsLimited(health: SimpleHealthPayload): boolean {
+  const fts = String(subsystemStatus(health, 'fts') ?? '').toLowerCase();
+  const vectorSubsystem = String(subsystemStatus(health, 'vector') ?? '').toLowerCase();
+  if (['down', 'error', 'degraded'].includes(fts) || ['down', 'error', 'degraded'].includes(vectorSubsystem)) return true;
+  if (health.healthStatus || health.state || health.subsystems) return false;
   const vector = String(health.vectorStatus ?? '').toLowerCase();
   return health.vectorAvailable === false || ['down', 'error', 'degraded'].includes(vector);
 }

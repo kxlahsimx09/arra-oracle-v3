@@ -80,6 +80,8 @@ export interface DashboardSummary {
 }
 
 export type RuntimeStatus = 'ok' | 'down' | 'degraded' | 'draining' | string;
+export type PublicHealthStatus = 'healthy' | 'starting' | 'degraded' | 'down';
+export type HealthSubsystemName = 'backend' | 'database' | 'db' | 'fts' | 'vector' | 'embedder' | 'mcp' | 'plugins' | 'plugin';
 
 export interface VectorHealthResponse {
   status: RuntimeStatus;
@@ -88,21 +90,34 @@ export interface VectorHealthResponse {
   error?: string;
 }
 
+export interface HealthSubsystemDetail {
+  status: PublicHealthStatus;
+  label: string;
+  detail: string;
+  critical: boolean;
+  checkedAt?: string;
+  data?: Record<string, unknown>;
+}
+
 export interface HealthResponse {
   status: RuntimeStatus;
+  healthStatus?: PublicHealthStatus;
+  state?: PublicHealthStatus;
+  checked_at?: string;
   server: string;
   version: string;
   port?: number;
   oracle?: 'connected' | 'degraded';
   uptimeSeconds?: number;
-  dbStatus?: 'ok' | 'down';
+  dbStatus?: 'connected' | 'error';
   vectorStatus?: RuntimeStatus;
   pluginStatus?: 'ok' | 'degraded';
   mcpToolCount?: number;
   pluginCount?: number;
   draining?: boolean;
-  uptime?: { seconds: number };
-  db?: { status: 'ok'; path: string } | { status: 'down'; error: string; path: string };
+  uptime?: number;
+  db?: 'connected' | 'error';
+  dbCheck?: { status: 'connected'; path: string } | { status: 'error'; error: string; path: string };
   vector?: VectorHealthResponse;
   mcp?: { toolCount: number };
   plugins?: {
@@ -110,6 +125,7 @@ export interface HealthResponse {
     status: 'ok' | 'degraded';
     items: Array<{ name: string; status: 'ok' | 'degraded'; error?: string }>;
   };
+  subsystems?: Partial<Record<HealthSubsystemName, HealthSubsystemDetail>>;
 }
 
 export interface MemoryUsageSnapshot {
