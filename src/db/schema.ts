@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { sqliteTable, text, integer, index } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, text, integer, real, index } from 'drizzle-orm/sqlite-core';
 export const tenants = sqliteTable('tenants', {
   id: text('id').primaryKey(),
   name: text('name'),
@@ -59,6 +59,8 @@ export const oracleMemories = sqliteTable('oracle_memories', {
   validFrom: integer('valid_from'),
   validTo: integer('valid_to'),
   supersededBy: text('superseded_by'), supersededAt: integer('superseded_at'), supersededReason: text('superseded_reason'),
+  tier: text('tier').default('warm').notNull(), heatScore: real('heat_score').default(0).notNull(),
+  usageCount: integer('usage_count').default(0).notNull(), lastAccessedAt: integer('last_accessed_at'),
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),
 }, (table) => [
@@ -67,6 +69,7 @@ export const oracleMemories = sqliteTable('oracle_memories', {
   index('idx_memory_source').on(table.source),
   index('idx_memory_tenant_created').on(table.tenantId, table.createdAt),
   index('idx_memory_tenant_valid_time').on(table.tenantId, table.validFrom, table.validTo),
+  index('idx_memory_tenant_tier_heat').on(table.tenantId, table.tier, table.heatScore),
 ]);
 // Indexing status tracking
 export const indexingStatus = sqliteTable('indexing_status', {
@@ -111,7 +114,6 @@ export const searchLog = sqliteTable('search_log', {
   index('idx_search_created').on(table.createdAt),
   index('idx_search_tenant_created').on(table.tenantId, table.createdAt),
 ]);
-
 // Consult log — legacy table kept for backward compat (pre-0007 snapshot had it).
 // Not actively used; retained to avoid destructive migration drop.
 export const consultLog = sqliteTable('consult_log', {
@@ -127,7 +129,6 @@ export const consultLog = sqliteTable('consult_log', {
   index('idx_consult_project').on(table.project),
   index('idx_consult_created').on(table.createdAt),
 ]);
-
 // Learning/pattern logging
 export const learnLog = sqliteTable('learn_log', {
   id: integer('id').primaryKey({ autoIncrement: true }),
@@ -158,7 +159,6 @@ export const documentAccess = sqliteTable('document_access', {
   index('idx_access_created').on(table.createdAt),
   index('idx_access_doc').on(table.documentId),
 ]);
-
 export const forumThreads = sqliteTable('forum_threads', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   title: text('title').notNull(),

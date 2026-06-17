@@ -5,6 +5,7 @@ export const SaveMemoryBody = t.Object({
   title: t.Optional(t.String()),
   tags: t.Optional(t.Array(t.String())),
   source: t.Optional(t.String()),
+  tier: t.Optional(t.Union([t.Literal('core'), t.Literal('warm'), t.Literal('cold')])),
   validFrom: t.Optional(t.Union([t.String(), t.Number()])),
   validTo: t.Optional(t.Union([t.String(), t.Number(), t.Null()])),
   validUntil: t.Optional(t.Union([t.String(), t.Number()])),
@@ -22,6 +23,7 @@ export const MemoryCloseoutBody = t.Object({
 export const RecallMemoryQuery = t.Object({
   q: t.Optional(t.String()),
   limit: t.Optional(t.String()),
+  includeCold: t.Optional(t.String()),
   asOf: t.Optional(t.String()),
 });
 
@@ -41,6 +43,9 @@ export const MemoryFanoutQuery = t.Object({
   limit: t.Optional(t.String()),
 });
 
+export const MemoryTiersQuery = t.Object({
+  limit: t.Optional(t.String()),
+});
 
 export function parseMemoryLimit(raw: unknown, fallback = 10, max = 50): number {
   const value = typeof raw === 'number' ? String(raw) : String(raw ?? fallback).trim();

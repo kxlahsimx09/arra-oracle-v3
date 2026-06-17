@@ -1,5 +1,5 @@
 import { Elysia } from 'elysia';
-import { MemoryCloseoutBody, MorningTapeQuery, RecallMemoryQuery, SaveMemoryBody, SemanticMemoryQuery, parseMemoryLimit } from './model.ts';
+import { MemoryCloseoutBody, MemoryTiersQuery, MorningTapeQuery, RecallMemoryQuery, SaveMemoryBody, SemanticMemoryQuery, parseMemoryLimit } from './model.ts';
 import { createMemoryFanoutEndpoint } from './fanout.ts';
 import { memoryStore, parseValidTime, type MemoryInput, type MemoryRecord, type MemoryStore } from './store.ts';
 import { memoryVectorIndex, type MemoryVectorHit, type MemoryVectorIndex } from './vector.ts';
@@ -56,8 +56,9 @@ export function createMemoryRoutes(
     })
     .get('/memory/recall', ({ query, set }) => {
       const limit = parseMemoryLimit(query.limit);
+      const includeCold = query.includeCold === undefined ? undefined : query.includeCold === 'true' || query.includeCold === '1';
       try {
-        const candidates = store.recall(query.q ?? '', limit, query.asOf);
+        const candidates = store.recall(query.q ?? '', limit, { asOf: query.asOf, includeCold });
         const items = rankMemories(candidates, { mode: 'keyword', asOf: query.asOf });
         return { query: query.q ?? '', asOf: isoAsOf(query.asOf), total: items.length, confidence: MEMORY_CONFIDENCE_STRATEGY, items };
       } catch (error) {
@@ -66,6 +67,15 @@ export function createMemoryRoutes(
     }, {
       query: RecallMemoryQuery,
       detail: { tags: ['memory'], menu: { group: 'hidden' }, summary: 'Recall persisted memories by keyword' },
+    })
+    .get('/memory/tiers', ({ query }) => ({
+      strategy: 'heat-based-tiered-salience',
+      tiers: ['core', 'warm', 'cold'],
+      eviction: 'cold memories are preserved and excluded from ambient recall unless requested',
+      ...store.tierSummary(parseMemoryLimit(query.limit, 5, 25)),
+    }), {
+      query: MemoryTiersQuery,
+      detail: { tags: ['memory'], menu: { group: 'hidden' }, summary: 'Summarize core/warm/cold memory tiers' },
     })
     .get('/memory/search', async ({ query, set }) => {
       if (!query.q?.trim()) {
@@ -76,7 +86,7 @@ export function createMemoryRoutes(
       try {
         isoAsOf(query.asOf);
         const hits = await vectorIndex.search(query.q, limit);
-        const records = store.getByIds(hits.map((hit) => hit.memoryId), query.asOf);
+        const records = store.getByIds(hits.map((hit) => hit.memoryId), { asOf: query.asOf });
         const merged = mergeHits(hits, records);
         const scores = new Map(hits.map((hit) => [hit.memoryId, hit.score]));
         const results = rankMemories(merged, { mode: 'semantic', asOf: query.asOf, score: (memory) => scores.get(memory.id) }).slice(0, limit);
@@ -113,12 +123,7 @@ function mergeHits(hits: MemoryVectorHit[], records: MemoryRecord[]) {
     if (tenantId && hitTenantId && hitTenantId !== tenantId) return [];
     const memory = memoryForHit(hit, record);
     seen.add(hit.memoryId);
-    return [{
-      ...memory,
-      score: hit.score,
-      distance: hit.distance,
-      vectorId: hit.vectorId,
-    }];
+    return [{ ...memory, score: hit.score, distance: hit.distance, vectorId: hit.vectorId }];
   });
 }
 
@@ -138,6 +143,10 @@ function memoryForHit(hit: MemoryVectorHit, record?: MemoryRecord): MemoryRecord
     source: metadataText(hit.metadata.source ?? hit.metadata.source_file),
     createdAt,
     updatedAt: metadataText(hit.metadata.updatedAt) ?? createdAt,
+    tier: metadataTier(hit.metadata.tier),
+    heatScore: metadataNumber(hit.metadata.heatScore ?? hit.metadata.heat_score) ?? 0,
+    usageCount: metadataNumber(hit.metadata.usageCount ?? hit.metadata.usage_count) ?? 0,
+    lastAccessedAt: metadataText(hit.metadata.lastAccessedAt ?? hit.metadata.last_accessed_at),
     validFrom: metadataText(hit.metadata.validFrom ?? hit.metadata.valid_from),
     validTo: metadataText(hit.metadata.validTo ?? hit.metadata.valid_to),
   };
@@ -145,6 +154,15 @@ function memoryForHit(hit: MemoryVectorHit, record?: MemoryRecord): MemoryRecord
 
 function metadataText(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function metadataTier(value: unknown): MemoryRecord['tier'] {
+  return value === 'core' || value === 'cold' ? value : 'warm';
+}
+
+function metadataNumber(value: unknown): number | undefined {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function metadataList(value: unknown): string[] {
