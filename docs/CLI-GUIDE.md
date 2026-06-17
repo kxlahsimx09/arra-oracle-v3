@@ -142,17 +142,17 @@ show 27 core tools before plugin tools.
 
 ## 5. HTTP API quick calls
 
-Canonical API paths are `/api/v1/*`; legacy `/api/*` paths usually redirect.
-Infrastructure endpoints `/api/health` and `/api/docs` stay unversioned.
+Canonical API paths are `/api/v1/*`; legacy `/api/*` paths 308 redirect in the
+running server. `/api/health` is direct; `/api/docs` redirects to `/api/v1/docs`.
 
 ```bash
 curl -sf http://localhost:47778/api/health
 curl -s 'http://localhost:47778/api/v1/search?q=oracle&limit=5'
 curl -s 'http://localhost:47778/api/v1/vector/export?collection=bge-m3&format=jsonl'
-curl -s -X POST http://localhost:47778/api/ask \
+curl -s -X POST http://localhost:47778/api/v1/ask \
   -H 'content-type: application/json' \
   -d '{"q":"What changed in the memory pipeline?","limit":5}'
-open http://localhost:47778/api/docs
+open http://localhost:47778/api/v1/docs
 ```
 
 When `ARRA_API_TOKEN` is set, protected `/api/*` calls need
@@ -224,7 +224,7 @@ Set `TUNNEL_URL` and `FEDERATION_TOKEN` for federation. See
 - **CLI cannot reach server:** start `bun run server` or set `ORACLE_API` / `arra --at`.
 - **MCP proxy fails:** `ORACLE_HTTP_URL` must point at a healthy backend; match `ARRA_API_TOKEN`.
 - **Different data per surface:** set the same `ORACLE_DATA_DIR` for HTTP, MCP, CLI, and Docker.
-- **Versioned route surprise:** use `/api/v1/*` except `/api/health` and `/api/docs`.
+- **Versioned route surprise:** use `/api/v1/*`; `/api/health` is direct and `/api/docs` redirects.
 - **Workers cannot open SQLite/LanceDB:** Workers are edge proxies; keep DB/vector files on the origin.
 - **Vector unavailable:** FTS search still works; configure vector later with `arra vector-config`.
 - **Secrets in git:** never commit real tokens, origin URLs, or Cloudflare credentials.

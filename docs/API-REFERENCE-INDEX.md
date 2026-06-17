@@ -41,9 +41,9 @@ curl -H 'X-Oracle-Tenant: team-a' \
 | --- | --- | --- |
 | Health, stats, dashboard | `/api/health`, `/api/stats`, `/api/dashboard` | [http-api-reference.md](./http-api-reference.md#health-metrics-dashboard) |
 | Search and memory | `/api/search`, `/api/list`, `/api/memory/*` | [http-api-reference.md](./http-api-reference.md#search-knowledge-learn-memory) |
-| Vector and indexer | `/api/vector/*`, `/api/indexer/*`, `/api/map` | [API.md](./API.md#vector-api) |
-| Menu and plugins | `/api/menu`, `/api/plugins`, `/api/canvas/*` | [API.md](./API.md#menu-api) |
-| MCP catalogue | `/api/mcp/tools` | [API.md](./API.md#mcp-tool-listing-api) |
+| Vector and indexer | `/api/vector/*`, `/api/indexer/*`, `/api/map` | [API.md](./API.md#vector-config-and-indexing) |
+| Menu and plugins | `/api/menu`, `/api/plugins`, `/api/canvas/*` | [API.md](./API.md#menu-and-plugin-state) |
+| MCP catalogue | `/api/mcp/tools` | [API.md](./API.md#mcp-tool-catalogue) |
 | Export/import | `/api/export/*`, `/api/vector/export/*` | [http-api-reference.md](./http-api-reference.md#vector-and-indexer) |
 | Collaboration | `/api/traces`, `/api/supersede`, `/api/schedule` | [http-api-reference.md](./http-api-reference.md#collaboration-social-traces-schedule) |
 | Federation mesh | `/api/federation/status`, `/api/federation/capabilities`, `/api/federation/mesh/nodes` | [FEDERATION.md](./FEDERATION.md) |

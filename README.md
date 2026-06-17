@@ -36,7 +36,7 @@ claude mcp list              # expect connected; tools/list exposes 27 tools
 Useful checks:
 ```bash
 curl -sf http://localhost:47778/api/health
-bun run src/cli/index.ts health
+bun cli/src/cli.ts health
 ```
 
 Run the React Studio UI:
@@ -69,7 +69,7 @@ docker run --rm -p 47778:47778 -v arra-data:/data \
 | Runtime plug-in/out | Unified manifests enable/disable CLI, menu/API, MCP, proxy, server, export-format, and lifecycle surfaces without forks. |
 | MCP memory tools | 27 tools: `____IMPORTANT` plus 26 `oracle_*`, including `oracle_research_note`, `oracle_profile`, and `oracle_trace_distill`. |
 | Memory confidence + supersede | Confidence receipts, reversible supersede chains, trace context, and async dry-run consolidation preserve history while deduping. |
-| HTTP API | Elysia route clusters under `/api/*`, with health, search, knowledge, vector, menu, plugins, canvas, federation, tenants, and settings surfaces. |
+| HTTP API | Elysia route clusters under `/api/*`, with health, search, knowledge, vector, menu, plugins, canvas, tenants, settings, and opt-in federation surfaces. |
 | Vector search | Configurable providers, LanceDB/local stores, proxy services, export formats, status/config APIs, and FTS fallback paths. |
 | maw-js `arra` plugin | `maw arra ...` gives CLI/API/menu access to ARRA verbs, maintenance commands, vector config/health, and server controls. |
 | Edge/cloud deploy | Cloudflare Workers remote MCP/canvas/studio/federation shapes, Vercel Studio proxy, Docker, and local Bun modes. |
@@ -110,23 +110,23 @@ Common endpoints:
 
 ```text
 GET  /api/health
-GET  /api/search?q=oracle&mode=fts
-POST /api/learn
-GET  /api/vector/config
+GET  /api/v1/search?q=oracle&mode=fts
+POST /api/v1/learn
+GET  /api/v1/vector/config
 GET  /api/v1/vector/status
-GET  /api/plugins
-GET  /api/menu
-GET  /api/canvas/plugins
+GET  /api/v1/plugins
+GET  /api/v1/menu
+GET  /api/v1/canvas/plugins
 ```
 
 Optional auth/tenant controls:
 
 ```bash
-export ARRA_API_TOKEN=secret                 # bearer token for protected writes
+export ARRA_API_TOKEN=secret                 # bearer token for protected API calls
 export ORACLE_TENANT_TOKENS='acme=secret,*=dev'
-curl -H 'X-Oracle-Tenant: acme' -H 'X-Oracle-Tenant-Token: secret' \
-  http://localhost:47778/api/search?q=team
-# Aliases accepted: X-Tenant-ID, X-Org-Id, X-API-Key.
+curl -H 'Authorization: Bearer secret' -H 'X-Oracle-Tenant: acme' \
+  -H 'X-Oracle-Tenant-Token: secret' http://localhost:47778/api/v1/search?q=team
+# Tenant ID aliases: X-Tenant-ID, X-Org-Id; X-API-Key can map tenant keys.
 ```
 
 ## Vector backends and export
