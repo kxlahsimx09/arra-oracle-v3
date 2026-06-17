@@ -102,14 +102,15 @@ describe('honest recall benchmark harness', () => {
     const lines = text.trim().split('\n');
     const cases = parseDatasetText(text);
 
-    expect(lines.length).toBeGreaterThanOrEqual(30);
-    expect(lines.length).toBeLessThanOrEqual(50);
+    expect(lines.length).toBeGreaterThanOrEqual(200);
+    expect(lines.length).toBeLessThanOrEqual(250);
     expect(cases).toHaveLength(lines.length);
     expect(cases.every((item) => item.id && item.query && Array.isArray(item.expectedIds))).toBe(true);
     expect(cases.filter((item) => item.id.includes('multi-word'))).toHaveLength(4);
-    expect(cases.filter((item) => item.id.includes('no-match'))).toHaveLength(4);
-    expect(cases.filter((item) => item.expectedIds.length === 0).map((item) => item.id).sort())
-      .toEqual(['edge/no-match-personal', 'edge/no-match-recipes', 'edge/no-match-sports', 'edge/no-match-weather']);
+    const negatives = cases.filter((item) => item.expectedIds.length === 0);
+    expect(negatives.length).toBeGreaterThanOrEqual(20);
+    expect(negatives.every((item) => item.id.includes('no-match'))).toBe(true);
+    expect(lines.filter((line) => line.includes('"label":"negative-control"'))).toHaveLength(negatives.length);
     expect(() => parseDatasetText('{"id":"bad","query":"missing expected ids"}')).toThrow('missing expected/relevant ids');
     expect(text).not.toContain('\u03c8/');
     expect(text).not.toContain('/Users/');
