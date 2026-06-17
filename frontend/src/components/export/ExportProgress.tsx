@@ -46,7 +46,7 @@ function progressBarClass(state: ExportProgressState): string {
 function retryButton(onRetry?: () => void) {
   if (!onRetry) return null;
   return (
-    <button className="focus-ring rounded-lg border border-err-border px-3 py-2 font-semibold text-err-text hover:bg-err-bg dark:border-err-border dark:text-err-text dark:hover:bg-err-bg" type="button" onClick={onRetry}>
+    <button className="focus-ring rounded-lg border border-err-border px-3 py-2 font-semibold text-err-text hover:bg-err-bg" type="button" onClick={onRetry}>
       Retry
     </button>
   );
@@ -73,11 +73,11 @@ export function ExportProgress({ state, title = 'Export app', onRetry, onDownloa
   const progress = Math.min(100, Math.max(0, state.progress));
 
   return (
-    <section className={`rounded-3xl border border-border bg-surface p-5 shadow-sm dark:border-border dark:bg-surface sm:p-6 ${className}`} aria-labelledby="export-progress-title" aria-live="polite">
+    <section className={`rounded-3xl border border-border bg-surface p-5 shadow-sm sm:p-6 ${className}`} aria-labelledby="export-progress-title" aria-live="polite">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.24em] text-accent dark:text-accent">Export</p>
-          <h3 id="export-progress-title" className="mt-2 text-xl font-semibold text-on-accent dark:text-text">{title}</h3>
+          <p className="text-xs font-semibold uppercase tracking-[0.24em] text-accent">Export</p>
+          <h3 id="export-progress-title" className="mt-2 text-xl font-semibold text-text">{title}</h3>
           <p className={`mt-2 inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold ${statusClass(state)}`}>
             {statusText(state)}
           </p>
@@ -85,18 +85,18 @@ export function ExportProgress({ state, title = 'Export app', onRetry, onDownloa
         {active ? <Spinner label="Exporting" /> : downloadControl(state, onDownload)}
       </div>
 
-      <div className="mt-5 grid gap-3 rounded-2xl border border-border bg-surface-muted p-4 dark:border-border dark:bg-surface-muted">
+      <div className="mt-5 grid gap-3 rounded-2xl border border-border bg-surface-muted p-4">
         <div className="flex items-center justify-between text-sm">
-          <span className="text-text-muted dark:text-text-muted">Progress</span>
-          <span className="font-medium text-text dark:text-text">{active || state.status === 'done' ? `${Math.round(progress)}%` : 'idle'}</span>
+          <span className="text-text-muted">Progress</span>
+          <span className="font-medium text-text">{active || state.status === 'done' ? `${Math.round(progress)}%` : 'idle'}</span>
         </div>
-        <div className="h-2 rounded-full border border-border bg-surface-muted dark:border-border dark:bg-field/[0.06]" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress)} aria-valuetext={statusText(state)}>
+        <div className="h-2 rounded-full border border-border bg-field" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress)} aria-valuetext={statusText(state)}>
           <div className={`h-full rounded-full transition-all ${progressBarClass(state)}`} style={{ width: `${active || state.status === 'done' ? progress : 0}%` }} />
         </div>
         <dl className="grid gap-3 text-sm sm:grid-cols-3">
-          <div><dt className="text-text-muted">Job</dt><dd className="break-all font-mono text-text dark:text-text">{state.jobId ?? 'not started'}</dd></div>
-          <div><dt className="text-text-muted">File size estimate</dt><dd className="font-medium text-text dark:text-text">{formatBytes(state.fileSizeEstimate)}</dd></div>
-          <div><dt className="text-text-muted">File</dt><dd className="break-all font-medium text-text dark:text-text">{state.filename ?? 'pending'}</dd></div>
+          <div><dt className="text-text-muted">Job</dt><dd className="break-all font-mono text-text">{state.jobId ?? 'not started'}</dd></div>
+          <div><dt className="text-text-muted">File size estimate</dt><dd className="font-medium text-text">{formatBytes(state.fileSizeEstimate)}</dd></div>
+          <div><dt className="text-text-muted">File</dt><dd className="break-all font-medium text-text">{state.filename ?? 'pending'}</dd></div>
         </dl>
       </div>
 

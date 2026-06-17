@@ -10,18 +10,18 @@ export type NavItem = {
 
 function navClass({ isActive }: { isActive: boolean }) {
   const base = 'focus-ring min-w-[10rem] rounded-2xl border px-4 py-3 text-left transition lg:min-w-0';
-  if (isActive) return `${base} border-accent-border bg-accent-soft text-accent shadow-lg shadow-black/5 dark:shadow-black/20`;
+  if (isActive) return `${base} border-accent-border bg-accent-soft text-accent shadow-lg`;
   return `${base} border-border bg-surface text-text hover:border-accent-border hover:bg-surface-muted`;
 }
 
 export function NavSidebar({ items }: { items: NavItem[] }) {
   return (
     <aside aria-label="Application navigation" className="sticky top-2 z-20 lg:top-4 lg:h-[calc(100vh-2rem)]">
-      <div className="flex h-full flex-col gap-4 rounded-3xl border border-border bg-surface p-3 shadow-2xl shadow-black/5 backdrop-blur sm:p-4 dark:shadow-black/20">
+      <div className="flex h-full flex-col gap-4 rounded-3xl border border-border bg-surface p-3 shadow-2xl backdrop-blur sm:p-4">
         <NavLink to="/menu" aria-label="Arra Oracle control surface home" className="focus-ring rounded-2xl p-2">
-          <p className="text-xs font-medium uppercase tracking-[0.28em] text-accent dark:text-accent">Arra Oracle</p>
+          <p className="text-xs font-medium uppercase tracking-[0.28em] text-accent">Arra Oracle</p>
           <h1 className="mt-2 text-xl font-bold tracking-tight text-text sm:text-2xl">Control Surface</h1>
-          <p className="mt-2 text-sm text-text-muted dark:text-text-muted">React routes over the Elysia API.</p>
+          <p className="mt-2 text-sm text-text-muted">React routes over the Elysia API.</p>
         </NavLink>
 
         <nav aria-label="Frontend sections" className="grid auto-cols-[minmax(10rem,1fr)] grid-flow-col gap-2 overflow-x-auto pb-1 lg:grid-flow-row lg:grid-cols-1 lg:overflow-visible lg:pb-0">
@@ -33,7 +33,7 @@ export function NavSidebar({ items }: { items: NavItem[] }) {
                   <span className="rounded-full bg-surface-muted px-2 py-1 text-xs text-text-muted" aria-label={`${item.badge} items`}>{item.badge}</span>
                 ) : null}
               </span>
-              <span className="mt-1 block text-xs leading-5 text-text-muted dark:text-text-muted">{item.description}</span>
+              <span className="mt-1 block text-xs leading-5 text-text-muted">{item.description}</span>
             </NavLink>
           ))}
         </nav>
