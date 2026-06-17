@@ -71,6 +71,7 @@ describe('frontend router', () => {
     expect(htmlAt('/search')).toContain('Full-text menu search');
     expect(htmlAt('/export')).toContain('Export app');
     expect(htmlAt('/learn')).toContain('Learn entries');
+    expect(htmlAt('/memory')).toContain('Memory dashboard');
     expect(htmlAt('/memory')).toContain('Memory health');
     expect(htmlAt('/vector')).toContain('Vector dashboard');
     expect(htmlAt('/vector/search')).toContain('Vector search preview');

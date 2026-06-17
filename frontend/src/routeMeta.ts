@@ -84,7 +84,10 @@ export function routeMeta(pathname: string, search = ''): RouteMeta {
 
   if (pathname === '/memory') {
     const query = new URLSearchParams(search).get('q')?.trim();
-    return base('Memory health', 'Memory', query ? `Heat-score and recency signals for “${query}”.` : 'Heat-score and recency visualization for Studio memory.', [{ label: 'Memory health' }]);
+    const description = query
+      ? `Provenance, confidence, heat, valid-time, and recency signals for “${query}”.`
+      : 'Provenance, confidence, heat, valid-time, and recency across Studio memory.';
+    return base('Memory dashboard', 'Memory', description, [{ label: 'Memory dashboard' }]);
   }
 
   if (pathname === '/plugins') return base('Plugin list', 'Plugins', 'Registered plugins and exposed runtime surfaces.', [{ label: 'Plugins' }]);

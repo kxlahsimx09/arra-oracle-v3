@@ -70,7 +70,7 @@ export function AppShell({
     { to: '/vector/settings', label: 'Vector settings', description: 'Collection config and index controls' },
     { to: '/vector/export', label: 'Export', description: 'Download vector collections' },
     { to: '/learn', label: 'Learn', description: 'Create and edit learnings' },
-    { to: '/memory', label: 'Memory Health', description: 'Heat-score and recency visualization' },
+    { to: '/memory', label: 'Memory Dashboard', description: 'Confidence, heat, provenance, valid-time, and recency' },
     { to: '/metrics', label: 'Metrics', description: 'Runtime counters from /api/v1/metrics' },
     { to: '/mcp', label: 'MCP', description: 'Tool schemas and groups' },
     { to: '/storage', label: 'Storage', description: 'Backend config from /api/settings/system' },

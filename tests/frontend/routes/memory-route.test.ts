@@ -9,7 +9,7 @@ describe('memory route helpers', () => {
   });
 
   test('returns memory route chrome metadata', () => {
-    expect(routeMeta('/memory')).toMatchObject({ title: 'Memory health', eyebrow: 'Memory' });
-    expect(routeMeta('/memory', '?q=oracle').description).toBe('Heat-score and recency signals for “oracle”.');
+    expect(routeMeta('/memory')).toMatchObject({ title: 'Memory dashboard', eyebrow: 'Memory' });
+    expect(routeMeta('/memory', '?q=oracle').description).toBe('Provenance, confidence, heat, valid-time, and recency signals for “oracle”.');
   });
 });

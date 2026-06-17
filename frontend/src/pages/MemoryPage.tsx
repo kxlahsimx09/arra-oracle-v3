@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { searchMemoryHealth } from '../api';
+import { fetchMemoryRecall, type MemoryRecallResponse, type RankedMemory } from '../memoryDashboard';
 import { MemoryDashboardInsights } from '../components/MemoryDashboardInsights';
+import { MemoryDashboardContent } from './MemoryDashboardPage';
 import { MemoryHealthPanel } from '../components/MemoryHealthPanel';
 import { SearchResultCard } from '../components/SearchResultCard';
 import { memoryPath, vectorResultsPath } from '../routePaths';
@@ -9,6 +11,7 @@ import type { SearchResponse, SearchResult } from '../types';
 
 type PageState = 'idle' | 'loading' | 'ready' | 'error';
 type MemorySearch = (query: string, limit?: number) => Promise<SearchResponse>;
+type MemoryRecall = (params?: { q?: string; asOf?: string; limit?: number }) => Promise<MemoryRecallResponse>;
 
 export function memoryHealthStatus(state: PageState, query: string, total: number): string {
   if (state === 'idle') return 'Search memory to inspect heat-score, recency, and recall signals.';
@@ -30,7 +33,7 @@ function MemoryRouteLinks() {
   );
 }
 
-export function MemoryPage({ search = searchMemoryHealth }: { search?: MemorySearch }) {
+export function MemoryPage({ search = searchMemoryHealth, recall = fetchMemoryRecall }: { search?: MemorySearch; recall?: MemoryRecall }) {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const routeQuery = searchParams.get('q') ?? '';
@@ -39,6 +42,11 @@ export function MemoryPage({ search = searchMemoryHealth }: { search?: MemorySea
   const [results, setResults] = useState<SearchResult[]>([]);
   const [state, setState] = useState<PageState>('idle');
   const [error, setError] = useState('');
+  const [dashboardItems, setDashboardItems] = useState<RankedMemory[]>([]);
+  const [dashboardTotal, setDashboardTotal] = useState(0);
+  const [dashboardAsOf, setDashboardAsOf] = useState<string | undefined>();
+  const [dashboardState, setDashboardState] = useState<PageState>('idle');
+  const [dashboardError, setDashboardError] = useState('');
 
   async function runSearch(nextQuery: string) {
     const q = nextQuery.trim();
@@ -63,10 +71,29 @@ export function MemoryPage({ search = searchMemoryHealth }: { search?: MemorySea
     }
   }
 
+  async function loadDashboard() {
+    setDashboardState('loading');
+    setDashboardError('');
+    try {
+      const response = await recall({ limit: 50 });
+      setDashboardItems(response.items);
+      setDashboardTotal(response.total);
+      setDashboardAsOf(response.asOf);
+      setDashboardState('ready');
+    } catch (err) {
+      setDashboardItems([]);
+      setDashboardTotal(0);
+      setDashboardError(err instanceof Error ? err.message : String(err));
+      setDashboardState('error');
+    }
+  }
+
   useEffect(() => {
     setQuery(routeQuery);
     void runSearch(routeQuery);
   }, [routeQuery]);
+
+  useEffect(() => { void loadDashboard(); }, []);
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -79,11 +106,13 @@ export function MemoryPage({ search = searchMemoryHealth }: { search?: MemorySea
 
   return (
     <div className="grid gap-5">
+      <MemoryDashboardContent items={dashboardItems} total={dashboardTotal} asOf={dashboardAsOf} state={dashboardState} error={dashboardError} />
+
       <section className="rounded-3xl border border-border bg-surface p-5 sm:p-6" aria-labelledby="memory-health-page-title">
         <div className="mb-5 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
           <div>
             <p className="text-xs font-semibold uppercase tracking-[0.24em] text-accent2">Memory</p>
-            <h1 id="memory-health-page-title" className="mt-2 text-3xl font-semibold text-text">Memory health</h1>
+            <h2 id="memory-health-page-title" className="mt-2 text-2xl font-semibold text-text">Memory health</h2>
             <p className="mt-2 text-sm text-text-muted">Inspect heat-score, last-recalled, and recall counts from Studio memory search results.</p>
           </div>
           <MemoryRouteLinks />
