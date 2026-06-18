@@ -222,6 +222,12 @@ TOTAL=${#TESTS[@]}
 #
 # If the pull fails (wrong branch, dirty tree, diverged history), the
 # contract was violated — abort + Telegram so the operator sees it and fixes.
+# Local git sync (Step 2 + 2.5) only applies to the local-Docker path. When
+# delegating to the droplet (REGRESSION_HOST set) the droplet syncs its OWN
+# mobiz + bank-bot clones via regression-on-droplet.sh, so skip the local sync
+# entirely — otherwise a host without a local bank-bot clone aborts at Step 2.5
+# before ever reaching the delegation block below. (fix: thread #21 pg-regression)
+if [ -z "${REGRESSION_HOST:-}" ]; then
 cd "$MOBIZ" || { log "ABORT: cannot cd into $MOBIZ"; exit 1; }
 
 log "Syncing \$MOBIZ with origin/$BRANCH..."
@@ -304,6 +310,7 @@ log "  \$BANK_BOT at $BANK_BOT_SHA ($(git log -1 --format='%s' | head -c 60))"
 
 # Return cwd to $MOBIZ for subsequent docker compose + test invocations
 cd "$MOBIZ"
+fi  # end local-sync guard (skipped when REGRESSION_HOST set → droplet delegation)
 
 # ── Step 2a: Rebuild images (backend + mock-bank + bank-bot) against HEAD ──
 # User's setup is DOCKER_MODE (persistent containers for backend, bank-bot,
