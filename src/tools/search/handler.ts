@@ -66,7 +66,7 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
       vectorSearchError = true;
       vectorAvailable = false;
       const errorMessage = error instanceof Error ? error.message : String(error);
-      console.error('[ChromaDB]', errorMessage);
+      console.error('[Vector]', errorMessage);
       warning = `Vector search unavailable: ${errorMessage}. Using FTS5 only.`;
     }
     if (vecResults.length === 0 && !vectorSearchError) {

@@ -20,7 +20,7 @@ import { detectProject } from './project-detect.ts';
 import { coerceConcepts } from '../tools/learn.ts';
 import { createVectorProxy } from './vector-proxy.ts';
 import { buildLearningMarkdown, dateSlug } from '../learn/markdown.ts';
-import { localNativeVectorDisabledReason, localVectorIndexMissingReason, logLocalVectorDisabled } from '../vector/cpu-capabilities.ts';
+import { localNativeVectorDisabledReason, localVectorIndexMissingReason, logLocalVectorDisabled, noteLocalVectorEnabled } from '../vector/cpu-capabilities.ts';
 import { isVectorSectionEnabled } from '../vector/config.ts';
 import { candidatePoolSize } from '../search/retrieve-depth.ts';
 
@@ -86,7 +86,7 @@ export function cosineDistanceToSimilarity(distance: number): number {
 
 /**
  * Search Oracle knowledge base with hybrid search (FTS5 + Vector)
- * HTTP server can safely use ChromaMcpClient since it's not an MCP server
+ * HTTP server can safely use the configured vector store (LanceDB by default) directly since it's not an MCP server
  */
 export async function handleSearch(
   query: string,
@@ -126,11 +126,16 @@ export async function handleSearch(
       effectiveMode = 'fts';
       warning = `${vectorDisabledReason}; falling back to FTS5-only results`;
       logLocalVectorDisabled(vectorDisabledReason);
-    } else if (!isVectorSectionEnabled()) {
-      vectorSectionDisabled = true;
-      effectiveMode = 'fts';
-    } else if (vectorIndexMissingReason) {
-      effectiveMode = 'fts';
+    } else {
+      // Native gate passed — re-arm the disabled-warning latch (de-latch) so a
+      // later transient disable logs afresh, not suppressed by a stale reason.
+      noteLocalVectorEnabled();
+      if (!isVectorSectionEnabled()) {
+        vectorSectionDisabled = true;
+        effectiveMode = 'fts';
+      } else if (vectorIndexMissingReason) {
+        effectiveMode = 'fts';
+      }
     }
   }
 
