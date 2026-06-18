@@ -184,6 +184,26 @@ PANE=$(tmux new-window ${GROUP:+-t "$GROUP:"} -n "$WINDOW_NAME" -c "$WT_PATH" -P
   || die "tmux new-window failed"
 ok "spawned in window '$WINDOW_NAME' pane $PANE (cwd: $WT_PATH)"
 
+# Record the teammate's pane id into the team config. `maw team spawn` (above) ran
+# BEFORE this window existed, so it registered the member with no `tmuxPaneId` — only
+# split-pane layouts get one. Without it, window-name→role tools (the Fleet Town map,
+# oracle-studio) can't link this separate-window teammate to its team and it falls to
+# the commons. Best-effort: a failure here never blocks the spawn.
+TEAM_CFG="$HOME/.claude/teams/$CAMPAIGN/config.json"
+if [ -f "$TEAM_CFG" ] && command -v python3 >/dev/null 2>&1; then
+  TEAM_CFG="$TEAM_CFG" ROLE="$ROLE" PANE="$PANE" python3 - <<'PY' && ok "recorded pane $PANE in team '$CAMPAIGN'" || ok "(note: could not record pane id in team config — Fleet Town may show this teammate in commons)"
+import json, os
+p, role, pane = os.environ["TEAM_CFG"], os.environ["ROLE"], os.environ["PANE"]
+c = json.load(open(p))
+# the member maw just appended is the LAST one with this role
+idx = [i for i, m in enumerate(c.get("members", [])) if m.get("name") == role]
+if not idx:
+    raise SystemExit(1)
+c["members"][idx[-1]]["tmuxPaneId"] = pane
+json.dump(c, open(p, "w"), indent=2)
+PY
+fi
+
 # --- 6.5. deliver the task as the FIRST USER TURN ---------------------------
 # The spawned claude has the role identity in its system prompt but no message
 # to act on yet. Send the dispatch contract ($PROMPT) as the kickoff turn so it
