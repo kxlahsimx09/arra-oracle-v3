@@ -371,6 +371,29 @@ ${RESULT_LINE:-all passed} — host <code>${REGRESSION_HOST}</code>"
     send_tg "🔴 <b>${RUN_LABEL} (droplet) FAILED</b> (run <code>${RUN_ID}</code>)
 ${RESULT_LINE:-see logs} — host <code>${REGRESSION_HOST}</code>
 pulled logs: <code>~/.cache/w2-watcher/regression-droplet/</code>"
+    # Gap (d) fix (thread #21): mirror the local path — wake pg-tester to
+    # investigate the droplet failure. regression-on-droplet.sh already pulled
+    # the failing per-test logs to ~/.cache/w2-watcher/regression-droplet/<id>/;
+    # point the tester at them. The primary 🔴 Telegram already went out above,
+    # so a silently-dying investigation wake (API overload) still leaves the
+    # operator notified — same contract as the local path.
+    PULLED_DIR=$(grep -oE 'pulled to: .*' "$DROP_OUT" | tail -1 | sed 's/.*pulled to: //')
+    FAILED_LINE=$(grep -E '^[[:space:]]*failed:' "$DROP_OUT" | tail -1)
+    DROP_PROMPT_FILE="$RUN_DIR/droplet-investigation-prompt.md"
+    {
+      printf 'Droplet regression FAILED (run %s, host %s).\n' "$RUN_ID" "$REGRESSION_HOST"
+      printf '%s\n' "${RESULT_LINE:-see logs}"
+      printf '%s\n' "${FAILED_LINE:-  failed: (see RESULT line)}"
+      printf 'Failing per-test logs pulled to: %s\n\n' "${PULLED_DIR:-$HOME/.cache/w2-watcher/regression-droplet/}"
+      printf 'อ่าน log ของแต่ละ test ที่ fail ในโฟลเดอร์นั้น, investigate ทีละตัวด้วย tester discipline (อ่าน test script + production code ที่ test เรียก + log output), แยกว่าเป็น real regression / flake / test-drift, แล้วส่ง summary ไป mcp__tester-telegram__telegram_send เป็นภาษาไทยง่ายๆ. ห้ามแก้ code/test — แค่ investigate + report.\n'
+    } > "$DROP_PROMPT_FILE"
+    WAKE_POINTER="อ่าน $DROP_PROMPT_FILE ให้จบก่อน — นั่นคือ task ของคุณ. investigate + report ผ่าน mcp__tester-telegram__telegram_send ห้ามแก้ code/test."
+    log "Spawning tester investigation wake (droplet path; prompt in $DROP_PROMPT_FILE)..."
+    if maw wake pg-tester --task "$WAKE_POINTER" --fresh >> "$RUN_DIR/runner.log" 2>&1; then
+      log "Investigation wake spawned (droplet path) — pg-tester MAY send detailed Telegram (best-effort)"
+    else
+      log "FAIL: maw wake pg-tester returned non-zero (operator already has primary Telegram above)"
+    fi
   fi
   exit "$DROP_RC"
 fi
