@@ -71,6 +71,53 @@ done
 [ -n "$PROMPT" ]   || die "missing --prompt"
 [ -n "${TMUX:-}" ] || die "must run inside a tmux session (TMUX not set)"
 
+# --- role: normalize label→oracle aliases + validate against the fleet registry ---
+# §11a: `--role` must be the ORACLE NAME (e.g. next-architect), not the human ROLE
+# LABEL (system-architect). The orchestrator naturally reaches for the label, and
+# the old helper spawned it verbatim → a mislabeled window+member that had to be
+# killed and re-dispatched (observed campaign sysbankenf, 2026-06-19: pane %489
+# `system-architect-sysbankenf` killed, re-run as next-architect → %492). Normalize
+# the known slips, then hard-validate against maw's OWN fleet config so any unknown
+# role fails BEFORE a worktree/pane is created.
+case "$ROLE" in
+  system-architect)         ROLE_NORM=next-architect ;;
+  implementation-architect) ROLE_NORM=next-impl ;;
+  *)                        ROLE_NORM="$ROLE" ;;
+esac
+if [ "$ROLE_NORM" != "$ROLE" ]; then
+  ok "role alias: '$ROLE' → '$ROLE_NORM' (oracle name, §11a)"
+  ROLE="$ROLE_NORM"
+fi
+
+FLEET_DIR="${MAW_FLEET_DIR:-$HOME/.config/maw/fleet}"
+VALID_ROLES=$(python3 - "$FLEET_DIR" <<'PY' 2>/dev/null
+import sys, os, json, glob
+roles = set()
+for f in glob.glob(os.path.join(sys.argv[1], "*.json")):
+    try:
+        cfg = json.load(open(f))
+    except Exception:
+        continue
+    for w in cfg.get("windows", []):
+        n = w.get("name", "")
+        if n.endswith("-oracle"):
+            n = n[: -len("-oracle")]
+        if n:
+            roles.add(n)
+print("\n".join(sorted(roles)))
+PY
+)
+if [ -n "$VALID_ROLES" ]; then
+  if ! printf '%s\n' "$VALID_ROLES" | grep -qxF -- "$ROLE"; then
+    die "unknown --role '$ROLE' — not a fleet oracle name.
+  Use the ORACLE NAME, not the role label (§11a): next-architect (NOT system-architect),
+  next-impl (NOT implementation-architect). Valid roles:
+$(printf '%s\n' "$VALID_ROLES" | sed 's/^/    /')"
+  fi
+else
+  say "⚠ fleet registry unreadable at $FLEET_DIR — skipping strict role check (alias map still applied)"
+fi
+
 # --- paths ---
 GHQ_ROOT=$(ghq root 2>/dev/null) || die "ghq not installed (brew install ghq)"
 REPO_PATH="$GHQ_ROOT/$REPO"
