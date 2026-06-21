@@ -1,0 +1,75 @@
+---
+import Base from "../../layouts/Base.astro";
+import { epics, passedCount } from "../../data/epic-verification";
+
+const passed = passedCount();
+const total = epics.length;
+---
+
+<Base title="Epic Verification | Neo ARRA V3">
+  <main class="max-w-4xl mx-auto px-6 py-16">
+    <a href="/" class="text-gray-500 hover:text-teal-300 text-sm transition-colors">← home</a>
+    <h1 class="text-5xl font-bold tracking-tight mt-4 mb-2">Epic Verification</h1>
+    <p class="text-gray-400 mb-6 text-lg">
+      Beginner-friendly, end-to-end test procedures that prove each completed epic actually works —
+      and a place to stamp it <span class="text-teal-300 font-mono">PASSED</span> once you've checked it yourself.
+    </p>
+
+    <div class="mb-10 inline-flex items-center gap-3 bg-gray-900/80 border border-gray-800 rounded-lg px-5 py-3">
+      <span class="text-2xl font-bold text-teal-300 font-mono">{passed} / {total}</span>
+      <span class="text-gray-400 text-sm">epics stamped <span class="font-mono text-teal-300">PASSED</span></span>
+    </div>
+
+    <div class="space-y-4">
+      {epics.map((e) => (
+        <a
+          href={`/verify/${e.slug}`}
+          class="block bg-gray-900/80 border border-gray-800 rounded-xl p-6 hover:border-teal-700/70 hover:ring-1 hover:ring-teal-500/30 transition-all duration-200 group"
+        >
+          <div class="flex items-start justify-between gap-4">
+            <div>
+              <h2 class="font-semibold text-lg mb-1">
+                <span class="text-gray-500 font-mono text-sm mr-2">#{e.id}</span>
+                {e.title}
+              </h2>
+              <p class="text-gray-400 text-sm">{e.summary}</p>
+            </div>
+            {e.status === "passed" ? (
+              <span class="shrink-0 inline-flex items-center rounded-full border border-green-700 bg-green-950/50 px-3 py-1 text-xs font-mono text-green-300">
+                ✅ PASSED
+              </span>
+            ) : (
+              <span class="shrink-0 inline-flex items-center rounded-full border border-amber-700 bg-amber-950/40 px-3 py-1 text-xs font-mono text-amber-300">
+                🟡 PENDING
+              </span>
+            )}
+          </div>
+          <div class="mt-3 flex items-center justify-between">
+            <span class="text-xs text-gray-500">
+              {e.features.length} features ·{" "}
+              {e.status === "passed"
+                ? `verified by ${e.verifiedBy || "—"}${e.verifiedDate ? ` on ${e.verifiedDate}` : ""}`
+                : "not yet verified"}
+            </span>
+            <span class="text-teal-400 group-hover:translate-x-1 inline-block transition-transform">→</span>
+          </div>
+        </a>
+      ))}
+    </div>
+
+    <div class="mt-12 rounded-xl border border-gray-800 bg-gray-900/50 p-6 text-sm text-gray-400">
+      <h3 class="text-gray-200 font-semibold mb-2">How to stamp an epic PASSED</h3>
+      <ol class="list-decimal list-inside space-y-1">
+        <li>Open the epic's detail page and follow the end-to-end procedure for every feature.</li>
+        <li>
+          Edit the epic's data file under{" "}
+          <code class="text-teal-300 font-mono">web/src/data/epics/</code> and set{" "}
+          <code class="text-teal-300 font-mono">status: 'passed'</code>,{" "}
+          <code class="text-teal-300 font-mono">verifiedBy</code>, and{" "}
+          <code class="text-teal-300 font-mono">verifiedDate</code>.
+        </li>
+        <li>Rebuild — this dashboard badge and the progress count update automatically.</li>
+      </ol>
+    </div>
+  </main>
+</Base>
