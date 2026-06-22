@@ -1,13 +1,14 @@
 {
   "name": "arra-oracle-v3",
-  "version": "26.5.2-alpha.1704",
+  "version": "26.6.1-alpha.1506",
   "description": "Arra Oracle - MCP Memory Layer with semantic search, philosophy, and knowledge management",
   "type": "module",
   "main": "src/index.ts",
   "bin": {
+    "arra-oracle": "./bin/arra.ts",
+    "arra-cli": "./cli/src/cli.ts",
     "arra-oracle-v3": "./bin/arra.ts",
-    "arra-oracle-v2": "./src/index.ts",
-    "arra-cli": "./cli/src/cli.ts"
+    "arra-oracle-v2": "./src/index.ts"
   },
   "files": [
     "bin",
@@ -28,8 +29,8 @@
   "scripts": {
     "dev": "bun src/index.ts",
     "server": "bun src/server.ts",
-    "vector": "ORACLE_VECTOR_READONLY=1 bun src/vector-server.ts",
-    "vector:dev": "ORACLE_VECTOR_READONLY=1 bun --watch src/vector-server.ts",
+    "vector": "ORACLE_VECTOR_SERVER=1 ORACLE_VECTOR_READONLY=1 bun src/vector-server.ts",
+    "vector:dev": "ORACLE_VECTOR_SERVER=1 ORACLE_VECTOR_READONLY=1 bun --watch src/vector-server.ts",
     "server:ensure": "bun src/ensure-server.ts",
     "server:status": "bun src/ensure-server.ts --status",
     "serve": "bun dist/server.js",
@@ -66,6 +67,7 @@
     "commander": "^14.0.3",
     "drizzle-orm": "^0.45.2",
     "elysia": "^1.4.28",
+    "hook-menu": "github:Soul-Brews-Studio/hook-menu",
     "sqlite-vec": "^0.1.9"
   },
   "devDependencies": {

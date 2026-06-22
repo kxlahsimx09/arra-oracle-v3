@@ -8,25 +8,31 @@
  * Endpoints (under /api prefix from vectorRoutes):
  *   POST /vector/index/start   — trigger reindex for a model
  *   GET  /vector/index/status  — current job status (poll)
+ *   POST /vector/index/stop    — request current job stop
  *   GET  /vector/index/models  — available models + collection counts
  */
 
 import { Elysia, t } from 'elysia';
-import { Database } from 'bun:sqlite';
-import { createVectorStore, getEmbeddingModels } from '../../vector/factory.ts';
-import { DB_PATH } from '../../config.ts';
+import { getEmbeddingModels, getVectorStoreConfigByModel } from '../../vector/factory.ts';
+import { loadVectorIndexDocuments, type VectorIndexSource } from './indexer-source.ts';
+import { proxyVectorIndexer } from './indexer-proxy.ts';
+import { localVectorOperations, type RebuildStrategy } from '../../server/vector-operations.ts';
 
 // ── In-memory status (no sqlite writes — avoids the disk I/O problem) ──
 
 interface IndexJob {
   jobId: string;
   model: string;
-  status: 'indexing' | 'completed' | 'error' | 'idle';
+  status: 'indexing' | 'stopping' | 'completed' | 'error' | 'idle' | 'stopped';
   current: number;
   total: number;
   startedAt: number;
   completedAt?: number;
   error?: string;
+  strategy?: RebuildStrategy;
+  source?: Exclude<VectorIndexSource, 'auto'>;
+  repoRoot?: string;
+  models?: string[];
 }
 
 let currentJob: IndexJob = {
@@ -37,6 +43,10 @@ let currentJob: IndexJob = {
   total: 0,
   startedAt: 0,
 };
+let stopRequestedJobId: string | null = null;
+
+
+export const rebuildVectorCollection = localVectorOperations.rebuildCollection.bind(localVectorOperations);
 
 // ── Endpoints ──────────────────────────────────────────────────────────
 
@@ -44,20 +54,31 @@ export const vectorIndexerEndpoints = new Elysia()
 
   // POST /vector/index/start
   .post('/vector/index/start', async ({ body, set }) => {
-    if (currentJob.status === 'indexing') {
+    const remote = await proxyVectorIndexer('start', set, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    if (remote) return remote;
+
+    if (currentJob.status === 'indexing' || currentJob.status === 'stopping') {
       set.status = 409;
       return { error: 'Indexing already in progress', job: currentJob };
     }
 
     const models = getEmbeddingModels();
-    const key = body.model && models[body.model] ? body.model : 'bge-m3';
-    const preset = models[key];
-    const batchSize = body.batchSize ?? (key === 'nomic' ? 100 : 50);
+    const modelKeys = body.model === 'all'
+      ? Object.keys(models)
+      : [body.model && models[body.model] ? body.model : 'bge-m3'];
+    const firstKey = modelKeys[0] ?? 'bge-m3';
+    const firstStoreConfig = getVectorStoreConfigByModel(firstKey);
+    const batchSize = body.batchSize ?? 50;
 
     const jobId = `vidx-${Date.now()}`;
+    stopRequestedJobId = null;
     currentJob = {
       jobId,
-      model: key,
+      model: body.model === 'all' ? 'all' : firstKey,
+      models: modelKeys,
       status: 'indexing',
       current: 0,
       total: 0,
@@ -66,71 +87,56 @@ export const vectorIndexerEndpoints = new Elysia()
 
     // Background indexing — fire and forget
     (async () => {
-      let sqlite: Database | undefined;
       try {
-        sqlite = new Database(DB_PATH, { readonly: true });
+        const loaded = loadVectorIndexDocuments({ source: body.source, repoRoot: body.repoRoot });
+        currentJob.source = loaded.source;
+        currentJob.repoRoot = loaded.repoRoot;
+        currentJob.total = loaded.docs.length * modelKeys.length;
 
-        const rows = sqlite.prepare(`
-          SELECT d.id, d.type, GROUP_CONCAT(f.content, '\n') as content,
-                 d.source_file, d.concepts, d.project, d.created_at
-          FROM oracle_documents d
-          JOIN oracle_fts f ON d.id = f.id
-          GROUP BY d.id
-          ORDER BY d.created_at DESC
-        `).all() as Array<{
-          id: string; type: string; content: string;
-          source_file: string; concepts: string; project: string | null;
-          created_at: string;
-        }>;
-
-        currentJob.total = rows.length;
-
-        const store = createVectorStore({
-          type: 'lancedb',
-          collectionName: preset.collection,
-          embeddingProvider: 'ollama',
-          embeddingModel: preset.model,
-          ...(preset.dataPath && { dataPath: preset.dataPath }),
-        });
-
-        await store.connect();
-        try { await store.deleteCollection(); } catch {}
-        await store.ensureCollection();
-
-        for (let i = 0; i < rows.length; i += batchSize) {
-          const batch = rows.slice(i, i + batchSize);
-          const docs = batch.map(row => ({
-            id: row.id,
-            document: row.content,
-            metadata: {
-              type: row.type,
-              source_file: row.source_file,
-              concepts: row.concepts,
-              ...(row.project && { project: row.project }),
-            },
-          }));
-
-          await store.addDocuments(docs);
-          currentJob.current = i + batch.length;
+        for (const [modelIndex, key] of modelKeys.entries()) {
+          if (stopRequestedJobId === jobId) break;
+          const { store } = localVectorOperations.createStoreForModel(key);
+          try {
+            const offset = modelIndex * loaded.docs.length;
+            const rebuild = await localVectorOperations.rebuildCollection(store, loaded.docs, batchSize, current => {
+              currentJob.current = offset + current;
+            });
+            currentJob.strategy = rebuild.strategy;
+          } finally {
+            try { await store?.close(); } catch {}
+          }
         }
 
-        await store.close();
-        currentJob.status = 'completed';
+        if (stopRequestedJobId === jobId) {
+          currentJob.status = 'stopped';
+          currentJob.error = 'Stopped by operator';
+        } else {
+          currentJob.status = 'completed';
+        }
         currentJob.completedAt = Date.now();
       } catch (e) {
         currentJob.status = 'error';
         currentJob.error = e instanceof Error ? e.message : String(e);
         currentJob.completedAt = Date.now();
-      } finally {
-        sqlite?.close();
       }
     })();
 
-    return { jobId, status: 'started', model: key, batchSize };
+    return {
+      jobId,
+      status: 'started',
+      model: currentJob.model,
+      models: modelKeys,
+      adapter: firstStoreConfig.type,
+      collection: firstStoreConfig.collectionName,
+      batchSize,
+      source: body.source ?? 'auto',
+    };
   }, {
     body: t.Object({
       model: t.Optional(t.String()),
       batchSize: t.Optional(t.Number()),
+      source: t.Optional(t.String()),
+      repoRoot: t.Optional(t.String()),
     }),
     detail: {
       tags: ['vector-indexer'],
@@ -139,7 +145,10 @@ export const vectorIndexerEndpoints = new Elysia()
   })
 
   // GET /vector/index/status
-  .get('/vector/index/status', () => {
+  .get('/vector/index/status', async ({ set }) => {
+    const remote = await proxyVectorIndexer('status', set);
+    if (remote) return remote;
+
     const elapsed = currentJob.startedAt
       ? (Date.now() - currentJob.startedAt) / 1000
       : 0;
@@ -161,37 +170,32 @@ export const vectorIndexerEndpoints = new Elysia()
     },
   })
 
-  // GET /vector/index/models
-  .get('/vector/index/models', async () => {
-    const models = getEmbeddingModels();
-    const result: Record<string, { collection: string; model: string; count?: number }> = {};
+  // POST /vector/index/stop
+  .post('/vector/index/stop', async ({ set }) => {
+    const remote = await proxyVectorIndexer('stop', set, { method: 'POST' });
+    if (remote) return remote;
 
-    for (const [key, preset] of Object.entries(models)) {
-      const entry: { collection: string; model: string; count?: number } = {
-        collection: preset.collection,
-        model: preset.model,
-      };
-
-      try {
-        const store = createVectorStore({
-          type: 'lancedb',
-          collectionName: preset.collection,
-          embeddingProvider: 'ollama',
-          embeddingModel: preset.model,
-          ...(preset.dataPath && { dataPath: preset.dataPath }),
-        });
-        await store.connect();
-        const stats = await store.getStats();
-        entry.count = stats.count;
-        await store.close();
-      } catch {
-        entry.count = 0;
-      }
-
-      result[key] = entry;
+    if (currentJob.status !== 'indexing') {
+      return { status: currentJob.status, stopped: false, job: currentJob };
     }
 
-    return { models: result };
+    stopRequestedJobId = currentJob.jobId;
+    currentJob.status = 'stopping';
+    currentJob.error = 'Stop requested by operator';
+    return { status: 'stopping', stopped: true, job: currentJob };
+  }, {
+    detail: {
+      tags: ['vector-indexer'],
+      summary: 'Request current vector indexing job stop',
+    },
+  })
+
+  // GET /vector/index/models
+  .get('/vector/index/models', async ({ set }) => {
+    const remote = await proxyVectorIndexer('models', set);
+    if (remote) return remote;
+
+    return { models: await localVectorOperations.modelStats() };
   }, {
     detail: {
       tags: ['vector-indexer'],

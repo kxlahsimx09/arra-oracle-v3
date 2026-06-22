@@ -4,7 +4,8 @@
  *
  * Flow:
  *   1. Boot-time seeder (src/db/seeders/menu-seeder.ts) upserts route-declared
- *      items into DB, preserving user-edited rows (`touchedAt != null`).
+ *      items with `detail.menu.path` into DB, preserving user-edited rows
+ *      (`touchedAt != null`).
  *   2. This endpoint reads `menu_items` via Drizzle, merges frontend pages,
  *      gist extras, and custom items — preserving /api/menu response shape.
  */
@@ -15,35 +16,14 @@ import { MenuItemSchema, MenuResponseSchema, ScopeSchema, type MenuItem, type Me
 import { getFrontendMenuItems } from '../../menu/index.ts';
 import { getMenuConfig, getMenuSource, reloadMenuConfig } from '../../menu/config.ts';
 import { listCustomMenuItems } from '../../menu/custom-store.ts';
+import { getPluginMenuItems } from '../plugins/model.ts';
 import { db, menuItems } from '../../db/index.ts';
 
 export type MenuExtras = {
   items?: MenuItem[];
+  pluginItems?: MenuItem[];
   disable?: Iterable<string>;
 };
-
-export const API_TO_STUDIO: ReadonlyArray<readonly [string, string]> = [
-  ['/api/supersede', '/superseded'],
-  ['/api/search', '/search'],
-  ['/api/list', '/feed'],
-  ['/api/reflect', '/playground'],
-  ['/api/threads', '/'],
-  ['/api/traces', '/traces'],
-  ['/api/schedule', '/schedule'],
-  ['/api/plugins', '/plugins'],
-  ['/api/graph', '/map'],
-  ['/api/map3d', '/map'],
-  ['/api/map', '/map'],
-  ['/api/context', '/evolution'],
-  ['/api/stats', '/pulse'],
-];
-
-function studioPathFor(apiPath: string): string | null {
-  for (const [prefix, studio] of API_TO_STUDIO) {
-    if (apiPath === prefix || apiPath.startsWith(prefix + '/')) return studio;
-  }
-  return null;
-}
 
 type RouteLike = { method?: string; path: string; hooks?: { detail?: unknown } };
 type HasRoutes = { routes: RouteLike[] };
@@ -52,6 +32,9 @@ const GROUP_RANK: Record<MenuItem['group'], number> = { main: 0, tools: 1, admin
 
 /**
  * Pure scan of Elysia route sources into MenuItems (source='api').
+ * A route becomes a menu row only when it declares `detail.menu.path`; this
+ * keeps each owning route responsible for its frontend/studio target instead
+ * of relying on a central API-prefix translation table.
  * Used by tests and exported for callers that need pre-DB scanning.
  */
 export function menuItemsFromRoutes(sources: HasRoutes[]): MenuItem[] {
@@ -64,19 +47,22 @@ export function menuItemsFromRoutes(sources: HasRoutes[]): MenuItem[] {
       const menu = detail.menu;
       if (!menu || !menu.group) continue;
 
-      const studio = studioPathFor(route.path);
-      if (!studio) continue;
+      if (!menu.path) continue;
 
-      const key = `${menu.group}:${studio}`;
+      const key = `${menu.group}:${menu.path}:${menu.studio ?? ''}`;
       if (seen.has(key)) continue;
       seen.add(key);
 
       const order =
         typeof menu.order === 'number' && Number.isFinite(menu.order) ? menu.order : 999;
-      const slug = studio.replace(/^\//, '') || 'home';
+      const slug = menu.path.replace(/^\//, '') || 'home';
       const label = menu.label ?? slug.charAt(0).toUpperCase() + slug.slice(1);
 
-      items.push({ path: studio, label, group: menu.group, order, source: 'api' });
+      const item: MenuItem = { path: menu.path, label, group: menu.group, order, source: 'api' };
+      if (menu.studio) item.studio = menu.studio;
+      if (menu.icon) item.icon = menu.icon;
+      if (menu.access) item.access = menu.access;
+      items.push(item);
     }
   }
 
@@ -190,6 +176,15 @@ export function buildMenuItems(
     items.push(item);
   }
 
+  if (extras?.pluginItems) {
+    for (const item of extras.pluginItems) {
+      const key = `${item.group}:${item.path}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push(item);
+    }
+  }
+
   if (extras?.items) {
     for (const item of extras.items) {
       const key = `${item.group}:${item.path}`;
@@ -235,7 +230,7 @@ export function createMenuEndpoint() {
         return {
           items: buildMenuItems(
             readApiMenuItemsFromDb(host, scope),
-            { items, disable },
+            { items, pluginItems: getPluginMenuItems(), disable },
             listCustomMenuItems(),
           ),
         };
