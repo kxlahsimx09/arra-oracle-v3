@@ -1,0 +1,20 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "NatInstanceSelfManage",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:ModifyInstanceAttribute",
+        "ec2:AssociateAddress",
+        "ec2:DisassociateAddress",
+        "ec2:DescribeAddresses",
+        "ec2:DescribeInstances",
+        "ec2:DescribeRouteTables",
+        "ec2:CreateRoute",
+        "ec2:ReplaceRoute"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
