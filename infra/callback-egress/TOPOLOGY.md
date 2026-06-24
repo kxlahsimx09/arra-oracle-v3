@@ -34,6 +34,7 @@ dispatch-callback EF (Supabase ap-se-1)        squid proxy (EC2 t4g.nano + EIP, 
 | Proxy auth | user `callbackproxy`, password in Supabase secret (NOT in repo) |
 
 ## Verification (2026-06-24)
+**Build-time (infra):**
 - CONNECT-https through the proxy with auth → egress IP = **52.65.119.13** (the EIP) ✅
 - No credentials → denied (407) ✅ · CONNECT to a non-443 port → denied (403) ✅
 - Mechanism proven on the real Supabase edge-runtime
@@ -41,14 +42,26 @@ dispatch-callback EF (Supabase ap-se-1)        squid proxy (EC2 t4g.nano + EIP, 
   `Deno.createHttpClient({proxy})` works and `fetch(url,{client})` tunnels HTTPS
   via CONNECT through the proxy.
 
+**End-to-end (after the payment-gateway team wired the EF, 2026-06-24 ~11:00):**
+- Squid access.log shows real callbacks from Supabase Edge egress IPs (13.214.x /
+  13.229.x / 47.129.x …) authenticated as `callbackproxy`, e.g.
+  `TCP_TUNNEL/200 CONNECT httpbin.org:443` — so client callbacks now exit via the
+  fixed EIP **52.65.119.13** ✅
+- **SSRF blocked**: a test callback endpoint pointing at `http://169.254.169.254/`
+  (IMDS) produced **zero** proxy log entries → the EF's `callbackUrlUnsafeReason`
+  check rejected it before relaying (ideal). Defense-in-depth also holds: squid
+  denies non-CONNECT / non-443, and the proxy enforces IMDSv2 (token required). ✅
+
 ## Auto-heal
 ASG min=max=1. On every boot the squid userdata (`userdata.tpl.sh`, baked into the
 LT) installs squid, writes the auth + CONNECT-443-only config, and **re-associates
 the EIP** — so the whitelisted IP survives instance replacement.
 
-## Edge Function integration (payment-gateway team)
-In `supabase/functions/dispatch-callback/index.ts` (~line 162), replace the direct
-fetch with a proxied client; keep the existing `callbackUrlUnsafeReason` SSRF check:
+## Edge Function integration (payment-gateway team) — ✅ DONE 2026-06-24
+The team wired `dispatch-callback` to route through the proxy and set the Supabase
+secrets; verified live (see Verification above). Reference implementation —
+in `supabase/functions/dispatch-callback/index.ts` (~line 162), the direct fetch
+becomes a proxied client, keeping the existing `callbackUrlUnsafeReason` SSRF check:
 ```ts
 const client = Deno.createHttpClient({
   proxy: { url: Deno.env.get("CALLBACK_PROXY_URL")!,            // http://52.65.119.13:3128
