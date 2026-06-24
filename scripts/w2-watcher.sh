@@ -185,9 +185,10 @@ log() {
 # fail-telegram for operator visibility).
 WAKE_VERIFY_TIMEOUT=${WAKE_VERIFY_TIMEOUT:-3600}
 SILENT_FAIL_TG_PROJECT=${SILENT_FAIL_TG_PROJECT:-$HOME/Code/github.com/kokarat/mobiz-payment-gateway}
-# Author of commits the workflows produce (W2/W9/W1 commits land via local
-# git config). Used by silent-fail detector to count AMEND-path commits in
-# addition to NEW PRs.
+# DEPRECATED (2026-06-23): the silent-fail detector NO LONGER filters AMEND-path
+# commits by author — the box's git identity drifts (amadeusmarsexpress → admin →
+# Ubuntu) and a stale value caused false "silent wake fail" alerts. Kept only so an
+# explicit `COMMIT_AUTHOR=…` env override doesn't error; it is otherwise unused.
 COMMIT_AUTHOR=${COMMIT_AUTHOR:-amadeusmarsexpress}
 # Regression runner host. When non-empty, the chained
 # regression-then-investigate.sh delegates the entire build+suite to this host
@@ -468,15 +469,21 @@ cmd_run() {
           done
           pr_count=${pr_count:-0}
 
-          # Signal 2: commits by COMMIT_AUTHOR on role's branch shape since wake.
+          # Signal 2: commits on role's branch shape since wake (AMEND path 8.A).
           # Refresh remote refs first so AMEND-path branches are visible.
+          # IDENTITY-AGNOSTIC (2026-06-23 fix): do NOT filter by --author. The
+          # docs/track-*|flow-track-* branches are the writer role's OWN output, so any
+          # commit there since the wake = this role's work, whoever authored it. The
+          # box's git identity drifts (amadeusmarsexpress → admin → Ubuntu); the stale
+          # COMMIT_AUTHOR default made every AMEND-path wake (push to an existing PR, no
+          # new PR) look silent → false "silent wake fail" alerts (pg/bot-writer +
+          # pg-tester, 2026-06-23 — all 3 had actually succeeded, pushed as "Ubuntu").
           git "${GIT_AUTH_FLAGS[@]}" -C "$repo" fetch origin --prune --quiet 2>/dev/null
           commit_count=0
           if [ -n "$patterns" ]; then
             for p in $patterns; do
               # `--branches` glob expands `*` against ref names; pattern is a prefix here.
               c=$(git -C "$repo" log --remotes="origin/${p}*" \
-                --author="$COMMIT_AUTHOR" \
                 --since="@$pending_wake_ts" \
                 --format=%h 2>/dev/null | wc -l | tr -d ' ')
               commit_count=$((commit_count + ${c:-0}))
@@ -484,7 +491,6 @@ cmd_run() {
           else
             # No pattern (legacy/uncategorized role) — fall back to all-branches.
             commit_count=$(git -C "$repo" log --all --remotes \
-              --author="$COMMIT_AUTHOR" \
               --since="@$pending_wake_ts" \
               --format=%h 2>/dev/null | wc -l | tr -d ' ')
             commit_count=${commit_count:-0}
