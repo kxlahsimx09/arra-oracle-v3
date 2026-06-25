@@ -496,12 +496,31 @@ cmd_run() {
             commit_count=${commit_count:-0}
           fi
 
+          # Signal 3 (2026-06-25): did the wake's claude session actually RUN? PR/commit
+          # presence (Signals 1+2) can be legitimately ZERO on a successful run — a
+          # pg-tester W1 NO-OP (HEAD already covered, nothing to fix → no PR/commit; seen
+          # 22x consecutively) or a W9 already-up-to-date pass. A SILENT DEATH (auth 401 /
+          # rate-limit at startup) instead writes NO transcript. The wake worktree +
+          # claude transcript dir embed the wake's compact timestamp, so glob for it and
+          # look for any assistant turn = claude ran. This is the universal "didn't die
+          # silently" signal; Signals 1+2 stay as the "produced the expected output" log.
+          wake_compact=$(_fmt_epoch "$pending_wake_ts" '+%Y%m%d-%H%M%S')
+          ran_transcript=0
+          for _td in "$HOME"/.claude/projects/*"$wake_compact"*; do
+            [ -d "$_td" ] || continue
+            if grep -lqE '"type":"assistant"|"role":"assistant"' "$_td"/*.jsonl 2>/dev/null; then
+              ran_transcript=1; break
+            fi
+          done
+
           total_signal=$((pr_count + commit_count))
-          if [ "$total_signal" -eq 0 ]; then
-            log "[$role] SILENT-FAIL: 0 PRs + 0 commits matching role pattern in $((pending_elapsed/60))min since wake @ $(_fmt_epoch "$pending_wake_ts" '+%H:%M') (search: $pr_search) — alerting operator"
-            send_silent_fail_telegram "$role" "$repo_slug" "$pending_wake_ts" "$pending_elapsed"
-          else
+          if [ "$total_signal" -gt 0 ]; then
             log "[$role] wake verified: $pr_count new PR(s) + $commit_count commit(s) matching pattern '$patterns' in $((pending_elapsed/60))min"
+          elif [ "$ran_transcript" -eq 1 ]; then
+            log "[$role] wake verified via transcript: claude ran (0 PR/commit = legit no-op/already-covered, not a silent death) in $((pending_elapsed/60))min"
+          else
+            log "[$role] SILENT-FAIL: 0 PRs + 0 commits AND no claude transcript since wake @ $(_fmt_epoch "$pending_wake_ts" '+%H:%M') (search: $pr_search) — alerting operator"
+            send_silent_fail_telegram "$role" "$repo_slug" "$pending_wake_ts" "$pending_elapsed"
           fi
           pending_wake_ts=0
         fi
